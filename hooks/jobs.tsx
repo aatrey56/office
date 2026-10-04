@@ -1,7 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-import type { Effort, Job, RouteDecision } from '../types'
+import type { Effort, EvalReport, Job, RouteCase, RouteDecision, RouteOutcome } from '../types'
+import { formatReport, parseCases, scoreRoutes } from './evals'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -170,6 +171,11 @@ export function installJobs(on: On, options: PluginOptions) {
         description: 'Dry run: which model tier and effort the router picks for a task',
         argumentHint: '<task>',
       })
+      await $.command.register({
+        name: 'route-eval',
+        description: 'Score the router against the labeled tasks in evals/routing.jsonl',
+        argumentHint: '[rules|claude|jev|all]',
+      })
       for (const spec of WORKER_AGENT_SPECS) {
         try {
           await $.agent.register(spec)
@@ -245,6 +251,48 @@ export function installJobs(on: On, options: PluginOptions) {
     const task = str(e.args)
     if (!task) return { text: 'Usage: /route-task <task>' }
     return { text: describeRoute(await route($, options, task)) }
+  })
+
+  on('command.run', { command: 'route-eval' }, async ($, e) => {
+    const asked = e.args.trim().toLowerCase() || 'all'
+    if (!EVAL_BACKENDS.includes(asked) && asked !== 'all') return { text: 'Usage: /route-eval [rules|claude|jev|all]' }
+    const file = `${$.plugin.root}/evals/routing.jsonl`
+    let text: string
+    try {
+      text = await $.fs.read(file)
+    } catch {
+      return { text: `No labeled tasks at ${file}.` }
+    }
+    const { cases, errors } = parseCases(text)
+    if (cases.length === 0) return { text: `No usable cases in ${file}. ${errors.slice(0, 3).join('; ')}` }
+
+    const now = Date.now()
+    const jevKey = asked === 'jev' || asked === 'all' ? await resolveJevKey($, options) : undefined
+    if (asked === 'jev' && !jevKey) return { text: 'No Jev key (Keychain service aimlapi, jevApiKey, or AIMLAPI_KEY).' }
+    // all: every backend that can answer now; Jev joins once a key exists.
+    const backends = asked === 'all' ? (jevKey ? EVAL_BACKENDS : EVAL_BACKENDS.filter(b => b !== 'jev')) : [asked]
+
+    const reports: EvalReport[] = []
+    const saved: string[] = []
+    for (const backend of backends as RouteDecision['backend'][]) {
+      const outcomes = await evalBackend($, options, backend, cases, jevKey, now)
+      const report = scoreRoutes(cases, outcomes, backend)
+      reports.push(report)
+      // A dated record, so a later run (a new rubric, Jev) has something to compare against.
+      const out = `${$.plugin.root}/evals/results/${new Date(now).toISOString().replace(/[:.]/g, '-')}-${backend}.json`
+      try {
+        await $.fs.write(out, JSON.stringify({ at: now, backend, report, outcomes }, null, 2))
+        saved.push(out)
+      } catch {
+        // the table below is the result; a record that could not be written is not worth failing for
+      }
+    }
+    const notes = [
+      errors.length > 0 ? `${errors.length} line(s) skipped: ${errors.slice(0, 2).join('; ')}` : '',
+      asked === 'all' && !jevKey ? 'Jev skipped: no key yet.' : '',
+      saved.length > 0 ? `Saved under ${$.plugin.root}/evals/results/` : '',
+    ].filter(Boolean)
+    return { text: [formatReport(reports, e.presentation.columns), ...notes].join('\n') }
   })
 
   on('command.run', { command: 'jobs' }, async $ => {
@@ -352,6 +400,38 @@ export function installJobs(on: On, options: PluginOptions) {
 }
 
 // ── routing ($ halves; the rubric and parsers are in router.ts) ──────────
+
+const EVAL_BACKENDS = ['rules', 'claude', 'jev']
+const EVAL_BATCH = 5 // model calls in flight at once while scoring
+
+/** One backend's answer for every case, with no fallback: a miss is that backend's miss. */
+async function evalBackend(
+  $: EngineInterface,
+  options: PluginOptions,
+  backend: RouteDecision['backend'],
+  cases: RouteCase[],
+  jevKey: string | undefined,
+  now: number,
+): Promise<RouteOutcome[]> {
+  const one = async (c: RouteCase): Promise<RouteOutcome> => {
+    const t0 = Date.now()
+    const got =
+      backend === 'rules'
+        ? rulesRoute(c.task, now)
+        : backend === 'jev'
+          ? jevKey
+            ? await routeJev($, options, jevKey, c.task, now)
+            : 'no key'
+          : await routeClaude($, options, c.task, now)
+    if (typeof got === 'string') return { id: c.id, error: got }
+    return { id: c.id, model: got.model, effort: got.effort, latencyMs: Date.now() - t0 }
+  }
+  const outcomes: RouteOutcome[] = []
+  for (let i = 0; i < cases.length; i += EVAL_BATCH) {
+    outcomes.push(...(await Promise.all(cases.slice(i, i + EVAL_BATCH).map(one))))
+  }
+  return outcomes
+}
 
 async function route($: EngineInterface, options: PluginOptions, task: string): Promise<RouteDecision> {
   const now = Date.now()

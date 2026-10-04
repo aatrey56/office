@@ -354,3 +354,58 @@ describe('--bg workers', () => {
     expect(readTranscript(jsonl)).toEqual({ result: 'OK', tail: '[tool Read]\nOK' })
   })
 })
+
+describe('/route-eval', () => {
+  const ASK = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
+  const CASES = [
+    '{"id":"a","task":"rename fooBar to foo_bar across utils.py","model":"sonnet","effort":"low","why":"mechanical"}',
+    '{"id":"b","task":"rename fooBar to foo_bar across utils.py","model":"fable","effort":"high","why":"deliberately wrong label"}',
+  ].join('\n')
+
+  test('rules: scores the labeled file, saves a dated record, and never calls a model', async ($, on) => {
+    let modelCalls = 0
+    const written: { path: string; text: string }[] = []
+    on('fs.read', () => ({ value: CASES }))
+    on('fs.write', (_$, e) => {
+      written.push({ path: e.path, text: e.text })
+      return { value: undefined }
+    })
+    on('model.complete', () => {
+      modelCalls++
+      return { value: { isAnswered: true, text: '{}', usage: USAGE } }
+    })
+    const ran = await $.command.run({ command: 'route-eval', args: 'rules', ...ASK })
+    expect(ran.text).toContain('rules')
+    expect(ran.text).toContain('2/2')
+    expect(ran.text).toContain('b: want fable/high, got sonnet/low')
+    expect(modelCalls).toBe(0)
+    expect(written).toHaveLength(1)
+    expect(written[0]?.path).toMatch(/evals\/results\/.*-rules\.json$/)
+    expect(JSON.parse(written[0]?.text ?? '{}').report).toMatchObject({ backend: 'rules', total: 2, exact: 1, underRouted: 1 })
+  })
+
+  test('claude: one model call per case; an unparseable reply is that case\'s miss', async ($, on) => {
+    let n = 0
+    on('fs.read', () => ({ value: CASES }))
+    on('fs.write', () => ({ value: undefined }))
+    on('model.complete', () => {
+      n++
+      return { value: { isAnswered: true, text: n === 1 ? '{"model":"sonnet","effort":"low","confidence":0.9,"reason":"mechanical"}' : 'no idea', usage: USAGE } }
+    })
+    const ran = await $.command.run({ command: 'route-eval', args: 'claude', ...ASK })
+    expect(n).toBe(2)
+    expect(ran.text).toContain('1/2')
+    expect(ran.text).toContain('error: unparseable reply')
+  })
+
+  test('a bad argument answers the usage line', async $ => {
+    expect((await $.command.run({ command: 'route-eval', args: 'gpt', ...ASK })).text).toContain('Usage: /route-eval')
+  })
+
+  test('a missing file answers in words', async ($, on) => {
+    on('fs.read', () => {
+      throw new Error('ENOENT')
+    })
+    expect((await $.command.run({ command: 'route-eval', args: 'rules', ...ASK })).text).toContain('No labeled tasks at')
+  })
+})
