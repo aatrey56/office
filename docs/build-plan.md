@@ -167,7 +167,28 @@ depends on the router, so this number tells you whether to trust it there.
 One tile map (13 × 10 tiles) and one art set either way. The test needs you looking at
 the pane in a Ghostty-direct session and telling me "crisp" or "blurry".
 
-### 5.3 Rooms and states (signals that exist today)
+### 5.2.1 Drawing test results (2026-10-04, Ghostty-direct session)
+
+| Finding | Decision |
+| --- | --- |
+| Picture x4 (we upscale, nearest-neighbour) is sharp; picture x1 is blurred by the terminal's own smoothing | Always draw through `Image`, upscaled by us by a whole number. Never let the terminal scale. |
+| Cells: 15 frames/s (target 8), but half resolution loses one-pixel detail | Cells are only the fallback for background sessions |
+| `[tag]` Button draws over the picture in every view | Overlay works visually; click not yet confirmed |
+| The person's verdict on the look: "goofy, like a child drew it" | Test-card figures were placeholders, but the art needs a real Game Boy Color method (§5.6) |
+
+### 5.6 Art direction (Game Boy Color rules, as Gold/Silver/Crystal use them)
+
+- Native canvas 160 × 144 (10 × 9 metatiles of 16 px), scaled ×4 or ×5 by us.
+- 8 × 8 tiles grouped into 16 × 16 metatiles; every tile uses one 4-color palette (8 background palettes).
+- Characters: 16 × 16 overworld sprites, 3 colors + transparent, dark outline, big head (about half the height),
+  4 directions (right is mirrored left), 2-frame walk.
+- 3/4 top-down view: walls show their front face, furniture has a lit top and a shaded front, light from above.
+- Floors and walls are quiet patterns; detail goes on furniture so crew stand out.
+- Original art only: the style, not Pokémon's tiles or characters.
+- Source: a vetted CC0 / CC-BY Game Boy-style interior pack if one fits, else authored to these rules; a contact
+  sheet is approved by the person before anything is wired in.
+
+ (signals that exist today)
 
 | Signal | Room | What you see |
 | --- | --- | --- |
