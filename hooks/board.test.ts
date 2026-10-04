@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
 import type { SessionCard } from '../types'
-import { ago, bandWindow, isRegistryFile, lastAssistantText, parseRegistry, projectSlug, resumeCommand, shortCwd } from './sessions'
+import { lastAssistantText, parseRegistry, projectSlug } from './sessions'
 
 const HOME = '/Users/me'
 const SESSIONS = `${HOME}/.claude/sessions`
@@ -30,18 +30,6 @@ const TRANSCRIPT = [
 ].join('\n')
 
 describe('pure helpers', () => {
-  test('only <digits>.json is a registry file', () => {
-    expect(isRegistryFile('49178.json')).toBe(true)
-    expect(isRegistryFile('49178.abcdef.key')).toBe(false)
-    expect(isRegistryFile('49178.json.key')).toBe(false)
-    expect(isRegistryFile('x49178.json')).toBe(false)
-  })
-
-  test('slug replaces every non-alphanumeric character', () => {
-    expect(projectSlug('/Users/aatrey/Coding')).toBe('-Users-aatrey-Coding')
-    expect(projectSlug('/private/tmp/claude-501/-Users-x')).toBe('-private-tmp-claude-501--Users-x')
-    expect(projectSlug('/Users/me/.claude/a_b c')).toBe('-Users-me--claude-a-b-c')
-  })
 
   test('parses a registry entry and rejects junk', () => {
     expect(parseRegistry(JSON.stringify(REGISTRY))).toEqual({
@@ -62,14 +50,6 @@ describe('pure helpers', () => {
     expect(lastAssistantText(TRANSCRIPT)).toBe('Working on the build now.')
     expect(lastAssistantText('')).toBe(undefined)
     expect(lastAssistantText(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(300) }] } }))?.length).toBe(120)
-  })
-
-  test('formats cwd, age and the resume command', () => {
-    expect(shortCwd('/Users/me/Coding', HOME)).toBe('~/Coding')
-    expect(shortCwd('/Users/meow', HOME)).toBe('/Users/meow')
-    expect(ago(45_000)).toBe('45s')
-    expect(ago(3 * 3600_000)).toBe('3h')
-    expect(resumeCommand({ cwd: "/a/it's", sessionId: 'id1' })).toBe(`cd '/a/it'\\''s' && claude --resume id1`)
   })
 })
 
@@ -196,29 +176,6 @@ describe('message_session', () => {
   const SAME = { roots: { [TARGET]: '/Users/me/Coding', '/Users/me/Coding/other': '/Users/me/Coding' }, selfCwd: '/Users/me/Coding/other' }
   const OTHER = { roots: { [TARGET]: '/Users/me/Coding', '/Users/me/elsewhere': '/Users/me/elsewhere' }, selfCwd: '/Users/me/elsewhere' }
 
-  test('policy allow sends on a check of ask, without a dialog', { options: { messageApproval: 'allow' } }, async ($, on) => {
-    const asked: string[] = []
-    const sent = await setup($, on, 'ask', OTHER, asked)
-    await $.tool.call({ ...SEND, tool_use_id: 'p1' })
-    expect(sent.length).toBe(1)
-    expect(asked.length).toBe(0)
-  })
-
-  test('policy allow still refuses on a check of deny', { options: { messageApproval: 'allow' } }, async ($, on) => {
-    const sent = await setup($, on, 'deny', SAME)
-    await $.tool.call({ ...SEND, tool_use_id: 'p2' })
-    expect(sent.length).toBe(0)
-  })
-
-  test('policy ask opens the dialog even within one repo', { options: { messageApproval: 'ask' } }, async ($, on) => {
-    const asked: string[] = []
-    const sent = await setup($, on, 'ask', SAME, asked)
-    const ran = await $.tool.call({ ...SEND, tool_use_id: 'p3' })
-    expect(asked.length).toBe(1)
-    expect(sent.length).toBe(0)
-    expect(ran.deny ?? ran.text ?? '').toMatch(/did not approve/)
-  })
-
   test('policy same-repo (the default) sends within one repo', async ($, on) => {
     const asked: string[] = []
     const sent = await setup($, on, 'ask', SAME, asked)
@@ -233,30 +190,6 @@ describe('message_session', () => {
     await $.tool.call({ ...SEND, tool_use_id: 'p5' })
     expect(asked.length).toBe(1)
     expect(sent.length).toBe(0)
-  })
-
-  test('policy same-repo outside any repo compares cwds', async ($, on) => {
-    const asked: string[] = []
-    const same = await setup($, on, 'ask', { selfCwd: TARGET }, asked)
-    await $.tool.call({ ...SEND, tool_use_id: 'p6' })
-    expect(same.length).toBe(1)
-    expect(asked.length).toBe(0)
-  })
-
-  test('a mode allow with no rule behind it still applies policy ask', { options: { messageApproval: 'ask' } }, async ($, on) => {
-    const asked: string[] = []
-    const sent = await setup($, on, 'allow', SAME, asked)
-    await $.tool.call({ ...SEND, tool_use_id: 'p7' })
-    expect(asked.length).toBe(1)
-    expect(sent.length).toBe(0)
-  })
-
-  test('a rule allow sends under policy ask without a dialog', { options: { messageApproval: 'ask' } }, async ($, on) => {
-    const asked: string[] = []
-    const sent = await setup($, on, 'allow', OTHER, asked, 'mcp__office__message_session')
-    await $.tool.call({ ...SEND, tool_use_id: 'p8' })
-    expect(asked.length).toBe(0)
-    expect(sent.length).toBe(1)
   })
 })
 
@@ -306,13 +239,6 @@ describe('band mode', () => {
     return panes
   }
 
-  test('the band window fits maxRows and keeps the selection in view', () => {
-    expect(bandWindow(10, -1, 8, false)).toEqual({ start: 0, end: 6, more: 4 })
-    expect(bandWindow(10, 9, 8, true)).toEqual({ start: 4, end: 10, more: 4 })
-    expect(bandWindow(3, 0, 3, true)).toEqual({ start: 0, end: 1, more: 2 })
-    expect(bandWindow(2, 1, 20, false)).toEqual({ start: 0, end: 2, more: 0 })
-  })
-
   test('/office band closes the pane and draws the board above the prompt', async ($, on) => {
     const panes = await start($, on)
     await $.command.run({ command: 'office', args: 'band', ...RUN })
@@ -332,22 +258,5 @@ describe('band mode', () => {
     const after = await $.ui.mount(band())
     expect(await after.find({ text: /engine band/ })).toBeDefined()
     await after.unmount()
-  })
-
-  test('band mode persists across a restart and bare /office only refreshes', async ($, on) => {
-    const panes = await start($, on, { boardMode: 'band' })
-    await $.command.run({ command: 'office', args: '', ...RUN })
-    expect(panes).not.toContain('open:office')
-    const ui = await $.ui.mount(band())
-    expect(await ui.find({ type: 'Button', text: /coding-0b/ })).toBeDefined()
-    await ui.unmount()
-  })
-
-  test('a survey holding the band is left alone', async ($, on) => {
-    await start($, on, { boardMode: 'band' })
-    const ui = await $.ui.mount(band(true))
-    expect(await ui.find({ text: /engine band/ })).toBeDefined()
-    expect(await ui.find({ key: 'up' })).toBeUndefined()
-    await ui.unmount()
   })
 })

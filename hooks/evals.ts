@@ -62,7 +62,7 @@ function median(values: number[]): number {
   if (values.length === 0) return 0
   const s = [...values].sort((a, b) => a - b)
   const mid = s.length >> 1
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
+  return s.length % 2 ? (s[mid] ?? 0) : ((s[mid - 1] ?? 0) + (s[mid] ?? 0)) / 2
 }
 
 // Tier order for over/under-routing is router.ts TIERS. An outcome with `error` counts as
@@ -128,9 +128,9 @@ export function formatReport(reports: EvalReport[], columns: number): string {
     pct(r.underRouted, r.total),
     `${r.medianLatencyMs}ms`,
   ])
-  const widths = head.map((h, c) => Math.max(h.length, ...rows.map(row => row[c].length)))
+  const widths = head.map((h, c) => Math.max(h.length, ...rows.map(row => (row[c] ?? '').length)))
   // Left-align the backend name, right-align the numbers.
-  const line = (cells: string[]) => cells.map((s, c) => (c === 0 ? s.padEnd(widths[c]) : s.padStart(widths[c]))).join('  ').trimEnd()
+  const line = (cells: string[]) => cells.map((s, c) => (c === 0 ? s.padEnd(widths[c] ?? 0) : s.padStart(widths[c] ?? 0))).join('  ').trimEnd()
   const out = [fit(line(head)), ...rows.map(row => fit(line(row)))]
   for (const r of reports) {
     if (r.misses.length === 0) continue

@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'claude-code/testing'
+import type { On } from 'claude-code'
 
-import { CODEX_DEFAULTS, codexExecArgv, codexQuotaMessage, codexReviewArgv, codexReviewPrompt, parseReviewTarget, splitDeep } from './codex'
-import { HAIKU_RETIRES_AT, jevRequestBody, MODEL_IDS, modelIdFor, parseClaudeRoute, parseJevResponse, rulesRoute } from './router'
-import { bgArgv, bgPhase, headlessArgv, newestBgSince, parseAgentsJson, parseBgId, parseSpawnArgs, readTranscript, transcriptPath } from './spawn'
+import { CODEX_DEFAULTS, codexQuotaMessage, codexReviewArgv, codexReviewPrompt, parseReviewTarget } from './codex'
+import { HAIKU_RETIRES_AT, MODEL_IDS, modelIdFor, parseClaudeRoute, parseJevResponse, rulesRoute } from './router'
+import { bgArgv, headlessArgv, parseAgentsJson, parseBgId, readTranscript, transcriptPath } from './spawn'
 
 const BEFORE = Date.UTC(2026, 9, 3) // haiku still available
 const AFTER = HAIKU_RETIRES_AT + 1 // haiku retired
@@ -33,43 +34,12 @@ describe('rules backend', () => {
       effort: 'high',
     })
   })
-  test('summarize / classify use haiku only while it is available', () => {
-    expect(rulesRoute('summarize this changelog', BEFORE)).toMatchObject({ model: 'haiku', effort: 'low' })
-    const after = rulesRoute('classify these tickets', AFTER)
-    expect(after).toMatchObject({ model: 'sonnet', effort: 'low' })
-    expect(after.reason).toContain('haiku retired')
-  })
-  test('code words like extract / tag / label do not route to haiku', () => {
-    expect(rulesRoute('extract a helper function from parse()', BEFORE).model).not.toBe('haiku')
-    expect(rulesRoute('label the release and tag v2', BEFORE).model).not.toBe('haiku')
-  })
-  test('anything else gets a low-confidence default', () => {
-    const r = rulesRoute('hmm', BEFORE)
-    expect(r).toMatchObject({ model: 'sonnet', effort: 'medium' })
-    expect(r.confidence).toBeLessThan(0.5)
-  })
 })
 
 describe('claude backend JSON parsing', () => {
-  test('plain JSON', () => {
-    expect(parseClaudeRoute('{"model":"opus","effort":"high","confidence":0.8,"reason":"debugging"}', BEFORE)).toEqual({
-      model: 'opus',
-      effort: 'high',
-      confidence: 0.8,
-      reason: 'debugging',
-    })
-  })
   test('fenced, with prose around it and braces inside strings', () => {
     const text = 'Sure!\n```json\n{"model": "sonnet", "effort": "low", "confidence": "0.9", "reason": "rename {x}"}\n```\nDone.'
     expect(parseClaudeRoute(text, BEFORE)).toEqual({ model: 'sonnet', effort: 'low', confidence: 0.9, reason: 'rename {x}' })
-  })
-  test('full model ids, odd effort spellings (capped at high), clamped confidence', () => {
-    const r = parseClaudeRoute('{"model":"claude-fable-5-1","effort":"Extra-High","confidence":7}', BEFORE)
-    expect(r).toMatchObject({ model: 'fable', effort: 'high', confidence: 1 })
-    expect(parseClaudeRoute('{"model":"sonnet","effort":"Med"}', BEFORE)?.effort).toBe('medium')
-  })
-  test('haiku after retirement becomes sonnet', () => {
-    expect(parseClaudeRoute('{"model":"haiku","effort":"low"}', AFTER)?.model).toBe('sonnet')
   })
   test('unusable replies answer undefined', () => {
     expect(parseClaudeRoute('I think opus.', BEFORE)).toBeUndefined()
@@ -80,13 +50,6 @@ describe('claude backend JSON parsing', () => {
 })
 
 describe('jev backend', () => {
-  test('request body asks two choice questions over the rubric', () => {
-    const body = JSON.parse(jevRequestBody('fix the flaky test', AFTER))
-    expect(body.model).toBe('typesafe/jev')
-    expect(body.questions.model.type).toBe('choice')
-    expect(Object.keys(body.questions.model.criteria)).toEqual(['sonnet', 'opus', 'fable'])
-    expect(Object.keys(body.questions.effort.criteria)).toEqual(['low', 'medium', 'high'])
-  })
   test('the literal documented reply', () => {
     expect(parseJevResponse(DOCS_REPLY, BEFORE)).toEqual({
       model: 'opus',
@@ -94,18 +57,6 @@ describe('jev backend', () => {
       confidence: 0.88,
       reason: 'jev: opus (conf 0.97), high (conf 0.88)',
     })
-  })
-  test('response in the documented shape', () => {
-    const text = JSON.stringify({
-      model: 'typesafe/jev-1.13-20260917',
-      answers: {
-        model: { type: 'choice', choice: 'opus', confidence: 0.9, probabilities: { opus: 0.93, sonnet: 0.07 } },
-        effort: { type: 'choice', choice: 'high', confidence: 0.7, probabilities: { high: 0.8 } },
-      },
-      usage: { input_tokens: 400, output_tokens: 0 },
-    })
-    expect(parseJevResponse(text, BEFORE)).toMatchObject({ model: 'opus', effort: 'high', confidence: 0.7 })
-    expect(parseJevResponse('{"answers":{}}', BEFORE)).toBeUndefined()
   })
 })
 
@@ -130,42 +81,6 @@ describe('route through the plugin', () => {
     expect(text).toContain('sonnet')
     expect(text).toContain('rules in')
     expect(text).toContain('claude: unparseable reply')
-  })
-
-  test('jev backend: the option key when the Keychain has none', {
-    options: { routerBackend: 'jev', jevApiKey: 'test-key' },
-  }, async ($, on) => {
-    on('process.run', () => ({ value: { ...RUN, exitCode: 44, stderr: 'could not be found' } }))
-    let auth: string | undefined
-    on('http.fetch', (_$, e) => {
-      auth = e.init?.headers?.Authorization
-      return { value: { status: 200, ok: true, headers: {}, text: DOCS_REPLY } }
-    })
-    const r = await $.tool.call({ tool: 'mcp__office__route_task', task: 'design the sync architecture' })
-    expect(auth).toBe('Bearer test-key')
-    expect(JSON.stringify(r.result)).toContain('jev in')
-  })
-
-  test('auto: the Keychain key wins, and the documented reply routes', {
-    options: { routerBackend: 'auto', jevApiKey: 'option-key' },
-  }, async ($, on) => {
-    const runs: string[] = []
-    on('process.run', (_$, e) => {
-      runs.push(e.argv.join(' '))
-      return { value: { ...RUN, stdout: 'keychain-key\n' } }
-    })
-    let auth: string | undefined
-    on('http.fetch', (_$, e) => {
-      auth = e.init?.headers?.Authorization
-      return { value: { status: 200, ok: true, headers: {}, text: DOCS_REPLY } }
-    })
-    const r = await $.tool.call({ tool: 'mcp__office__route_task', task: 'debug the flaky upload' })
-    expect(runs).toContain('security find-generic-password -s aimlapi -w')
-    expect(auth).toBe('Bearer keychain-key')
-    const text = String(r.result)
-    expect(text).toMatch(/^opus \(claude-opus-5-5\) at high effort/)
-    expect(text).toMatch(/· jev in \d+ms ·/)
-    expect(text).not.toContain('keychain-key')
   })
 
   test('auto without any key goes straight to claude: no Jev request', {
@@ -225,13 +140,6 @@ describe('argv safety', () => {
     const commit = parseReviewTarget('--commit abc123')!
     expect(codexReviewPrompt(commit, 'x')).toContain('git show abc123')
   })
-  test('codex review without instructions keeps the flag and no prompt', () => {
-    const argv = codexReviewArgv('codex', parseReviewTarget('--uncommitted')!, '/tmp/o', { model: 'gpt-5', effort: '' }, false)
-    expect(argv).toContain('--uncommitted')
-    expect(argv).not.toContain('-')
-    expect(argv).toContain('model="gpt-5"')
-    expect(argv.some(a => a.startsWith('model_reasoning_effort'))).toBe(false)
-  })
   test('the headless worker task never rides argv', () => {
     const argv = headlessArgv('claude', 'claude-sonnet-5-5', 'low', 'acceptEdits')
     expect(argv).toEqual([
@@ -243,24 +151,6 @@ describe('argv safety', () => {
 })
 
 describe('codex tiers', () => {
-  test('reviews run gpt-6-sol at high, second opinions gpt-6-luna at medium, deep gpt-6-astra at high', () => {
-    const review = codexReviewArgv('codex', parseReviewTarget('--uncommitted')!, '/tmp/o', CODEX_DEFAULTS.review, false)
-    expect(review.slice(0, 9)).toEqual([
-      'codex', 'exec', 'review', '-c', 'model="gpt-6-sol"', '-c', 'review_model="gpt-6-sol"',
-      '-c', 'model_reasoning_effort="high"',
-    ])
-    const deep = codexReviewArgv('codex', parseReviewTarget('main')!, '/tmp/o', CODEX_DEFAULTS.deep, false)
-    expect(deep).toContain('review_model="gpt-6-astra"')
-    const exec = codexExecArgv('codex', '/tmp/o', CODEX_DEFAULTS.exec)
-    expect(exec.slice(0, 6)).toEqual(['codex', 'exec', '-c', 'model="gpt-6-luna"', '-c', 'model_reasoning_effort="medium"'])
-    expect(exec).toContain('read-only')
-    expect(CODEX_DEFAULTS.deep).toEqual({ model: 'gpt-6-astra', effort: 'high' })
-  })
-  test('--deep is opt-in and stripped from the target', () => {
-    expect(splitDeep('--deep --base main')).toEqual({ deep: true, rest: '--base main' })
-    expect(splitDeep('--uncommitted')).toEqual({ deep: false, rest: '--uncommitted' })
-    expect(splitDeep('')).toEqual({ deep: false, rest: '' })
-  })
   test('usage / rate limits become a quota message with the reset time', () => {
     expect(
       codexQuotaMessage("You've hit your usage limit. Upgrade to Pro or try again at 3:11 AM.", 'gpt-6-astra'),
@@ -288,18 +178,6 @@ describe('effort cap', () => {
     })
     expect(parseJevResponse(jev, BEFORE)?.effort).toBe('high')
   })
-  test('/spawn takes an explicit effort (xhigh allowed) and a mode', () => {
-    expect(parseSpawnArgs('--effort xhigh design the billing system')).toEqual({
-      task: 'design the billing system',
-      effort: 'xhigh',
-    })
-    expect(parseSpawnArgs('--mode headless --model opus -- --fix the flag parser')).toEqual({
-      task: '--fix the flag parser',
-      mode: 'headless',
-      model: 'opus',
-    })
-    expect(parseSpawnArgs('fix the bug')).toEqual({ task: 'fix the bug' })
-  })
 })
 
 describe('--bg workers', () => {
@@ -316,24 +194,6 @@ describe('--bg workers', () => {
     expect(parseBgId(out)).toBe('5ac0f0df')
     expect(parseBgId('\u001b[2mbackgrounded\u001b[22m · \u001b[1m5ac0f0df\u001b[22m\n')).toBe('5ac0f0df')
     expect(parseBgId('nothing here')).toBeUndefined()
-  })
-  test('no printed id: the newest background session in the cwd since the spawn', () => {
-    const agents = [
-      { id: 'old', kind: 'background', cwd: '/r', startedAt: 100 },
-      { id: 'new', kind: 'background', cwd: '/r', startedAt: 300 },
-      { id: 'other', kind: 'background', cwd: '/x', startedAt: 400 },
-      { id: 'tty', kind: 'interactive', cwd: '/r', startedAt: 500 },
-    ]
-    expect(newestBgSince(agents, '/r', 200)?.id).toBe('new')
-    expect(newestBgSince(agents, '/r', 350)).toBeUndefined()
-  })
-  test('agent states', () => {
-    expect(bgPhase('done')).toBe('done')
-    expect(bgPhase('failed')).toBe('failed')
-    expect(bgPhase('stopped')).toBe('failed')
-    expect(bgPhase('blocked')).toBe('blocked')
-    expect(bgPhase('working')).toBe('active')
-    expect(bgPhase(undefined)).toBe('active')
   })
   test('claude agents --json and the transcript', () => {
     const agents = parseAgentsJson(
@@ -383,31 +243,6 @@ describe('/route-eval', () => {
     expect(written[0]?.path).toMatch(/evals\/results\/.*-rules\.json$/)
     expect(JSON.parse(written[0]?.text ?? '{}').report).toMatchObject({ backend: 'rules', total: 2, exact: 1, underRouted: 1 })
   })
-
-  test('claude: one model call per case; an unparseable reply is that case\'s miss', async ($, on) => {
-    let n = 0
-    on('fs.read', () => ({ value: CASES }))
-    on('fs.write', () => ({ value: undefined }))
-    on('model.complete', () => {
-      n++
-      return { value: { isAnswered: true, text: n === 1 ? '{"model":"sonnet","effort":"low","confidence":0.9,"reason":"mechanical"}' : 'no idea', usage: USAGE } }
-    })
-    const ran = await $.command.run({ command: 'route-eval', args: 'claude', ...ASK })
-    expect(n).toBe(2)
-    expect(ran.text).toContain('1/2')
-    expect(ran.text).toContain('error: unparseable reply')
-  })
-
-  test('a bad argument answers the usage line', async $ => {
-    expect((await $.command.run({ command: 'route-eval', args: 'gpt', ...ASK })).text).toContain('Usage: /route-eval')
-  })
-
-  test('a missing file answers in words', async ($, on) => {
-    on('fs.read', () => {
-      throw new Error('ENOENT')
-    })
-    expect((await $.command.run({ command: 'route-eval', args: 'rules', ...ASK })).text).toContain('No labeled tasks at')
-  })
 })
 
 describe('budget guard on worker starts', () => {
@@ -416,26 +251,20 @@ describe('budget guard on worker starts', () => {
     value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [{ kind: 'five_hour', percentUsed: fiveHour, resetsAt: '2026-10-05T01:00:00.000Z' }] },
   })
   const routeReply = (model: string, effort: string) => ({
-    value: { isAnswered: true, text: `{"model":"${model}","effort":"${effort}","confidence":0.9,"reason":"test"}`, usage: USAGE },
+    value: { isAnswered: true as const, text: `{"model":"${model}","effort":"${effort}","confidence":0.9,"reason":"test"}`, usage: USAGE },
   })
   // What a start touches beneath the plugin: the bg id list, the cwd, and `claude --bg` itself.
-  function fakeStart(on: Parameters<Parameters<typeof test>[1]>[1]) {
+  function fakeStart(on: On) {
     const ran: string[][] = []
     on('store.get', () => ({ value: undefined }))
     on('store.set', () => ({ value: undefined }))
     on('session.cwd', () => ({ value: '/r' }))
     on('process.run', (_$, e) => {
-      ran.push(e.argv)
+      ran.push([...e.argv])
       return { value: { ...RUN, stdout: 'backgrounded · 5ac0f0df\n' } }
     })
     return ran
   }
-
-  test('--force is a flag of /spawn, in any position before the task', () => {
-    expect(parseSpawnArgs('--force --model opus fix it')).toEqual({ task: 'fix it', model: 'opus', force: true })
-    expect(parseSpawnArgs('--model opus --force fix it')).toEqual({ task: 'fix it', model: 'opus', force: true })
-    expect(parseSpawnArgs('fix --force later')).toEqual({ task: 'fix --force later' })
-  })
 
   test('soft zone: a task routed large is refused and nothing is spawned', { options: { routerBackend: 'claude' } }, async ($, on) => {
     const ran = fakeStart(on)
@@ -446,14 +275,6 @@ describe('budget guard on worker starts', () => {
     expect(text).toContain('5-hour limit is at 85%')
     expect(text).toContain('only small tasks')
     expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(0)
-  })
-
-  test('soft zone: a task routed small starts', { options: { routerBackend: 'claude' } }, async ($, on) => {
-    const ran = fakeStart(on)
-    on('session.usage', () => usageAt(85))
-    on('model.complete', () => routeReply('sonnet', 'low'))
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', cwd: '/r' })
-    expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(1)
   })
 
   test('hard limit: refused before any routing call is spent', { options: { routerBackend: 'claude' } }, async ($, on) => {

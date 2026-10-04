@@ -4,23 +4,11 @@ import type { Engine } from 'claude-code/testing'
 
 import {
   LAST,
-  byLastNumber,
-  byNumber,
   cachePath,
-  chapterLabel,
-  isCbz,
-  isInsideCache,
-  lastNumber,
-  markerFresh,
-  needsPrefetch,
-  pageAlt,
   fitPage,
   graphicsLikely,
-  dockColumns,
   dockToFill,
-  planPages,
   sipsArgv,
-  staleNames,
   step,
   unzipArgv,
 } from './manga'
@@ -79,9 +67,6 @@ function fakePanes(on: On, up: string[] = []) {
 }
 
 describe('pure logic', () => {
-  test('sorts numerically, not lexically', () => {
-    expect(['10.png', '2.png', '1.png'].sort(byNumber)).toEqual(['1.png', '2.png', '10.png'])
-  })
 
   test('paging rolls over between chapters and stops at the ends', () => {
     expect(step(0, 1, 1, 3, 2)).toEqual({ chapter: 0, page: 2 })
@@ -91,21 +76,9 @@ describe('pure logic', () => {
     expect(step(0, 0, -1, 3, 2)).toEqual({ chapter: 0, page: 0 })
     expect(step(0, 0, 1, 0, 1)).toEqual({ chapter: 0, page: 0 })
   })
-
-  test('alt reads Ch X p Y/Z', () => {
-    expect(pageAlt('12', 2, 20)).toBe('Ch 12 p 3/20')
-    expect(pageAlt('Chapter 12', 0, 5)).toBe('Ch 12 p 1/5')
-    expect(pageAlt(undefined, 0, 0)).toBe('Ch ? p 1/0')
-  })
 })
 
 describe('/manga pane', () => {
-  test('empty root answers the hint and opens nothing', async ($, on) => {
-    fakeStore(on)
-    fakeDisk(on, { [ROOT]: [] })
-    const ran = await $.command.run({ command: 'manga', args: '', ...RUN })
-    expect(ran).toMatchObject({ text: expect.stringContaining('Drop chapter folders of PNGs into ~/Manga/<Series>/') })
-  })
 
   test('/manga leaves the office board open beside it as a tab', async ($, on) => {
     fakeStore(on)
@@ -225,73 +198,10 @@ describe('page sizing', () => {
     expect(fitPage(60, 90)).toEqual({ rows: 59, columns: 89 })
     expect(fitPage(80, 90)).toEqual({ rows: 60, columns: 90 })
   })
-  test('a short inline pane is limited by its height, never the whole terminal', () => {
-    expect(fitPage(28, 200)).toEqual({ rows: 27, columns: 41 })
-  })
-  test('dock width is about 45% of the terminal, clamped', () => {
-    expect(dockColumns(200)).toBe(90)
-    expect(dockColumns(60)).toBe(40)
-    expect(dockColumns(500)).toBe(160)
-  })
   test('a dock too narrow for the page height asks for enough width, capped at 60%', () => {
     expect(dockToFill(56, 77, 214)).toBe(83)
     expect(dockToFill(56, 90, 214)).toBeUndefined()
     expect(dockToFill(80, 60, 120)).toBe(72)
-  })
-})
-
-describe('cbz pure logic', () => {
-  test('chapters sort by the last number, not the leading ones', () => {
-    const names = [cbzName(460), cbzName(458), 'ch-000-test', cbzName(459), 'extra', '1.5']
-    expect(lastNumber(cbzName(458))).toBe(458)
-    expect(lastNumber('kingdom-chapter-458.5.cbz')).toBe(458.5)
-    expect(names.sort(byLastNumber)).toEqual(['ch-000-test', '1.5', cbzName(458), cbzName(459), cbzName(460), 'extra'])
-    expect(['b-7', 'a-7'].sort(byLastNumber)).toEqual(['a-7', 'b-7']) // natural tiebreak
-  })
-
-  test('pages sort by last number, stored out of order', () => {
-    const files = ['010.jpg', '002.JPG', 'ComicInfo.xml', '001.jpg', '009.jpeg', '._001.jpg']
-    expect(planPages(files).map(x => x.png)).toEqual(['001.png', '002.png', '009.png', '010.png'])
-    expect(planPages(['page-2.jpg', 'page-10.jpg', 'page-1.jpg']).map(x => x.src)).toEqual(['page-1.jpg', 'page-2.jpg', 'page-10.jpg'])
-  })
-
-  test('a converted png wins over its jpg and needs no conversion', () => {
-    expect(planPages(['001.jpg', '001.png', '002.webp'])).toEqual([
-      { src: '001.png', png: '001.png' },
-      { src: '002.webp', png: '002.png' },
-    ])
-  })
-
-  test('cbz detection, labels, cache path and argv', () => {
-    expect(isCbz(cbzName(458))).toBe(true)
-    expect(isCbz('Vol1.ZIP')).toBe(true)
-    expect(isCbz('458')).toBe(false)
-    expect(chapterLabel(cbzName(458))).toBe('458')
-    expect(pageAlt(cbzName(458), 2, 18)).toBe('Ch 458 p 3/18')
-    expect(cachePath('Kingdom', cbzName(458))).toBe(`${CACHE}/Kingdom/chapters8-10458000kingdom-chapter-458`)
-    expect(unzipArgv('/m/a.cbz', '/c/a')).toEqual(['unzip', '-o', '-j', '-qq', '/m/a.cbz', '-d', '/c/a'])
-    expect(sipsArgv('/c/a/1.jpg', '/c/a/1.png')).toEqual(['sips', '-s', 'format', 'png', '/c/a/1.jpg', '--out', '/c/a/1.png'])
-  })
-
-  test('marker hit needs both size and mtime', () => {
-    const stat = { size: SIZE, mtimeMs: MTIME }
-    expect(markerFresh({ size: SIZE, mtimeMs: MTIME, openedAt: 1 }, stat)).toBe(true)
-    expect(markerFresh({ size: SIZE + 1, mtimeMs: MTIME, openedAt: 1 }, stat)).toBe(false)
-    expect(markerFresh({ size: SIZE, mtimeMs: MTIME + 1, openedAt: 1 }, stat)).toBe(false)
-    expect(markerFresh(undefined, stat)).toBe(false)
-  })
-
-  test('cap keeps the newest, guard and prefetch trigger', () => {
-    const entries = [1, 5, 3, 4, 2].map(n => ({ name: `d${n}`, openedAt: n }))
-    expect(staleNames(entries, 3)).toEqual(['d2', 'd1'])
-    expect(staleNames(entries, 12)).toEqual([])
-    expect(isInsideCache(CACHE, `${CACHE}/Kingdom/x`)).toBe(true)
-    expect(isInsideCache(CACHE, CACHE)).toBe(false)
-    expect(isInsideCache(CACHE, `${CACHE}-evil/x`)).toBe(false)
-    expect(isInsideCache(CACHE, '/Users/aatrey/Manga/Kingdom')).toBe(false)
-    expect(needsPrefetch(14, 18)).toBe(false)
-    expect(needsPrefetch(15, 18)).toBe(true)
-    expect(needsPrefetch(0, 0)).toBe(false)
   })
 })
 

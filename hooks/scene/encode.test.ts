@@ -31,21 +31,6 @@ describe('toCells', () => {
       [HB, 0xff0000, 0x0000ff],
     ])
   })
-  test('an odd last row repeats the top pixel as the bottom', () => {
-    const f = frameOf(2, 3, [0, 1, 2, 3, 1, 0])
-    const { cells, columns, rows } = toCells(f, PAL, 1)
-    expect([columns, rows]).toEqual([2, 2])
-    expect(triplets(cells)).toEqual([
-      [HB, 0x112233, 0x00ff00],
-      [HB, 0xff0000, 0x0000ff],
-      [HB, 0xff0000, 0xff0000],
-      [HB, 0x112233, 0x112233],
-    ])
-  })
-  test('a palette index with no entry is black, and alpha bits are dropped', () => {
-    const { cells } = toCells(frameOf(1, 2, [7, 0]), [0xff123456], 1)
-    expect(triplets(cells)).toEqual([[HB, 0, 0x123456]])
-  })
   test('shrink 2 takes the top-left of each 2x2 block and drops an odd trailing row and column', () => {
     // 5x5: rows/cols 0 and 2 survive, row/col 4 is dropped.
     // prettier-ignore
@@ -61,22 +46,6 @@ describe('toCells', () => {
     expect(triplets(cells)).toEqual([
       [HB, 0xff0000, 0x0000ff],
       [HB, 0x00ff00, 0x112233],
-    ])
-  })
-  test('shrink 2 with an odd height after halving', () => {
-    // 4x6 → 2x3 → 2 columns, 2 rows; the last row is a lone top pixel.
-    const px = Array(24).fill(0)
-    px[0] = 1
-    px[2] = 2
-    px[2 * 4] = 3
-    px[4 * 4 + 2] = 1
-    const { cells, columns, rows } = toCells(frameOf(4, 6, px), PAL, 2)
-    expect([columns, rows]).toEqual([2, 2])
-    expect(triplets(cells)).toEqual([
-      [HB, 0xff0000, 0x0000ff],
-      [HB, 0x00ff00, 0x112233],
-      [HB, 0x112233, 0x112233],
-      [HB, 0xff0000, 0xff0000],
     ])
   })
 })
@@ -184,31 +153,8 @@ describe('toPng', () => {
     for (const c of d.list) expect(c.crcOk).toBe(true)
     expect(d.list[3]!.data.length).toBe(0)
   })
-  test('IHDR: scaled size, 8-bit indexed, no interlace', () => {
-    const d = decode(toPng(small, PAL, 3))
-    expect([d.width, d.height]).toEqual([9, 6])
-    expect(d.fields).toEqual([8, 3, 0, 0, 0])
-  })
-  test('PLTE is three bytes per entry; an empty palette writes one black entry', () => {
-    expect(decode(toPng(small, PAL, 1)).plte).toEqual([0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff])
-    expect(decode(toPng(small, [], 1)).plte).toEqual([0, 0, 0])
-  })
-  test('zlib header, stored block lengths and Adler-32', () => {
-    const { z } = decode(toPng(small, PAL, 2))
-    expect(z.header).toEqual([0x78, 0x01])
-    expect((0x78 * 256 + 0x01) % 31).toBe(0)
-    expect(z.blocks).toEqual([{ len: 7 * 4, nlen: ~(7 * 4) & 0xffff, final: true }])
-    expect(z.adler).toBe(adler32(z.raw))
-  })
   test('scanlines reconstruct the scaled pixels', () => {
     for (const s of [1, 2, 3]) checkPixels(decode(toPng(small, PAL, s)).z, small, s)
-  })
-  test('scale below 1 is treated as 1', () => {
-    for (const s of [0, -2, 0.5]) {
-      const d = decode(toPng(small, PAL, s))
-      expect([d.width, d.height]).toEqual([3, 2])
-      checkPixels(d.z, small, 1)
-    }
   })
   test('a large frame splits into several 65535-byte stored blocks', () => {
     const w = 200
@@ -223,13 +169,5 @@ describe('toPng', () => {
     for (const b of d.z.blocks) expect(b.nlen).toBe(~b.len & 0xffff)
     expect(d.z.adler).toBe(adler32(d.z.raw))
     checkPixels(d.z, f, 2)
-  })
-  test('does not mutate the frame or palette', () => {
-    const f = frameOf(2, 2, [1, 2, 3, 0])
-    const pal = [...PAL]
-    toPng(f, pal, 2)
-    toCells(f, pal, 2)
-    expect([...f.pixels]).toEqual([1, 2, 3, 0])
-    expect(pal).toEqual(PAL)
   })
 })

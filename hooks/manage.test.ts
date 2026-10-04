@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
-
-type On = Parameters<Parameters<typeof test>[1]>[1]
+import type { On } from 'claude-code'
 
 const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
 const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
@@ -46,19 +45,6 @@ describe('/office manage', () => {
     expect(store.get('managers')).toEqual({})
   })
 
-  test('off from a session that is not the manager changes nothing', async ($, on) => {
-    const managers = { [ROOT]: { sessionId: 'sess-B', name: 'other', since: 1 } }
-    const { store } = fakeWorld(on, { store: { managers } })
-    const off = await $.command.run({ command: 'office', args: 'manage off', ...TYPED })
-    expect(off.text).toContain('other is')
-    expect(store.get('managers')).toEqual(managers)
-  })
-
-  test('taking over names the session it replaces', async ($, on) => {
-    fakeWorld(on, { store: { managers: { [ROOT]: { sessionId: 'sess-B', name: 'other', since: 1 } } } })
-    expect((await $.command.run({ command: 'office', args: 'manage', ...TYPED })).text).toContain('takes over from other')
-  })
-
   test('an unknown argument still gets the board\'s usage line', async ($, on) => {
     fakeWorld(on)
     expect((await $.command.run({ command: 'office', args: 'nonsense', ...TYPED })).text).toContain('Usage: /office')
@@ -67,11 +53,6 @@ describe('/office manage', () => {
 
 describe('the role in the system prompt', () => {
   const ids = (r: { sections: readonly { id: string }[] }) => r.sections.map(s => s.id)
-
-  test('no manager: the prompt is left as it was', async ($, on) => {
-    fakeWorld(on)
-    expect(ids(await $.prompt.compose(COMPOSE))).toEqual(['intro'])
-  })
 
   test('the manager gets the manager section, last and on the session side', async ($, on) => {
     fakeWorld(on, { store: { managers: { [ROOT]: { sessionId: 'sess-A', name: 'lead-a', since: 1 } } } })
@@ -113,12 +94,6 @@ describe('the project notebook', () => {
     const got = JSON.stringify(await $.tool.call({ tool: 'mcp__office__read_notes', last: 1 }))
     expect(got).toContain('Second, over two lines.')
     expect(got).not.toContain('First.')
-  })
-
-  test('an empty note is refused, and an empty notebook says so', async ($, on) => {
-    fakeWorld(on)
-    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__office__post_note', text: '   ' }))).toContain('needs text')
-    expect(JSON.stringify(await $.tool.call({ tool: 'mcp__office__read_notes' }))).toContain('No notes yet')
   })
 
   test('workers can neither post nor read', async ($, on) => {

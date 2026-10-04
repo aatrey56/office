@@ -29,7 +29,7 @@ export function findPath(map: TileMap, from: Tile, to: Tile): Tile[] {
   const queue = [start]
   for (let head = 0; head < queue.length; head++) {
     const cur = queue[head]
-    if (cur === goal) break
+    if (cur === undefined || cur === goal) break
     const cx = cur % w
     const cy = (cur - cx) / w
     for (const d of DIRS) {
@@ -75,9 +75,11 @@ export function stepActors(actors: Actor[], crew: Crew[], map: TileMap, pixels: 
     let facing: Facing = actor.facing
     const isOnTile = x % size === 0 && y % size === 0
     // Mid-step the actor is bound for path[0]; a new route must start there so it never cuts a corner.
-    const base: Tile = !isOnTile && path.length ? path[0] : { x: Math.round(x / size), y: Math.round(y / size) }
+    const heading = path[0]
+    const base: Tile = !isOnTile && heading ? heading : { x: Math.round(x / size), y: Math.round(y / size) }
     const isOnTarget = path.length === 0 && isSame(base, target)
-    if (!isOnTarget && (path.length === 0 || !isSame(path[path.length - 1], target))) {
+    const last = path[path.length - 1]
+    if (!isOnTarget && (!last || !isSame(last, target))) {
       const route = findPath(map, base, target)
       path = !isOnTile && actor.path.length ? [base, ...route] : route
     }
@@ -85,8 +87,10 @@ export function stepActors(actors: Actor[], crew: Crew[], map: TileMap, pixels: 
     let isMoved = false
     let left = pixels
     while (left > 0 && path.length) {
-      const wx = path[0].x * size
-      const wy = path[0].y * size
+      const next = path[0]
+      if (!next) break
+      const wx = next.x * size
+      const wy = next.y * size
       if (x !== wx) {
         const d = Math.min(left, Math.abs(wx - x))
         facing = wx > x ? 'right' : 'left'

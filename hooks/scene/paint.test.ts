@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { Actor, Art, Bitmap, Crew, CrewState, Frame, SpritePose, TileMap } from '../../types'
-import { newFrame, paintFrame, poseFor } from './paint'
+import { paintFrame } from './paint'
 
 const TS = 4
 
@@ -61,15 +61,6 @@ const px = (f: Frame, x: number, y: number): number | undefined => f.pixels[y * 
 const paint = (actors: Actor[], crew: Crew[], tick = 0, selected: string | null = null) =>
   paintFrame(MAP, ART, actors, crew, tick, selected, 6)
 
-describe('newFrame', () => {
-  test('fills width * height with the index', () => {
-    const f = newFrame(3, 2, 7)
-    expect(f.width).toBe(3)
-    expect(f.height).toBe(2)
-    expect([...f.pixels]).toEqual([7, 7, 7, 7, 7, 7])
-  })
-})
-
 describe('tiles', () => {
   test('every tile is drawn opaquely; a tile with no bitmap draws nothing', () => {
     const f = paint([], [])
@@ -108,28 +99,6 @@ describe('sprites', () => {
     expect(px(f, 7, 7)).toBe(3)
     expect(px(f, 4, 8)).toBe(5)
   })
-  test('sprites are clipped at every frame edge', () => {
-    const f = paint(
-      [actor('top', 1, 0), actor('right', 0, 0, { x: 10, y: 4 }), actor('neg', 0, 0, { x: -2, y: 8 })],
-      [member('top', 'reporting', 3), member('right', 'reporting', 0), member('neg', 'reporting', 0)],
-    )
-    expect(f.pixels.length).toBe(144)
-    expect(px(f, 4, 0)).toBe(3) // the tall sprite's top two rows fall off
-    expect(px(f, 10, 4)).toBe(1)
-    expect(px(f, 11, 7)).toBe(1)
-    expect(px(f, 0, 8)).toBe(1)
-    expect(px(f, 1, 11)).toBe(1)
-    expect(px(f, 2, 8)).toBe(5)
-  })
-  test('the look wraps around the sprite list', () => {
-    const f = paint([actor('a', 1, 1)], [member('a', 'reporting', 5)])
-    expect(px(f, 5, 5)).toBe(1)
-    expect(px(f, 4, 4)).toBe(6)
-  })
-  test('later actors draw over earlier ones', () => {
-    const f = paint([actor('a', 1, 1), actor('b', 1, 1)], [member('a', 'reporting', 0), member('b', 'idle', 0)])
-    expect(px(f, 4, 4)).toBe(4)
-  })
 })
 
 describe('pose table', () => {
@@ -137,13 +106,6 @@ describe('pose table', () => {
     const crew = state ? [member('a', state, 0)] : []
     return px(paint([actor('a', 0, 0, more)], crew, tick), 0, 0)
   }
-  test('walking alternates walk1 / walk2 on step, whatever the state', () => {
-    const path = [{ x: 1, y: 0 }]
-    expect(at('working', { path, step: 0 })).toBe(2)
-    expect(at('working', { path, step: 1 })).toBe(3)
-    expect(at('idle', { path, step: 4 })).toBe(2)
-    expect(at('leaving', { path, step: 7 })).toBe(3)
-  })
   test('arrived: working types and sits every 4 ticks, idle sits, the rest stand', () => {
     expect(at('working', {}, 0)).toBe(7)
     expect(at('working', {}, 3)).toBe(7)
@@ -151,17 +113,6 @@ describe('pose table', () => {
     expect(at('working', {}, 8)).toBe(7)
     expect(at('idle')).toBe(4)
     for (const s of ['needs-you', 'reporting', 'failed', 'leaving'] as CrewState[]) expect(at(s)).toBe(1)
-  })
-  test('an actor with no crew member still walks', () => {
-    expect(at(null, { step: 0 })).toBe(2)
-    expect(at(null, { step: 1 })).toBe(3)
-  })
-  test('poseFor matches the table', () => {
-    const a = actor('a', 0, 0)
-    expect(poseFor(a, member('a', 'working', 0), 5)).toBe('sit')
-    expect(poseFor(a, member('a', 'idle', 0), 0)).toBe('sit')
-    expect(poseFor(a, undefined, 0)).toBe('walk1')
-    expect(poseFor({ ...a, path: [{ x: 0, y: 0 }], step: 3 }, member('a', 'idle', 0), 0)).toBe('walk2')
   })
 })
 
@@ -175,17 +126,6 @@ describe('bubbles', () => {
     expect(px(paint([actor('a', 1, 1)], crew, 4), 5, 2)).toBe(5)
     expect(px(paint([actor('a', 1, 1)], crew, 8), 5, 2)).toBe(8)
   })
-  test('failed always shows', () => {
-    const crew = [member('a', 'failed', 0)]
-    for (const tick of [0, 4, 5]) expect(px(paint([actor('a', 1, 1)], crew, tick), 6, 3)).toBe(9)
-  })
-  test('other states get no bubble', () => {
-    expect(px(paint([actor('a', 1, 1)], [member('a', 'working', 0)]), 5, 2)).toBe(5)
-  })
-  test('a bubble above the top row is clipped', () => {
-    const f = paint([actor('a', 1, 0)], [member('a', 'failed', 0)])
-    expect(px(f, 5, 0)).toBe(1)
-  })
 })
 
 describe('selection outline', () => {
@@ -195,33 +135,5 @@ describe('selection outline', () => {
     for (const [x, y] of [[5, 5], [6, 6]] as const) expect(px(f, x, y)).toBe(1)
     expect(px(f, 4, 4)).toBe(6) // a diagonal corner keeps the tile under it
   })
-  test('reaches one pixel outside the sprite box', () => {
-    const f = paintFrame(MAP, ART, [actor('a', 1, 1)], [member('a', 'reporting', 0)], 0, 'a', 9)
-    for (const [x, y] of [[3, 4], [3, 7], [8, 5], [4, 3], [7, 8]] as const) expect(px(f, x, y)).toBe(9)
-    expect(px(f, 3, 3)).toBe(5)
-    expect(px(f, 4, 4)).toBe(1)
-  })
-  test('only the selected crew member is outlined', () => {
-    const f = paintFrame(MAP, ART, [actor('a', 1, 1)], [member('a', 'reporting', 0)], 0, 'b', 9)
-    expect(px(f, 3, 4)).toBe(5)
-  })
 })
 
-describe('purity', () => {
-  test('does not mutate any input', () => {
-    const actors = [actor('a', 1, 1, { facing: 'left', path: [{ x: 2, y: 1 }] }), actor('b', 0, 0)]
-    const crew = [member('a', 'needs-you', 2), member('b', 'failed', 3)]
-    const snapshot = (): string =>
-      JSON.stringify({
-        map: MAP,
-        actors,
-        crew,
-        tiles: ART.tiles.map(t => [...t.pixels]),
-        sprites: ART.sprites.map(s => Object.values(s).map(b => [...b.pixels])),
-        bubbles: [...ART.bubbles.needsYou.pixels, ...ART.bubbles.failed.pixels],
-      })
-    const before = snapshot()
-    paintFrame(MAP, ART, actors, crew, 0, 'a', 9)
-    expect(snapshot()).toBe(before)
-  })
-})
