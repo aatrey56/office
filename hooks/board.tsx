@@ -242,7 +242,7 @@ export function installBoard(on: On, options: PluginOptions) {
     await $.command.register({
       name: 'office',
       description: 'Session board: see, message and resume your other Claude Code sessions',
-      argumentHint: '[band|pane]',
+      argumentHint: '[band|pane|manage|manage off]',
       immediate: true,
     })
     await $.tool.register({
@@ -293,8 +293,10 @@ export function installBoard(on: On, options: PluginOptions) {
     return next(e)
   })
 
-  on('command.run', { command: 'office' }, async ($, e) => {
+  on('command.run', { command: 'office' }, async ($, e, next) => {
     const arg = e.args.trim().toLowerCase()
+    // `manage` and `manage off` are manage.tsx's: pass them on.
+    if (/^manage\b/.test(arg)) return next(e)
     if (arg === 'band') {
       await setMode($, 'band')
       await $.ui.close({ id: PANE })
@@ -306,7 +308,7 @@ export function installBoard(on: On, options: PluginOptions) {
       await setMode($, 'pane')
       return openPane($)
     }
-    if (arg !== '') return { text: 'Usage: /office [band|pane]' }
+    if (arg !== '') return { text: 'Usage: /office [band|pane|manage|manage off]' }
     if ((await read($, mode)) === 'band') {
       await refresh($)
       const count = (await read($, sessions)).length
