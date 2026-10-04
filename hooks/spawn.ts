@@ -248,16 +248,23 @@ export function readTranscript(text: string): { result?: string; tail: string } 
   return { result, tail: lines.join('\n').slice(-TAIL_MAX) }
 }
 
-/** `/spawn [--mode m] [--model x] [--effort e] [--] <task>` */
+/** `/spawn [--force] [--mode m] [--model x] [--effort e] [--] <task>`; --force starts past the budget's hard limit. */
 export function parseSpawnArgs(raw: string): {
   task: string
   mode?: string
   model?: string
   effort?: string
+  force?: true
 } {
-  const out: { task: string; mode?: string; model?: string; effort?: string } = { task: '' }
+  const out: { task: string; mode?: string; model?: string; effort?: string; force?: true } = { task: '' }
   let rest = raw.trim()
   for (;;) {
+    const f = rest.match(/^--force(?:\s+|$)/)
+    if (f) {
+      out.force = true
+      rest = rest.slice(f[0].length)
+      continue
+    }
     const m = rest.match(/^--(mode|model|effort)(?:=|\s+)(\S+)\s*/)
     if (!m) break
     const key = m[1] as 'mode' | 'model' | 'effort'

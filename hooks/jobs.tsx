@@ -1,7 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-import type { Effort, EvalReport, Job, RouteCase, RouteDecision, RouteOutcome } from '../types'
+import type { BudgetCaps, Effort, EvalReport, Job, ModelTier, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
+import { budgetVerdict, DEFAULT_CAPS, isSmallRoute } from './budget'
 import { formatReport, parseCases, scoreRoutes } from './evals'
 import {
   CODEX_EXEC_TOOL,
@@ -164,7 +165,7 @@ export function installJobs(on: On, options: PluginOptions) {
       await $.command.register({
         name: 'spawn',
         description: 'Route a task to a model tier and run it as a claude --bg worker',
-        argumentHint: '[--mode bg|headless|subagent] [--model m] [--effort e] <task>',
+        argumentHint: '[--force] [--mode bg|headless|subagent] [--model m] [--effort e] <task>',
       })
       await $.command.register({
         name: 'route-task',
@@ -220,7 +221,7 @@ export function installJobs(on: On, options: PluginOptions) {
     const task = str(input.task)
     if (!task) return { deny: 'spawn_worker needs a task.' }
     const mode: WorkerMode = isWorkerMode(input.mode) ? input.mode : 'bg'
-    const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd))
+    const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT)
     return msg.ok ? { result: msg.text } : { deny: msg.text }
   })
 
@@ -239,11 +240,11 @@ export function installJobs(on: On, options: PluginOptions) {
 
   on('command.run', { command: 'spawn' }, async ($, e) => {
     const args = parseSpawnArgs(e.args)
-    if (!args.task) return { text: 'Usage: /spawn [--mode bg|headless|subagent] [--model m] [--effort e] <task>' }
+    if (!args.task) return { text: 'Usage: /spawn [--force] [--mode bg|headless|subagent] [--model m] [--effort e] <task>' }
     if (args.mode !== undefined && !isWorkerMode(args.mode)) return { text: `Unknown mode "${args.mode}".` }
     if (args.effort !== undefined && !isEffort(args.effort)) return { text: `Unknown effort "${args.effort}".` }
     const mode: WorkerMode = isWorkerMode(args.mode) ? args.mode : 'bg'
-    const msg = await startWorker($, options, args.task, mode, args.model, args.effort, undefined)
+    const msg = await startWorker($, options, args.task, mode, args.model, args.effort, undefined, { isPerson: true, isForced: args.force === true })
     return { text: msg.text }
   })
 
@@ -1001,6 +1002,35 @@ async function startCodexExec(
 
 // ── workers ─────────────────────────────────────────────────────────────
 
+/** Who asked for a worker: a /spawn the person typed, or a tool call from a model. */
+type SpawnedBy = { isPerson: boolean; isForced: boolean }
+const BY_AGENT: SpawnedBy = { isPerson: false, isForced: false }
+
+/** The account's rate-limit windows; none when they cannot be read, which leaves the guard open. */
+async function rateWindows($: EngineInterface): Promise<RateWindow[]> {
+  try {
+    return (await $.session.usage()).rateLimits
+  } catch {
+    return []
+  }
+}
+
+function budgetCaps(options: PluginOptions): BudgetCaps {
+  return {
+    softFiveHourPct: num(options, 'budgetSoftFiveHourPct', DEFAULT_CAPS.softFiveHourPct),
+    softSevenDayPct: num(options, 'budgetSoftSevenDayPct', DEFAULT_CAPS.softSevenDayPct),
+    hardPct: num(options, 'budgetHardPct', DEFAULT_CAPS.hardPct),
+  }
+}
+
+/** The tier a full model id belongs to, for sizing a model the caller named; unknown ids count as large. */
+function tierOfModelId(modelId: string): ModelTier {
+  if (modelId.includes('haiku')) return 'haiku'
+  if (modelId.includes('sonnet')) return 'sonnet'
+  if (modelId.includes('fable')) return 'fable'
+  return 'opus'
+}
+
 async function startWorker(
   $: EngineInterface,
   options: PluginOptions,
@@ -1009,14 +1039,31 @@ async function startWorker(
   modelArg: string | undefined,
   effortArg: unknown,
   cwdArg: string | undefined,
+  by: SpawnedBy,
 ): Promise<Started> {
   const full = await capacityError($, options)
   if (full) return { ok: false, text: full }
+  // The budget guard, in two looks: past the hard limit nothing starts, so no routing call
+  // is spent finding out the task's size; in the soft zone the route decides.
+  const windows = await rateWindows($)
+  const caps = budgetCaps(options)
+  const isForced = by.isPerson && by.isForced
+  const atHard = budgetVerdict(windows, caps, { isSmall: false, isExplicit: false, isForced })
+  if (!atHard.isAllowed && atHard.zone === 'hard') return { ok: false, text: `${atHard.reason}. /spawn --force (typed by the person) is the only override.` }
   const cwd = await resolveCwd($, cwdArg)
   const now = Date.now()
   const routed = modelArg === undefined ? await route($, options, task) : undefined
   const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet', now)
   const effort: Effort = isEffort(effortArg) ? effortArg : (routed?.effort ?? 'medium')
+  const verdict = budgetVerdict(windows, caps, {
+    isSmall: isSmallRoute(routed?.model ?? tierOfModelId(modelId), effort),
+    // Only a model the person typed counts as their explicit choice; an agent's does not.
+    isExplicit: by.isPerson && modelArg !== undefined,
+    isForced,
+  })
+  if (!verdict.isAllowed) {
+    return { ok: false, text: `${verdict.reason}. This task was sized as ${modelId} at ${effort} effort; only small tasks (sonnet at low or medium) start in the soft zone.` }
+  }
   const job: Job = {
     id: newJobId(now),
     kind: 'worker',
@@ -1030,7 +1077,7 @@ async function startWorker(
     mode,
     tail: '',
   }
-  const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}`
+  const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}${verdict.warning ? `. Budget: ${verdict.warning}` : ''}`
 
   if (mode === 'subagent') {
     const spawned = await $.agent

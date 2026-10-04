@@ -1,6 +1,6 @@
 {
   "name": "office",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Multi-session switchboard: session board + tap-in, Codex review handoff, model router/spawner, manga reader",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -100,6 +100,24 @@
         "allow"
       ],
       "default": "same-repo"
+    },
+    "budgetSoftFiveHourPct": {
+      "type": "number",
+      "title": "Budget: 5-hour soft line (%)",
+      "description": "From this share of the 5-hour limit, only small routed tasks (sonnet at low or medium effort) start as workers.",
+      "default": 80
+    },
+    "budgetSoftSevenDayPct": {
+      "type": "number",
+      "title": "Budget: weekly soft line (%)",
+      "description": "From this share of the weekly limit, only small routed tasks start as workers.",
+      "default": 85
+    },
+    "budgetHardPct": {
+      "type": "number",
+      "title": "Budget: hard limit (%)",
+      "description": "At this share of either limit no worker starts, unless you type /spawn --force.",
+      "default": 95
     }
   }
 }

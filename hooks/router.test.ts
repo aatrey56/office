@@ -409,3 +409,86 @@ describe('/route-eval', () => {
     expect((await $.command.run({ command: 'route-eval', args: 'rules', ...ASK })).text).toContain('No labeled tasks at')
   })
 })
+
+describe('budget guard on worker starts', () => {
+  const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
+  const usageAt = (fiveHour: number) => ({
+    value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [{ kind: 'five_hour', percentUsed: fiveHour, resetsAt: '2026-10-05T01:00:00.000Z' }] },
+  })
+  const routeReply = (model: string, effort: string) => ({
+    value: { isAnswered: true, text: `{"model":"${model}","effort":"${effort}","confidence":0.9,"reason":"test"}`, usage: USAGE },
+  })
+  // What a start touches beneath the plugin: the bg id list, the cwd, and `claude --bg` itself.
+  function fakeStart(on: Parameters<Parameters<typeof test>[1]>[1]) {
+    const ran: string[][] = []
+    on('store.get', () => ({ value: undefined }))
+    on('store.set', () => ({ value: undefined }))
+    on('session.cwd', () => ({ value: '/r' }))
+    on('process.run', (_$, e) => {
+      ran.push(e.argv)
+      return { value: { ...RUN, stdout: 'backgrounded · 5ac0f0df\n' } }
+    })
+    return ran
+  }
+
+  test('--force is a flag of /spawn, in any position before the task', () => {
+    expect(parseSpawnArgs('--force --model opus fix it')).toEqual({ task: 'fix it', model: 'opus', force: true })
+    expect(parseSpawnArgs('--model opus --force fix it')).toEqual({ task: 'fix it', model: 'opus', force: true })
+    expect(parseSpawnArgs('fix --force later')).toEqual({ task: 'fix --force later' })
+  })
+
+  test('soft zone: a task routed large is refused and nothing is spawned', { options: { routerBackend: 'claude' } }, async ($, on) => {
+    const ran = fakeStart(on)
+    on('session.usage', () => usageAt(85))
+    on('model.complete', () => routeReply('opus', 'high'))
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'debug the crash', cwd: '/r' })
+    const text = JSON.stringify(r)
+    expect(text).toContain('5-hour limit is at 85%')
+    expect(text).toContain('only small tasks')
+    expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(0)
+  })
+
+  test('soft zone: a task routed small starts', { options: { routerBackend: 'claude' } }, async ($, on) => {
+    const ran = fakeStart(on)
+    on('session.usage', () => usageAt(85))
+    on('model.complete', () => routeReply('sonnet', 'low'))
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', cwd: '/r' })
+    expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(1)
+  })
+
+  test('hard limit: refused before any routing call is spent', { options: { routerBackend: 'claude' } }, async ($, on) => {
+    const ran = fakeStart(on)
+    let routed = 0
+    on('session.usage', () => usageAt(96))
+    on('model.complete', () => {
+      routed++
+      return routeReply('sonnet', 'low')
+    })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', cwd: '/r' })
+    expect(JSON.stringify(r)).toContain('hard limit 95%')
+    expect(routed).toBe(0)
+    expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(0)
+  })
+
+  test('an agent naming a model does not count as the person choosing it', async ($, on) => {
+    const ran = fakeStart(on)
+    on('session.usage', () => usageAt(85))
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'design it', model: 'opus', cwd: '/r' })
+    expect(JSON.stringify(r)).toContain('only small tasks')
+    expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(0)
+  })
+
+  test('the person may pick a model in the soft zone (warned) and force past the hard limit', async ($, on) => {
+    const ran = fakeStart(on)
+    let used = 85
+    on('session.usage', () => usageAt(used))
+    const soft = await $.command.run({ command: 'spawn', args: '--model opus design it', ...TYPED })
+    expect(soft.text).toContain('soft zone')
+    used = 97
+    const refused = await $.command.run({ command: 'spawn', args: '--model sonnet --effort low tidy it', ...TYPED })
+    expect(refused.text).toContain('hard limit 95%')
+    const forced = await $.command.run({ command: 'spawn', args: '--force --model sonnet --effort low tidy it', ...TYPED })
+    expect(forced.text).toContain('Forced past the limit')
+    expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(2)
+  })
+})
