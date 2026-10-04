@@ -53,7 +53,7 @@ describe('budgetVerdict', () => {
   })
   test('hard zone: forced starts with a warning that names the window', () => {
     const v = budgetVerdict([five(97)], DEFAULT_CAPS, { ...none, isForced: true })
-    expect(v).toMatchObject({ isAllowed: true, zone: 'soft' })
+    expect(v).toMatchObject({ isAllowed: true, zone: 'hard' })
     const warning = (v as { warning: string }).warning
     expect(warning.startsWith('Forced past the limit:')).toBe(true)
     expect(warning).toContain('5-hour limit')

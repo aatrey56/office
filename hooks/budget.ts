@@ -53,8 +53,7 @@ export function budgetVerdict(
   const hard = worst(windows, () => caps.hardPct)
   if (hard !== undefined) {
     const what = describe(hard.w, hard.line, 'hard limit')
-    // The type has no allowed 'hard' zone, so a forced start reports as soft with a loud warning.
-    if (ask.isForced) return { isAllowed: true, zone: 'soft', warning: `Forced past the limit: ${what}` }
+    if (ask.isForced) return { isAllowed: true, zone: 'hard', warning: `Forced past the limit: ${what}` }
     return { isAllowed: false, zone: 'hard', reason: `Budget guard refused: ${what}` }
   }
   const soft = worst(windows, w => softLine(w, caps))

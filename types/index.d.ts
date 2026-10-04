@@ -137,7 +137,7 @@ export type EvalReport = {
 export type RateWindow = { kind: string; percentUsed: number; resetsAt?: string }
 export type BudgetCaps = { softFiveHourPct: number; softSevenDayPct: number; hardPct: number }
 export type BudgetVerdict =
-  | { isAllowed: true; zone: 'open' | 'soft'; warning?: string }
+  | { isAllowed: true; zone: 'open' | 'soft' | 'hard'; warning?: string } // 'hard' only when the person forced it
   | { isAllowed: false; zone: 'soft' | 'hard'; reason: string }
 
 // ── manager (manager.ts / manage.tsx) ────────────────────────────────────
