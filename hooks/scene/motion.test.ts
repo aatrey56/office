@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'claude-code/testing'
+import { officeMap } from './art'
 
 import type { Actor, Crew, Tile, TileMap } from '../../types'
 import { findPath, isSettled, stepActors } from './motion'
@@ -130,5 +131,15 @@ describe('stepActors leaving', () => {
     expect(actors).toHaveLength(1)
     expect(actors[0]).toMatchObject({ x: 0, y: 0, path: [], isGone: true })
     expect(stepActors(actors, crew, map, 8)).toEqual([])
+  })
+})
+
+describe('the real office', () => {
+  test('every seat can be walked to from the door', () => {
+    const map = officeMap()
+    for (const seat of map.seats) {
+      const path = findPath(map, map.door, seat.at)
+      expect(path.at(-1)).toEqual(seat.at)
+    }
   })
 })
