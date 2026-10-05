@@ -56,17 +56,20 @@ describe('pure helpers', () => {
 // The test environment has no disk or processes: answer them from memory, and
 // record every path read so the test can prove no .key file was touched.
 // `roots` answers `git rev-parse --show-toplevel` per cwd (absent: not a repo).
-type World = { roots?: Record<string, string>; selfCwd?: string; registered?: string[] }
+// `other`: a second live session, in another project.
+type World = { roots?: Record<string, string>; selfCwd?: string; registered?: string[]; other?: boolean }
 
 function fakeHost(on: On, reads: string[], world: World = {}) {
   const slugDir = `${HOME}/.claude/projects/${projectSlug(REGISTRY.cwd)}`
   on('fs.list', (_$, e) => ({
-    value: e.path === SESSIONS ? [file('49178.json'), file('49178.deadbeef.key'), file('5.json')] : [],
+    value: e.path === SESSIONS ? [file('49178.json'), file('49178.deadbeef.key'), file('5.json'), ...(world.other ? [file('7.json')] : [])] : [],
   }))
   on('fs.read', (_$, e) => {
     reads.push(e.path)
     if (e.path === `${SESSIONS}/49178.json`) return { value: JSON.stringify(REGISTRY) }
     if (e.path === `${SESSIONS}/5.json`) return { value: JSON.stringify({ ...REGISTRY, pid: 5, sessionId: 'dead' }) }
+    if (world.other && e.path === `${SESSIONS}/7.json`)
+      return { value: JSON.stringify({ ...REGISTRY, pid: 7, sessionId: 'bbbb-2222', name: 'other-1', cwd: '/Users/me/Other' }) }
     throw new Error(`ENOENT ${e.path}`)
   })
   on('fs.stat', (_$, e) => {
@@ -78,7 +81,7 @@ function fakeHost(on: On, reads: string[], world: World = {}) {
   })
   on('process.run', (_$, e) => {
     const [cmd] = e.argv
-    if (cmd === 'ps') return out(0, '49178\n')
+    if (cmd === 'ps') return out(0, world.other ? '49178\n7\n' : '49178\n')
     if (cmd === 'tail') return out(0, TRANSCRIPT)
     if (cmd === 'git' && e.argv[1] === '-C') {
       const root = world.roots?.[e.argv[2] ?? '']
@@ -140,6 +143,27 @@ test('the pane lists sessions and selects one', async ($, on) => {
   expect(await ui.find({ key: 'msg' })).toBeDefined()
   await ui.press({ key: 'scene' })
   expect(await ui.find({ key: 'copy' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the office scene with sessions in two projects: pictures, the crew list, and switching offices', async ($, on) => {
+  mock.env(on, { HOME, TERM_PROGRAM: 'ghostty' })
+  fakeHost(on, [], { other: true })
+  await $.session.start({ cwd: HOME, surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'mcp__office__list_sessions', tool_use_id: 'call-3' })
+  const ui = await $.ui.mount({
+    plugin: 'office',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'office',
+    props: { title: 'Office', isFocused: true, bodyColumns: 160, placement: 'dock', scroll: { offset: 0, bodyRows: 80 } },
+  } as Parameters<typeof $.ui.mount>[0])
+  expect(await ui.find({ type: 'Image', key: 'scene' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /error/ })).toBeUndefined()
+  const before = (await ui.find({ type: 'Button', text: /coding-0b|other-1/ }))?.props.label
+  await ui.press({ key: 'next-proj' })
+  const after = (await ui.find({ type: 'Button', text: /coding-0b|other-1/ }))?.props.label
+  expect(after).not.toBe(before)
   await ui.unmount()
 })
 

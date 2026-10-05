@@ -211,8 +211,8 @@ export function installScene(on: On) {
         <Box gap={1}>
           <Text bold>{projectName}</Text>
           {usage && <Text dimColor>{usage}</Text>}
-          {all.length > 1 && <Button plain key="prev-proj" label="prev office" hotkey="[" onPress={cycle(-1)} />}
-          {all.length > 1 && <Button plain key="next-proj" label="next office" hotkey="]" onPress={cycle(1)} />}
+          {all.length > 1 && <Button plain key="prev-proj" label="prev office" hotkey="h" onPress={cycle(-1)} />}
+          {all.length > 1 && <Button plain key="next-proj" label="next office" hotkey="l" onPress={cycle(1)} />}
           <Button plain key="text" label="text board" hotkey="t" onPress={() => update($, VIEW, () => 'text')} />
           <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', focus: true })} />
         </Box>
