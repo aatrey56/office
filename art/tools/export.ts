@@ -6,7 +6,7 @@ import { PALETTES, rgb8 } from './art'
 
 // Writes the mod's hooks/scene/art-data.ts: one shared palette, the office cut into 16 px tiles,
 // the map (tiles, walkable, seats, door) and every crew look's frames. Generated: edit tools/, not the output.
-const OUT = '/Users/aatrey/.claude/dev-mods/2cb96d62-1d23-4435-9b5c-280236cac8ba/office/hooks/scene/art-data.ts'
+const OUT = new URL('../../mod/hooks/scene/art-data.ts', import.meta.url).pathname // the mod, next door
 
 const palette: number[] = [0x000000] // index 0: transparent for sprites
 const index = (r: number, g: number, b: number) => {
