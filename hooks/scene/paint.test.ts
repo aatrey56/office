@@ -28,6 +28,7 @@ const ART: Art = {
     facings(allPoses(solid(3, 4, 6))),
   ],
   bubbles: { needsYou: solid(8, 2, 2), failed: solid(9, 2, 2), music: [], thinking: solid(9, 2, 2) },
+  props: [],
 }
 
 // 3x3 tiles; the middle tile is index 1, the bottom-right one has no bitmap.

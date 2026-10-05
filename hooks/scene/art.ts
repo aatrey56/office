@@ -1,4 +1,4 @@
-import type { Art, Bitmap, Facing, RoomId, Seat, SpritePose, TileMap } from '../../types'
+import type { Art, Bitmap, Facing, Prop, RoomId, Seat, SpritePose, TileMap } from '../../types'
 import { ART_DATA } from './art-data'
 
 // The office map, its tiles, and the crew sprites. The pixels are made in ~/Coding/office-art
@@ -16,6 +16,10 @@ export function bitmapOf(rows: string[], key: Record<string, number>): Bitmap {
 
 const square = (b64: string): Bitmap => ({ width: ART_DATA.tileSize, height: ART_DATA.tileSize, pixels: fromBase64(b64) })
 const sprite = (b64: string): Bitmap => ({ width: 16, height: 16, pixels: fromBase64(b64) })
+
+// Furniture as the export writes it; older exports have no `props`, and seats may lack dy / zBias.
+type RawProp = { name: string; x: number; y: number; width: number; height: number; pixels: string; sortY: number; floor: boolean }
+type RawSeat = { dx?: number; dy?: number; zBias?: boolean }
 
 // Decoded once: the scene asks for the art on every frame.
 let art: Art | undefined
@@ -46,6 +50,9 @@ export function officeArt(_tileSize: 8 | 16 = 16): Art {
       music: ART_DATA.bubbles.music.map(b),
       thinking: b(ART_DATA.bubbles.thinking),
     },
+    props: ((ART_DATA as unknown as { props?: RawProp[] }).props ?? []).map(
+      (p): Prop => ({ name: p.name, bitmap: b(p), x: p.x, y: p.y, sortY: p.sortY, floor: p.floor }),
+    ),
   }
   return art
 }
@@ -58,7 +65,17 @@ export function officeMap(_tileSize: 8 | 16 = 16): TileMap {
     tileSize: ART_DATA.tileSize,
     tiles: [...ART_DATA.map],
     walkable: [...ART_DATA.walkable],
-    seats: ART_DATA.seats.map(s => ({ room: s.room as RoomId, at: { ...s.at }, facing: s.facing as Facing, ...('dx' in s && s.dx ? { dx: s.dx } : {}) }) satisfies Seat),
+    seats: ART_DATA.seats.map(s => {
+      const r = s as RawSeat
+      return {
+        room: s.room as RoomId,
+        at: { ...s.at },
+        facing: s.facing as Facing,
+        ...(r.dx ? { dx: r.dx } : {}),
+        ...(r.dy ? { dy: r.dy } : {}),
+        ...(r.zBias ? { zBias: true } : {}),
+      } satisfies Seat
+    }),
     door: { ...ART_DATA.door },
   }
   return map

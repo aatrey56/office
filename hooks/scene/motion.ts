@@ -14,6 +14,10 @@ function isInside(map: TileMap, t: Tile): boolean {
   return Number.isInteger(t.x) && Number.isInteger(t.y) && t.x >= 0 && t.y >= 0 && t.x < map.width && t.y < map.height
 }
 
+function isBetween(v: number, a: number, b: number): boolean {
+  return v >= Math.min(a, b) && v <= Math.max(a, b)
+}
+
 function isSame(a: Tile, b: Tile): boolean {
   return a.x === b.x && a.y === b.y
 }
@@ -69,15 +73,24 @@ export function stepActors(actors: Actor[], crew: Crew[], map: TileMap, pixels: 
     const isLeaving = !member || member.state === 'leaving'
     const target = isLeaving ? map.door : (member as Crew).seat
     const dx = isLeaving ? 0 : ((member as Crew).seatDx ?? 0)
+    const dy = isLeaving ? 0 : ((member as Crew).seatDy ?? 0)
 
     let x = actor.x
     let y = actor.y
     let path = actor.path.slice()
     let facing: Facing = actor.facing
     const isOnTile = x % size === 0 && y % size === 0
+    // The arrival pixel: the seat's cell nudged by the seat's dx / dy (each under a tile).
+    const cellX = target.x * size
+    const cellY = target.y * size
+    const seatX = cellX + dx
+    const seatY = cellY + dy
     // Mid-step the actor is bound for path[0]; a new route must start there so it never cuts a corner.
+    // Between its seat's cell and the nudged pixel it is already there.
     const heading = path[0]
-    const base: Tile = !isOnTile && heading ? heading : { x: Math.round((x - dx) / size), y: Math.round(y / size) }
+    const isNudging = path.length === 0 && isBetween(x, cellX, seatX) && isBetween(y, cellY, seatY)
+    const base: Tile =
+      !isOnTile && heading ? heading : isNudging ? target : { x: Math.round((x - dx) / size), y: Math.round((y - dy) / size) }
     const isOnTarget = path.length === 0 && isSame(base, target)
     const last = path[path.length - 1]
     if (!isOnTarget && (!last || !isSame(last, target))) {
@@ -107,15 +120,22 @@ export function stepActors(actors: Actor[], crew: Crew[], map: TileMap, pixels: 
       }
       if (x === wx && y === wy) path.shift()
     }
-    // On the seat's cell: the last few pixels sideways, so the sitter centres on its desk.
-    const seatX = target.x * size + dx
-    if (left > 0 && path.length === 0 && y === target.y * size && x !== seatX && Math.abs(x - seatX) < size) {
+    // On the seat's cell: the last few pixels sideways, then up or down, so the sitter centres on
+    // its desk and sinks into (or rises onto) its seat.
+    const isClose = path.length === 0 && Math.abs(x - seatX) < size && Math.abs(y - seatY) < size
+    if (left > 0 && isClose && x !== seatX) {
       const d = Math.min(left, Math.abs(seatX - x))
       x += seatX > x ? d : -d
+      left -= d
+      isMoved = true
+    }
+    if (left > 0 && isClose && x === seatX && y !== seatY) {
+      const d = Math.min(left, Math.abs(seatY - y))
+      y += seatY > y ? d : -d
       isMoved = true
     }
 
-    const isArrived = path.length === 0 && x === seatX && y === target.y * size
+    const isArrived = path.length === 0 && x === seatX && y === seatY
     if (isArrived && !isLeaving) facing = (member as Crew).facing
     out.push({ id: actor.id, x, y, path, facing, step: actor.step + (isMoved ? 1 : 0), isGone: isArrived && isLeaving })
   }

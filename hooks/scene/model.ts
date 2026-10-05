@@ -1,4 +1,4 @@
-import type { Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId, SessionCard, Tile, TileMap, Activity } from '../../types'
+import type { Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId, Seat, SessionCard, Tile, TileMap, Activity } from '../../types'
 import { LOOKS } from './art'
 import { clip } from '../sessions'
 
@@ -128,6 +128,11 @@ function standingTiles(map: TileMap, room: RoomId, seatTiles: Set<string>): Tile
   return out.sort((a, b) => a.d - b.d || a.t.y - b.t.y || a.t.x - b.t.x).map(o => o.t)
 }
 
+// What a seat passes on to its sitter: the pixel nudge and whether it draws on top.
+function seatShift(seat: Seat): Pick<Crew, 'seatDx' | 'seatDy' | 'seatZ'> {
+  return { ...(seat.dx ? { seatDx: seat.dx } : {}), ...(seat.dy ? { seatDy: seat.dy } : {}), ...(seat.zBias ? { seatZ: true } : {}) }
+}
+
 // Gives each crew member of `project` a free seat in its room (stable across calls: the same
 // id keeps its seat while its room is unchanged). More crew than seats: the rest stand on
 // walkable tiles of that room.
@@ -146,7 +151,7 @@ export function assignSeats(crew: Crew[], map: TileMap, project: string, previou
     const slot = `${c.room}:${seat ? key(seat.at) : ''}`
     if (!seat || taken.has(slot)) continue
     taken.add(slot)
-    kept.set(c.id, { ...c, seat: { ...seat.at }, facing: seat.facing, ...(seat.dx ? { seatDx: seat.dx } : {}) })
+    kept.set(c.id, { ...c, seat: { ...seat.at }, facing: seat.facing, ...seatShift(seat) })
   }
 
   const standing = new Map<RoomId, Tile[]>()
@@ -159,7 +164,7 @@ export function assignSeats(crew: Crew[], map: TileMap, project: string, previou
     const free = map.seats.find(s => s.room === c.room && !taken.has(`${c.room}:${key(s.at)}`))
     if (free) {
       taken.add(`${c.room}:${key(free.at)}`)
-      return { ...c, seat: { ...free.at }, facing: free.facing, ...(free.dx ? { seatDx: free.dx } : {}) }
+      return { ...c, seat: { ...free.at }, facing: free.facing, ...seatShift(free) }
     }
 
     // Overflow: the nearest standing tile nobody has taken.

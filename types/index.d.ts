@@ -69,8 +69,9 @@ export type MangaShelf = {
 export type Tile = { x: number; y: number } // tile coordinates, 0,0 at the top left
 export type Facing = 'up' | 'down' | 'left' | 'right'
 export type RoomId = 'manager' | 'meeting' | 'coding' | 'break' | 'lobby' | 'whiteboard' | 'review'
-// dx: pixels to shift the sitter sideways, so one person centres on a two-cell desk.
-export type Seat = { room: RoomId; at: Tile; facing: Facing; dx?: number }
+// dx / dy: pixels to shift the sitter, so one person centres on a two-cell desk or sinks into a chair.
+// zBias: the sitter draws over whatever it sits on (a bench, a sofa) instead of sorting behind it.
+export type Seat = { room: RoomId; at: Tile; facing: Facing; dx?: number; dy?: number; zBias?: true }
 // tiles / walkable are row-major, width * height long. `door` is where crew enter and leave.
 export type TileMap = {
   width: number
@@ -95,6 +96,8 @@ export type Crew = {
   room: RoomId
   seat: Tile // where it stands once it has arrived
   seatDx?: number // the seat's sideways shift, in pixels
+  seatDy?: number // the seat's vertical shift, in pixels
+  seatZ?: true // once arrived, drawn over the furniture it sits on
   facing: Facing
   look: number // which base sprite and color swap, stable per id
   tag?: string // two or three words on what it is doing
@@ -119,11 +122,15 @@ export type Frame = { width: number; height: number; pixels: Uint8Array }
 // A sprite or tile: rows of palette indices, 0 = transparent (sprites only).
 export type Bitmap = { width: number; height: number; pixels: Uint8Array }
 export type SpritePose = 'stand' | 'walk1' | 'walk2' | 'sit' | 'type'
+// A piece of furniture drawn over the tiles at pixel (x, y). floor: a rug or mat, always under
+// everyone; otherwise it sorts with the crew by sortY (its bottom pixel row).
+export type Prop = { name: string; bitmap: Bitmap; x: number; y: number; sortY: number; floor: boolean }
 export type Art = {
   palette: number[] // 0xRRGGBB, at most 256; index 0 is the transparent slot for sprites
   tiles: Bitmap[] // tileSize square, opaque
   sprites: Record<Facing, Record<SpritePose, Bitmap>>[] // one entry per look, every facing drawn (none mirrored)
   bubbles: { needsYou: Bitmap; failed: Bitmap; music: Bitmap[]; thinking: Bitmap }
+  props: Prop[] // in export order; floor props draw in this order
 }
 
 // ── evals (evals.ts / jobs.tsx /route-eval) ──────────────────────────────
