@@ -41,15 +41,18 @@ const BLOCKED: [number, number][] = [
 const walkable = Array.from({ length: COLS * ROWS }, () => true)
 for (const [c, r] of BLOCKED) walkable[r! * COLS + c!] = false
 
-type Seat = { room: string; at: { x: number; y: number }; facing: string }
-const seat = (room: string, x: number, y: number, facing: string): Seat => ({ room, at: { x, y }, facing })
+type Seat = { room: string; at: { x: number; y: number }; facing: string; dx?: number }
+// dx -8: the sitter shifts half a cell left, to centre on a two-cell desk, couch or bench.
+const seat = (room: string, x: number, y: number, facing: string, dx = 0): Seat => ({ room, at: { x, y }, facing, ...(dx ? { dx } : {}) })
 const seats: Seat[] = [
-  seat('manager', 1, 2, 'down'), seat('manager', 2, 2, 'down'),
+  seat('manager', 2, 2, 'down', -8), seat('manager', 1, 2, 'down'),
   seat('meeting', 7, 3, 'right'), seat('meeting', 7, 4, 'right'), seat('meeting', 11, 4, 'left'),
-  seat('coding', 1, 7, 'up'), seat('coding', 4, 7, 'up'), seat('coding', 7, 7, 'up'),
-  seat('break', 9, 6, 'down'), seat('break', 10, 6, 'down'), seat('break', 11, 8, 'left'),
+  seat('coding', 1, 7, 'up', -8), seat('coding', 4, 7, 'up', -8), seat('coding', 7, 7, 'up', -8),
+  // break room: two on the couch facing out, two on the bench facing them, one by the fridge
+  seat('break', 9, 6, 'down', -8), seat('break', 10, 6, 'down', -8),
+  seat('break', 9, 8, 'up', -8), seat('break', 10, 8, 'up', -8), seat('break', 11, 8, 'left'),
   seat('lobby', 5, 3, 'down'), seat('lobby', 7, 2, 'down'),
-  seat('whiteboard', 8, 2, 'up'), seat('whiteboard', 9, 2, 'up'),
+  seat('whiteboard', 9, 2, 'up', -8), seat('whiteboard', 8, 2, 'up', -8),
   seat('review', 4, 8, 'down'), seat('review', 5, 8, 'down'),
 ]
 const door = { x: 6, y: 2 }
