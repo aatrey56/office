@@ -1,7 +1,7 @@
 import { writeFileSync } from 'node:fs'
-import { background, COLS, footprint, PLACEMENTS, ROWS, T } from './room'
+import { background, COLS, footprint, PLACEMENTS, props as roomProps, ROWS, scene, T, type Person } from './room'
 import { crewSheet, LOOKS } from './crew'
-import { load } from './png'
+import { load, save, scale, type Img } from './png'
 import { PALETTES, rgb8 } from './art'
 
 // Writes the mod's hooks/scene/art-data.ts: one shared palette, the office cut into 16 px tiles,
@@ -41,19 +41,23 @@ const BLOCKED: [number, number][] = [
 const walkable = Array.from({ length: COLS * ROWS }, () => true)
 for (const [c, r] of BLOCKED) walkable[r! * COLS + c!] = false
 
-type Seat = { room: string; at: { x: number; y: number }; facing: string; dx?: number }
-// dx -8: the sitter shifts half a cell left, to centre on a two-cell desk, couch or bench.
-const seat = (room: string, x: number, y: number, facing: string, dx = 0): Seat => ({ room, at: { x, y }, facing, ...(dx ? { dx } : {}) })
+type Facing = 'down' | 'up' | 'right' | 'left'
+type Seat = { room: string; at: { x: number; y: number }; facing: Facing; dx?: number; dy?: number; zBias?: true }
+// dx/dy nudge the sitter off the cell (dx -8 centres them on a two-cell desk); zBias: they draw on top
+// of what they sit on (a couch, a bench, a chair) instead of being sorted behind it.
+const seat = (room: string, x: number, y: number, facing: Facing, dx = 0, dy = 0, zBias = false): Seat =>
+  ({ room, at: { x, y }, facing, ...(dx ? { dx } : {}), ...(dy ? { dy } : {}), ...(zBias ? { zBias: true as const } : {}) })
 const seats: Seat[] = [
-  seat('manager', 2, 2, 'down', -8), seat('manager', 1, 2, 'down'),
-  seat('meeting', 7, 3, 'right'), seat('meeting', 7, 4, 'right'), seat('meeting', 11, 4, 'left'),
-  seat('coding', 1, 7, 'up', -8), seat('coding', 4, 7, 'up', -8), seat('coding', 7, 7, 'up', -8),
-  // break room: two on the couch facing out, two on the bench facing them, one by the fridge
-  seat('break', 9, 6, 'down', -8), seat('break', 10, 6, 'down', -8),
-  seat('break', 9, 8, 'up', -8), seat('break', 10, 8, 'up', -8), seat('break', 11, 8, 'left'),
+  seat('manager', 2, 2, 'down', -8, 6),
+  seat('meeting', 7, 3, 'right', 4, 0, true), seat('meeting', 7, 4, 'right', 4, 0, true), seat('meeting', 11, 4, 'left', -6, 0, true),
+  seat('whiteboard', 8, 2, 'up', -4), seat('whiteboard', 9, 2, 'up', -4),
+  seat('coding', 1, 7, 'up', -8, -6), seat('coding', 4, 7, 'up', -8, -6), seat('coding', 7, 7, 'up', -8, -6),
+  seat('review', 2, 8, 'down', -8, 6), seat('review', 5, 8, 'down', -8, 6),
+  // break room: two on the couch facing out, two on the bench facing them, one on the stool at the side
+  seat('break', 9, 6, 'down', 0, 3, true), seat('break', 10, 6, 'down', 0, 3, true),
+  seat('break', 9, 9, 'up', 0, -4, true), seat('break', 10, 9, 'up', 0, -4, true),
+  seat('break', 8, 7, 'right', 0, 0, true),
   seat('lobby', 5, 3, 'down'), seat('lobby', 7, 2, 'down'),
-  seat('whiteboard', 9, 2, 'up', -8), seat('whiteboard', 8, 2, 'up', -8),
-  seat('review', 4, 8, 'down'), seat('review', 5, 8, 'down'),
 ]
 const door = { x: 6, y: 2 }
 
@@ -113,8 +117,46 @@ const thinking = bubble(['.#######.', '#WWWWWWW#', '#W#W#W#W#', '#WWWWWWW#', '.#
   if (cut.length) throw new Error(`seats the door cannot reach: ${cut.map(s => `${s.room}(${s.at.x},${s.at.y})`).join(', ')}`)
 }
 
+// ── props: furniture drawn over the tiles, floor pieces first, the rest sorted by sortY with the crew ──
+const propList = roomProps()
+const props = propList.map(p => {
+  const px = new Uint8Array(p.piece.w * p.piece.h), pal = PALETTES[p.piece.pal]!
+  p.piece.slots.forEach((s, i) => { if (s >= 0) { const c = rgb8(pal[s]!); px[i] = index(c[0], c[1], c[2]) } })
+  return { name: p.name, x: p.x, y: p.y, width: p.piece.w, height: p.piece.h, pixels: b64(px), sortY: p.sortY, floor: p.floor }
+})
+
+// ── previews: everyone seated (out/preview.png) and, with --debug, the empty room with the floor plan ──
+const sitters: Person[] = seats.map((s, i) => ({ look: i % LOOKS.length, dir: s.facing, x: s.at.x * T + (s.dx ?? 0), y: s.at.y * T + (s.dy ?? 0), zBias: !!s.zBias }))
+const Z = 4
+save('out/preview.png', scale(scene(sitters), Z))
+if (process.argv.includes('--debug')) {
+  const img: Img = scale(scene(), Z)
+  const mix = (x: number, y: number, c: number[], a: number) => {
+    if (x < 0 || y < 0 || x >= img.width || y >= img.height) return
+    const i = (y * img.width + x) * 4
+    for (let k = 0; k < 3; k++) img.data[i + k] = Math.round(img.data[i + k]! * (1 - a) + c[k]! * a)
+  }
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!walkable[r * COLS + c]) for (let y = 0; y < T * Z; y++) for (let x = 0; x < T * Z; x++) mix(c * T * Z + x, r * T * Z + y, [255, 0, 0], 0.3)
+  }
+  for (let y = 0; y < img.height; y++) for (let x = 0; x < img.width; x++) if (x % (T * Z) === 0 || y % (T * Z) === 0) mix(x, y, [0, 0, 0], 0.25)
+  // each seat: a dot at its sprite's top-left and an arrow at its centre pointing the way it faces
+  for (const s of sitters) {
+    const cx = (s.x + 8) * Z, cy = (s.y + 8) * Z
+    for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) mix(s.x * Z + i, s.y * Z + j, [255, 0, 255], 1)
+    for (let t = -10; t <= 10; t++) for (let u = -10; u <= 10; u++) {
+      // a triangle: tip at +10 along the facing, base 20 wide at -10
+      const along = s.dir === 'down' ? u : s.dir === 'up' ? -u : s.dir === 'right' ? t : -t
+      const across = s.dir === 'down' || s.dir === 'up' ? t : u
+      const half = (10 - along) / 2
+      if (Math.abs(across) <= half + 1) mix(cx + t, cy + u, Math.abs(across) > half - 1 || along >= 9 || along <= -10 ? [0, 0, 0] : [255, 0, 255], 1)
+    }
+  }
+  save('out/debug.png', img)
+}
+
 const data = {
-  palette, tileSize: T, width: COLS, height: ROWS, tiles, map, walkable, seats, door, sprites, bubbles: { needsYou, failed, music, thinking },
+  palette, tileSize: T, width: COLS, height: ROWS, tiles, map, walkable, seats, door, sprites, bubbles: { needsYou, failed, music, thinking }, props,
 }
 const src = `// GENERATED by ~/Coding/office-art/tools/export.ts. Do not edit by hand.
 // Art: furniture from MonkeyImage "Home Interior Tilesheet (Game Boy styled)" (itch.io, free to use),
@@ -124,4 +166,4 @@ const src = `// GENERATED by ~/Coding/office-art/tools/export.ts. Do not edit by
 export const ART_DATA = ${JSON.stringify(data)} as const
 `
 writeFileSync(OUT, src)
-console.log(`palette ${palette.length}, unique tiles ${tiles.length} of ${COLS * ROWS}, looks ${sprites.length}, ${(src.length / 1024).toFixed(0)} KB`)
+console.log(`palette ${palette.length}, unique tiles ${tiles.length} of ${COLS * ROWS}, props ${props.length}, looks ${sprites.length}, ${(src.length / 1024).toFixed(0)} KB`)

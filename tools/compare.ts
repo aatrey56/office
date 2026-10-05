@@ -1,7 +1,7 @@
-import { background, withCrew } from './room'
+import { scene } from './room'
 import { blank, save, scale, type Img } from './png'
 import { correct } from './correct'
-const raw = withCrew(background())
+const raw = scene()
 const fixed: Img = { ...raw, data: raw.data.slice() }
 for (let i = 0; i < fixed.data.length; i += 4) fixed.data.set(correct([fixed.data[i]!, fixed.data[i + 1]!, fixed.data[i + 2]!]), i)
 const both = blank(raw.width * 2 + 8, raw.height, [40, 40, 44, 255])
