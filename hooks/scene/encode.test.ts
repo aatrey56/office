@@ -147,20 +147,20 @@ describe('toPng', () => {
   const small = frameOf(3, 2, [0, 1, 2, 3, 2, 1])
 
   test('signature, chunk order and every CRC', () => {
-    const d = decode(toPng(small, PAL, 2))
+    const d = decode(toPng(small, PAL, 2, false))
     expect(d.signature).toEqual(SIGNATURE)
     expect(d.list.map(c => c.type)).toEqual(['IHDR', 'PLTE', 'IDAT', 'IEND'])
     for (const c of d.list) expect(c.crcOk).toBe(true)
     expect(d.list[3]!.data.length).toBe(0)
   })
   test('scanlines reconstruct the scaled pixels', () => {
-    for (const s of [1, 2, 3]) checkPixels(decode(toPng(small, PAL, s)).z, small, s)
+    for (const s of [1, 2, 3]) checkPixels(decode(toPng(small, PAL, s, false)).z, small, s)
   })
   test('a large frame splits into several 65535-byte stored blocks', () => {
     const w = 200
     const h = 200
     const f = frameOf(w, h, Array.from({ length: w * h }, (_, i) => (i * 7 + (i >> 5)) % 4))
-    const d = decode(toPng(f, PAL, 2))
+    const d = decode(toPng(f, PAL, 2, false))
     const total = (400 + 1) * 400
     expect([d.width, d.height]).toEqual([400, 400])
     for (const c of d.list) expect(c.crcOk).toBe(true)

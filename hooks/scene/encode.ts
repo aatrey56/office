@@ -107,10 +107,100 @@ function zlibStored(raw: Uint8Array): Uint8Array {
   return out
 }
 
+// Fixed-Huffman deflate (RFC 1951, BTYPE 01) with the two matches pixel art enlarged by a whole
+// number is made of: a run of one byte (distance 1) and a copy of the line above (distance = stride).
+// A 1536 x 1280 office frame shrinks from about 2 MB stored to a few tens of KB.
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+const MAX_MATCH = 258
+
+class BitWriter {
+  bytes: number[] = []
+  private acc = 0
+  private n = 0
+  // `count` low bits of `value`, least significant first (deflate's order for extra bits and headers).
+  bits(value: number, count: number) {
+    for (let i = 0; i < count; i++) {
+      this.acc |= ((value >>> i) & 1) << this.n
+      if (++this.n === 8) {
+        this.bytes.push(this.acc)
+        this.acc = 0
+        this.n = 0
+      }
+    }
+  }
+  // A Huffman code goes most significant bit first.
+  code(value: number, count: number) {
+    for (let i = count - 1; i >= 0; i--) this.bits((value >>> i) & 1, 1)
+  }
+  flush(): number[] {
+    if (this.n > 0) this.bytes.push(this.acc)
+    this.acc = 0
+    this.n = 0
+    return this.bytes
+  }
+}
+
+function literal(w: BitWriter, sym: number) {
+  if (sym < 144) w.code(0x30 + sym, 8)
+  else if (sym < 256) w.code(0x190 + sym - 144, 9)
+  else if (sym < 280) w.code(sym - 256, 7)
+  else w.code(0xc0 + sym - 280, 8)
+}
+
+function match(w: BitWriter, length: number, distance: number) {
+  let li = LEN_BASE.length - 1
+  while ((LEN_BASE[li] ?? 0) > length) li--
+  literal(w, 257 + li)
+  w.bits(length - (LEN_BASE[li] ?? 0), LEN_EXTRA[li] ?? 0)
+  let di = DIST_BASE.length - 1
+  while ((DIST_BASE[di] ?? 0) > distance) di--
+  w.code(di, 5)
+  w.bits(distance - (DIST_BASE[di] ?? 0), DIST_EXTRA[di] ?? 0)
+}
+
+// How many bytes from `at` repeat the bytes `distance` back, up to MAX_MATCH.
+function runLength(raw: Uint8Array, at: number, distance: number): number {
+  if (at < distance) return 0
+  let n = 0
+  while (n < MAX_MATCH && at + n < raw.length && raw[at + n] === raw[at + n - distance]) n++
+  return n
+}
+
+function zlibDeflate(raw: Uint8Array, stride: number): Uint8Array {
+  const w = new BitWriter()
+  w.bits(1, 1) // BFINAL
+  w.bits(1, 2) // BTYPE 01: fixed Huffman codes
+  for (let i = 0; i < raw.length; ) {
+    const up = stride <= 32768 ? runLength(raw, i, stride) : 0
+    const run = runLength(raw, i, 1)
+    if (up >= 3 && up >= run) {
+      match(w, up, stride)
+      i += up
+    } else if (run >= 3) {
+      match(w, run, 1)
+      i += run
+    } else {
+      literal(w, raw[i] ?? 0)
+      i++
+    }
+  }
+  literal(w, 256) // end of block
+  const body = w.flush()
+  const out = new Uint8Array(2 + body.length + 4)
+  out[0] = 0x78
+  out[1] = 0x01
+  out.set(body, 2)
+  new DataView(out.buffer).setUint32(2 + body.length, adler32(raw))
+  return out
+}
+
 // For Image: a whole PNG, base64. Indexed color (PLTE from `palette`), each pixel repeated
 // `scale` times both ways. No compression library exists here, so IDAT uses stored deflate
 // blocks; CRC-32 and Adler-32 are computed in this file.
-export function toPng(frame: Frame, palette: number[], scale: number): string {
+export function toPng(frame: Frame, palette: number[], scale: number, compress = true): string {
   const s = Math.max(1, Math.floor(scale) || 1)
   const width = frame.width * s
   const height = frame.height * s
@@ -143,7 +233,7 @@ export function toPng(frame: Frame, palette: number[], scale: number): string {
     new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     chunk('IHDR', ihdr),
     chunk('PLTE', plte),
-    chunk('IDAT', zlibStored(raw)),
+    chunk('IDAT', compress ? zlibDeflate(raw, stride) : zlibStored(raw)),
     chunk('IEND', new Uint8Array(0)),
   ]
   const png = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))

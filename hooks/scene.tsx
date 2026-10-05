@@ -152,6 +152,7 @@ export function installScene(on: On) {
       stopTimer()
       return next(e)
     }
+    try {
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
     const Image = 'Image' in ui ? ui.Image : undefined
@@ -167,7 +168,7 @@ export function installScene(on: On) {
     // by the terminal's smoothing, and the box keeps the office's shape on tall cells.
     const columns = Math.max(24, Math.min(e.props.bodyColumns - 1, 160))
     const rows = Math.max(8, Math.round((columns * CELL_W * H) / W / CELL_H))
-    const scale = Math.max(2, Math.min(8, Math.round((columns * CELL_W) / W)))
+    const scale = Math.max(2, Math.min(7, Math.round((columns * CELL_W) / W)))
     const sized = box.columns !== columns || box.rows !== rows || box.graphics !== graphics || box.scale !== scale
     box = { columns, rows, scale, graphics }
 
@@ -245,6 +246,18 @@ export function installScene(on: On) {
         )}
       </Box>
     )
+    } catch (err) {
+      // A blank pane tells nobody anything: say what broke, and keep the text board one key away.
+      stopTimer()
+      $.ui.log(`office: scene failed: ${String(err)}`, { to: 'debug' })
+      const { Box, Text, Button } = $.ui.resolve(e)
+      return (
+        <Box flexDirection="column">
+          <Text>{`The office scene hit an error: ${String(err).slice(0, 300)}`}</Text>
+          <Button plain key="text" label="text board" hotkey="t" onPress={() => update($, VIEW, () => 'text')} />
+        </Box>
+      )
+    }
   })
 
   on('ui.close', { id: /^office$/ }, async ($, e, next) => {
