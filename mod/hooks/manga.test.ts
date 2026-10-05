@@ -4,7 +4,8 @@ import type { Engine } from 'claude-code/testing'
 
 import { cachePath, fitPage, graphicsLikely, sipsArgv, unzipArgv } from './manga'
 
-const ROOT = '/Users/aatrey/Manga'
+const HOME = '/Users/aatrey'
+const ROOT = `${HOME}/Manga`
 type Entry = { name: string; kind: 'dir' | 'file'; size: number; mtimeMs: number; isLink: boolean }
 const dir = (name: string): Entry => ({ name, kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
 const png = (name: string): Entry => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })
@@ -12,6 +13,7 @@ const RUN = { origin: { kind: 'composer' }, presentation: { isFullscreen: false,
 
 // The test environment has no disk: answer $.fs from a tree of path -> entries.
 function fakeDisk(on: On, tree: Record<string, Entry[]>) {
+  mock.env(on, { HOME, TERM_PROGRAM: 'ghostty' })
   on('fs.exists', (_$, e) => ({ value: e.path in tree }))
   on('fs.list', (_$, e) => ({ value: tree[e.path] ?? [] }))
 }
@@ -146,7 +148,7 @@ describe('/manga pane', () => {
 })
 
 // ── cbz chapters ─────────────────────────────────────────────────────────
-const CACHE = '/Users/aatrey/Library/Caches/office-manga'
+const CACHE = `${HOME}/Library/Caches/office-manga`
 const MARKER = '.office-manga.json'
 const cbzName = (n: number) => `chapters8-10${n}000kingdom-chapter-${n}.cbz`
 const SIZE = 4242
@@ -189,14 +191,15 @@ type World = {
 }
 
 function fakeCbzWorld(on: On, opts: World = {}) {
+  mock.env(on, { HOME, TERM_PROGRAM: 'ghostty' })
   const unzipped = new Set<string>()
   const made = new Set<string>()
   const texts = new Map<string, string>(Object.entries(opts.markers ?? {}).map(([d, m]) => [`${d}/${MARKER}`, JSON.stringify(m)]))
   const calls: string[][] = []
   const jpgs = [png('10.jpg'), png('2.jpg'), png('1.jpg'), png('ComicInfo.xml')]
   const cacheDirs: Record<string, Entry[]> = {
-    [cachePath('Kingdom', cbzName(458))]: jpgs,
-    [cachePath('Kingdom', cbzName(459))]: jpgs,
+    [cachePath(CACHE, 'Kingdom', cbzName(458))]: jpgs,
+    [cachePath(CACHE, 'Kingdom', cbzName(459))]: jpgs,
     ...opts.cacheDirs,
   }
   const tree: Record<string, Entry[]> = {
@@ -237,8 +240,8 @@ function fakeCbzWorld(on: On, opts: World = {}) {
   return { calls, texts }
 }
 
-const DIR458 = cachePath('Kingdom', cbzName(458))
-const DIR459 = cachePath('Kingdom', cbzName(459))
+const DIR458 = cachePath(CACHE, 'Kingdom', cbzName(458))
+const DIR459 = cachePath(CACHE, 'Kingdom', cbzName(459))
 const CBZ458 = `${ROOT}/Kingdom/${cbzName(458)}`
 const MISSING = { series: 'Kingdom', chapter: 'ch-000-gone', page: 7 } // the old test folder, deleted
 

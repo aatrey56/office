@@ -4,9 +4,8 @@ import type { EngineInterface, On } from 'claude-code'
 import type { MangaShelf } from '../types'
 
 // ~/Manga/<Series>/<chapter>: a chapter is a folder of PNGs or a .cbz/.zip of images.
-const MANGA_ROOT = '/Users/aatrey/Manga'
-// A cbz is unpacked here (never into ~/Manga) and its pages converted to PNG, the one format Image takes.
-const CACHE_ROOT = '/Users/aatrey/Library/Caches/office-manga'
+// A cbz is unpacked into ~/Library/Caches/office-manga (never into ~/Manga) and its pages
+// converted to PNG, the one format Image takes. Both roots come from HOME at runtime: see roots().
 const CACHE_KEEP = 12 // newest-opened chapter dirs kept per series
 const MARKER = '.office-manga.json'
 const PREFETCH_WITHIN = 3 // last pages of a chapter that start unpacking the next one
@@ -48,8 +47,8 @@ export const isImage = (name: string) => /\.(png|jpe?g|webp)$/i.test(name) && !n
 export const isPng = (name: string) => /\.png$/i.test(name)
 const stemOf = (name: string) => name.replace(KNOWN_EXT, '')
 
-// ~/Library/Caches/office-manga/<series>/<cbz name without extension>
-export const cachePath = (series: string, name: string) => `${CACHE_ROOT}/${series}/${stemOf(name)}`
+// <cache root>/<series>/<cbz name without extension>
+export const cachePath = (cacheRoot: string, series: string, name: string) => `${cacheRoot}/${series}/${stemOf(name)}`
 
 export const unzipArgv = (cbz: string, dir: string) => ['unzip', '-o', '-j', '-qq', cbz, '-d', dir]
 export const sipsArgv = (from: string, to: string) => ['sips', '-s', 'format', 'png', from, '--out', to]
@@ -156,16 +155,22 @@ async function termGraphics($: EngineInterface): Promise<boolean> {
 }
 
 // ── fs helpers ───────────────────────────────────────────────────────────
+async function roots($: EngineInterface): Promise<{ manga: string; cache: string }> {
+  const home = (await $.env.get('HOME')) ?? ''
+  return { manga: `${home}/Manga`, cache: `${home}/Library/Caches/office-manga` }
+}
+
 async function listSeries($: EngineInterface): Promise<string[]> {
-  if (!(await $.fs.exists(MANGA_ROOT))) return []
-  const entries = await $.fs.list(MANGA_ROOT)
+  const { manga } = await roots($)
+  if (!(await $.fs.exists(manga))) return []
+  const entries = await $.fs.list(manga)
   return entries.filter(x => x.kind === 'dir' && !x.name.startsWith('.')).map(x => x.name).sort(byNumber)
 }
 
 // Folders and archives alike, in chapter-number order.
 async function listChapters($: EngineInterface, series: string): Promise<string[]> {
   if (!series) return []
-  const entries = await $.fs.list(`${MANGA_ROOT}/${series}`)
+  const entries = await $.fs.list(`${(await roots($)).manga}/${series}`)
   return entries
     .filter(x => !x.name.startsWith('.') && (x.kind === 'dir' || (x.kind === 'file' && isCbz(x.name))))
     .map(x => x.name)
@@ -175,7 +180,7 @@ async function listChapters($: EngineInterface, series: string): Promise<string[
 // A chapter folder's PNGs. Nothing is ever converted or written inside ~/Manga.
 async function listPages($: EngineInterface, series: string, name: string | undefined): Promise<string[]> {
   if (!name) return []
-  const entries = await $.fs.list(`${MANGA_ROOT}/${series}/${name}`)
+  const entries = await $.fs.list(`${(await roots($)).manga}/${series}/${name}`)
   return entries
     .filter(x => x.kind === 'file' && isPng(x.name) && !x.name.startsWith('.'))
     .map(x => x.name)
@@ -193,7 +198,7 @@ async function readMarker($: EngineInterface, dir: string): Promise<Marker | und
 
 // rm -rf only a directory that resolves to somewhere strictly inside the cache root.
 async function removeCacheDir($: EngineInterface, path: string): Promise<boolean> {
-  const root = await $.fs.stat(CACHE_ROOT, { resolve: true }).catch(() => undefined)
+  const root = await $.fs.stat((await roots($)).cache, { resolve: true }).catch(() => undefined)
   const own = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
   if (!root?.realPath || !own?.realPath || own.kind !== 'dir') return false
   if (!isInsideCache(root.realPath, own.realPath)) return false
@@ -202,7 +207,7 @@ async function removeCacheDir($: EngineInterface, path: string): Promise<boolean
 }
 
 async function pruneCache($: EngineInterface, series: string) {
-  const base = `${CACHE_ROOT}/${series}`
+  const base = `${(await roots($)).cache}/${series}`
   if (!(await $.fs.exists(base))) return
   const dirs = (await $.fs.list(base)).filter(x => x.kind === 'dir')
   const seen = await Promise.all(
@@ -213,8 +218,9 @@ async function pruneCache($: EngineInterface, series: string) {
 
 // Unpack a cbz into its cache dir once; a marker of the archive's size and mtime says it is still good.
 async function unpack($: EngineInterface, series: string, name: string) {
-  const cbz = `${MANGA_ROOT}/${series}/${name}`
-  const dir = cachePath(series, name)
+  const { manga, cache } = await roots($)
+  const cbz = `${manga}/${series}/${name}`
+  const dir = cachePath(cache, series, name)
   const stat = await $.fs.stat(cbz)
   if (!markerFresh(await readMarker($, dir), stat)) {
     if (await $.fs.exists(dir)) await removeCacheDir($, dir)
@@ -278,7 +284,7 @@ async function openChapter($: EngineInterface, series: string, index: number, at
   const chapters = await listChapters($, series)
   const i = clamp(index, 0, chapters.length - 1)
   const name = chapters[i]
-  let dir = `${MANGA_ROOT}/${series}/${name}`
+  let dir = `${(await roots($)).manga}/${series}/${name}`
   let pages: string[]
   let ready: boolean[]
   let plans: { src: string; png: string }[] = []
