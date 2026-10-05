@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, PluginOptions, RenderSurface, Timer } from 'claude-code'
 
-import type { SessionCard } from '../types'
+import type { Activity, MangaShelf, SessionCard } from '../types'
 import type { BoardMode, Registered } from './sessions'
-import { SLUG_MAX, ago, bandWindow, parseMode, clip, isRegistryFile, lastAssistantText, parseRegistry, projectSlug, resumeCommand, shortCwd } from './sessions'
+import { SLUG_MAX, ago, bandWindow, parseMode, clip, isRegistryFile, lastActivity, lastAssistantText, parseRegistry, projectSlug, resumeCommand, shortCwd } from './sessions'
 
 // Owner: board agent. Session board pane (/office) + tap-in.
 
@@ -19,13 +19,15 @@ const tick = atom({ plugin: 'office', key: 'boardTick' } as const, 0)
 const mode = atom({ plugin: 'office', key: 'boardMode' } as const, 'pane' as BoardMode)
 // What the /office pane shows; scene.tsx draws 'scene', this file draws 'text'.
 const view = atom({ plugin: 'office', key: 'officeView' } as const, 'scene' as 'scene' | 'text')
+// The reader's series, so the manga tab opened from here is titled like /manga titles it.
+const shelf = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', chapters: [], pages: [], dir: '', ready: [], loading: false } as MangaShelf)
 
 // Not drawn from: the poll's handle, the refresh in flight, and a transcript
 // tail cache keyed by path (re-tailed only when the file's mtime moves). A
 // reload drops them along with the environment's timers.
 let poll: Timer | undefined
 let inFlight: Promise<void> | undefined
-const tails = new Map<string, { mtimeMs: number; text: string | undefined }>()
+const tails = new Map<string, { mtimeMs: number; text?: string; activity?: Activity }>()
 // Git toplevel per cwd, null outside a repo.
 const roots = new Map<string, string | null>()
 
@@ -62,17 +64,19 @@ async function transcriptPath($: EngineInterface, root: string, card: Registered
   return hit ? `${projects}/${hit.name}/${card.sessionId}.jsonl` : undefined
 }
 
-async function lastTextOf($: EngineInterface, root: string, card: Registered): Promise<string | undefined> {
+async function lastTextOf($: EngineInterface, root: string, card: Registered): Promise<{ text?: string; activity?: Activity }> {
   const path = await transcriptPath($, root, card)
-  if (!path) return undefined
+  if (!path) return {}
   const stat = await $.fs.stat(path).catch(() => undefined)
-  if (!stat) return undefined
+  if (!stat) return {}
   const hit = tails.get(path)
-  if (hit && hit.mtimeMs === stat.mtimeMs) return hit.text
+  if (hit && hit.mtimeMs === stat.mtimeMs) return hit
   const ran = await $.process.run(['tail', '-n', '40', path]).catch(() => undefined)
   const text = (ran ? lastAssistantText(ran.stdout) : undefined) ?? hit?.text
-  tails.set(path, { mtimeMs: stat.mtimeMs, text })
-  return text
+  const activity = (ran ? lastActivity(ran.stdout) : undefined) ?? hit?.activity
+  const got = { mtimeMs: stat.mtimeMs, ...(text ? { text } : {}), ...(activity ? { activity } : {}) }
+  tails.set(path, got)
+  return got
 }
 
 async function loadBoard($: EngineInterface): Promise<SessionCard[]> {
@@ -92,8 +96,8 @@ async function loadBoard($: EngineInterface): Promise<SessionCard[]> {
   const live = found.filter(card => alive.has(card.pid))
   const cards = await Promise.all(
     live.map(async card => {
-      const lastText = await lastTextOf($, root, card)
-      return { ...card, isSelf: card.sessionId === self, ...(lastText ? { lastText } : {}) }
+      const { text: lastText, activity } = await lastTextOf($, root, card)
+      return { ...card, isSelf: card.sessionId === self, ...(lastText ? { lastText } : {}), ...(activity ? { activity } : {}) }
     }),
   )
 
@@ -355,6 +359,8 @@ export function installBoard(on: On, options: PluginOptions) {
     const home = await $.env.get('HOME')
     const width = Math.max(20, e.props.bodyColumns)
     const current = list.find(card => card.sessionId === pick)
+    const series = (await read($, shelf)).series
+    const mangaTitle = series ? `Manga: ${series}` : 'Manga'
 
     return (
       <Box flexDirection="column" width={width}>
@@ -362,7 +368,7 @@ export function installBoard(on: On, options: PluginOptions) {
           <Button plain key="up" label="up" hotkey="k" onPress={() => move($, -1)} />
           <Button plain key="down" label="down" hotkey="j" onPress={() => move($, 1)} />
           <Button plain key="refresh" label="refresh" hotkey="r" onPress={() => refresh($)} />
-          <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', focus: true })} />
+          <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', title: mangaTitle, focus: true })} />
           <Button plain key="scene" label="office view" hotkey="t" onPress={() => update($, view, () => 'scene')} />
         </Box>
         {list.length === 0 && <Text dimColor>No live sessions found.</Text>}

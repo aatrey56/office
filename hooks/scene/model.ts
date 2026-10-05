@@ -1,4 +1,4 @@
-import type { Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId, SessionCard, Tile, TileMap } from '../../types'
+import type { Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId, SessionCard, Tile, TileMap, Activity } from '../../types'
 import { LOOKS } from './art'
 import { clip } from '../sessions'
 
@@ -28,7 +28,11 @@ export function stateOf(status: string, role: CrewRole): CrewState {
 
 // working → coding (a manager → manager), idle → break, needs-you → meeting,
 // reporting / failed → manager, leaving → lobby.
-export function roomFor(state: CrewState, role: CrewRole): RoomId {
+export function roomFor(state: CrewState, role: CrewRole, activity?: Activity): RoomId {
+  // Planning happens at the whiteboard and reviewing at the plain desk, for anyone; other work
+  // is the manager's own desk or a computer.
+  if (state === 'working' && activity === 'planning') return 'whiteboard'
+  if (state === 'working' && activity === 'reviewing') return 'review'
   if (state === 'working') return role === 'manager' ? 'manager' : 'coding'
   if (state === 'idle') return 'break'
   if (state === 'needs-you') return 'meeting'
@@ -65,11 +69,12 @@ export function deriveCrew(
       role,
       project,
       state,
-      room: roomFor(state, role),
+      room: roomFor(state, role, card.activity),
       seat: { x: 0, y: 0 },
       facing: 'down',
       look: lookOf(card.sessionId, LOOKS),
       ...(tag ? { tag } : {}),
+      ...(card.activity ? { activity: card.activity } : {}),
       isSelectable: true,
       isSelf: card.isSelf,
     })

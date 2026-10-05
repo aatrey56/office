@@ -40,7 +40,12 @@ export function officeArt(_tileSize: 8 | 16 = 16): Art {
       for (const facing of ['up', 'down', 'left', 'right'] as const) out[facing] = poses(look[facing])
       return out
     }),
-    bubbles: { needsYou: b(ART_DATA.bubbles.needsYou), failed: b(ART_DATA.bubbles.failed) },
+    bubbles: {
+      needsYou: b(ART_DATA.bubbles.needsYou),
+      failed: b(ART_DATA.bubbles.failed),
+      music: ART_DATA.bubbles.music.map(b),
+      thinking: b(ART_DATA.bubbles.thinking),
+    },
   }
   return art
 }

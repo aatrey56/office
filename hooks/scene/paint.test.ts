@@ -27,7 +27,7 @@ const ART: Art = {
     facings(allPoses(bmp(['2...', '2...', '2...', '2...'])), allPoses(bmp(['...2', '...2', '...2', '...2']))),
     facings(allPoses(solid(3, 4, 6))),
   ],
-  bubbles: { needsYou: solid(8, 2, 2), failed: solid(9, 2, 2) },
+  bubbles: { needsYou: solid(8, 2, 2), failed: solid(9, 2, 2), music: [], thinking: solid(9, 2, 2) },
 }
 
 // 3x3 tiles; the middle tile is index 1, the bottom-right one has no bitmap.
@@ -112,7 +112,7 @@ describe('pose table', () => {
     expect(at('working', {}, 0)).toBe(7)
     expect(at('working', {}, 3)).toBe(7)
     expect(at('working', {}, 4)).toBe(4)
-    expect(at('working', {}, 8)).toBe(7)
+    expect(at('working', {}, 16)).toBe(7) // a tick between bobs
     expect(at('idle')).toBe(4)
     for (const s of ['needs-you', 'reporting', 'failed', 'leaving'] as CrewState[]) expect(at(s)).toBe(1)
   })

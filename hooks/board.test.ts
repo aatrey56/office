@@ -49,7 +49,7 @@ describe('pure helpers', () => {
   test('takes the last assistant text block from a tail', () => {
     expect(lastAssistantText(TRANSCRIPT)).toBe('Working on the build now.')
     expect(lastAssistantText('')).toBe(undefined)
-    expect(lastAssistantText(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(300) }] } }))?.length).toBe(120)
+    expect(lastAssistantText(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(700) }] } }))?.length).toBe(600)
   })
 })
 

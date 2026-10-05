@@ -1,4 +1,4 @@
-import type { SessionCard } from '../types'
+import type { Activity, SessionCard } from '../types'
 
 // Registry of live Claude Code processes (<config>/sessions/<pid>.json) and the
 // last assistant line of each one's transcript. The registry folder also holds
@@ -7,7 +7,7 @@ import type { SessionCard } from '../types'
 // reads that need `$` live in board.tsx.
 
 const REGISTRY_FILE = /^\d+\.json$/
-const TEXT_MAX = 120
+const TEXT_MAX = 600 // a few sentences: the scene shows them in full, the board clips to its width
 export const SLUG_MAX = 200 // the engine cuts longer slugs and appends a hash
 
 export type Registered = Omit<SessionCard, 'isSelf' | 'lastText'>
@@ -69,6 +69,34 @@ export function lastAssistantText(tail: string): string | undefined {
       .filter(block => block?.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '')
       .map(block => block.text as string)
     if (texts.length > 0) return clip(texts.join(' '))
+  }
+  return undefined
+}
+
+// The newest tool call in a transcript tail, as an activity: editing files or running commands is
+// coding, reading and searching is reviewing, plans, todo lists, research and delegation are planning.
+const CODING = /^(Edit|MultiEdit|Write|NotebookEdit|Bash|PowerShell)$/
+const REVIEWING = /^(Read|Grep|Glob|LS|mcp__office__codex_review)$/
+const PLANNING = /^(EnterPlanMode|ExitPlanMode|TodoWrite|TaskCreate|TaskUpdate|WebSearch|WebFetch|Agent|Task|Workflow|mcp__office__route_task|mcp__office__spawn_worker)$/
+export function lastActivity(tail: string): Activity | undefined {
+  const lines = tail.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (!line || !line.includes('"tool_use"')) continue
+    let row: { type?: unknown; message?: { content?: unknown } }
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row?.type !== 'assistant' || !Array.isArray(row.message?.content)) continue
+    const tools = (row.message.content as { type?: unknown; name?: unknown }[]).filter(b => b?.type === 'tool_use' && typeof b.name === 'string')
+    const name = tools[tools.length - 1]?.name as string | undefined
+    if (!name) continue
+    if (CODING.test(name)) return 'coding'
+    if (REVIEWING.test(name)) return 'reviewing'
+    if (PLANNING.test(name)) return 'planning'
+    return undefined
   }
   return undefined
 }

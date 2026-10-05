@@ -11,7 +11,11 @@ export type SessionCard = {
   updatedAt: number
   isSelf: boolean
   lastText?: string // last assistant text, trimmed
+  activity?: Activity // what its newest tool call says it is doing
 }
+
+// From the newest tool call in a transcript: edits and commands, reading, or planning.
+export type Activity = 'coding' | 'reviewing' | 'planning'
 
 // ── jobs (codex.ts / router.ts / spawn.ts / jobs.tsx) ────────────────────
 export type ModelTier = 'haiku' | 'sonnet' | 'opus' | 'fable'
@@ -61,7 +65,7 @@ export type MangaShelf = {
 // a frame of palette indices comes out. Only scene.tsx touches `$`.
 export type Tile = { x: number; y: number } // tile coordinates, 0,0 at the top left
 export type Facing = 'up' | 'down' | 'left' | 'right'
-export type RoomId = 'manager' | 'meeting' | 'coding' | 'break' | 'lobby'
+export type RoomId = 'manager' | 'meeting' | 'coding' | 'break' | 'lobby' | 'whiteboard' | 'review'
 export type Seat = { room: RoomId; at: Tile; facing: Facing }
 // tiles / walkable are row-major, width * height long. `door` is where crew enter and leave.
 export type TileMap = {
@@ -89,6 +93,7 @@ export type Crew = {
   facing: Facing
   look: number // which base sprite and color swap, stable per id
   tag?: string // two or three words on what it is doing
+  activity?: Activity
   isSelectable: boolean // leads and managers only; workers never
   isSelf: boolean
 }
@@ -113,7 +118,7 @@ export type Art = {
   palette: number[] // 0xRRGGBB, at most 256; index 0 is the transparent slot for sprites
   tiles: Bitmap[] // tileSize square, opaque
   sprites: Record<Facing, Record<SpritePose, Bitmap>>[] // one entry per look, every facing drawn (none mirrored)
-  bubbles: { needsYou: Bitmap; failed: Bitmap }
+  bubbles: { needsYou: Bitmap; failed: Bitmap; music: Bitmap[]; thinking: Bitmap }
 }
 
 // ── evals (evals.ts / jobs.tsx /route-eval) ──────────────────────────────

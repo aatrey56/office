@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, Timer } from 'claude-code'
 
-import type { Actor, Crew, Job, ManagerEntry, RateWindow, SessionCard } from '../types'
+import type { Actor, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
 import { budgetLine } from './budget'
 import { officeArt, officeMap } from './scene/art'
 import { toCells, toPng } from './scene/encode'
@@ -28,6 +28,8 @@ const SELECTED = atom({ plugin: 'office', key: 'sceneSelected' } as const, null 
 const PROJECT = atom({ plugin: 'office', key: 'sceneProject' } as const, null as string | null)
 // Bumped when the crew list (names, states) changes, so only the list under the picture redraws.
 const TICK = atom({ plugin: 'office', key: 'sceneTick' } as const, 0)
+// The reader's series, so the manga tab opened from here is titled like /manga titles it.
+const SHELF = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', chapters: [], pages: [], dir: '', ready: [], loading: false } as MangaShelf)
 
 // Not drawn from: the animation's own state. A reload starts the walk over, which is harmless.
 let timer: Timer | undefined
@@ -100,8 +102,12 @@ async function frame($: EngineInterface): Promise<void> {
     listKey = key
     await update($, TICK, n => (n + 1) % 1_000_000)
   }
-  // Still, nobody blinking, nothing new: send nothing.
-  if (wasSettled && isSettled(actors) && !blinking && frameNo > 1 && lastPicture.png !== undefined) return
+  // Nobody walking: the quiet animations (typing, music, thinking, the needs-you blink) only
+  // need every other frame. Nobody in the office: send nothing.
+  const quiet = wasSettled && isSettled(actors)
+  const hasPicture = (box.graphics ? lastPicture.png : lastPicture.cells) !== undefined
+  if (quiet && hasPicture && (crew.length === 0 || frameNo % 2 === 1) && !blinking) return
+  if (quiet && hasPicture && blinking && frameNo % 2 === 1) return
   paint(crew, selected)
   const sent = box.graphics
     ? await $.ui.blit({ requestId: PANE, key: 'scene', source: { png: lastPicture.png! } }).catch(() => undefined)
@@ -133,6 +139,14 @@ async function sendTo($: EngineInterface, card: SessionCard, text: string): Prom
   const self = (await read($, SESSIONS)).find(c => c.isSelf)?.name ?? (await $.session.id()).slice(0, 8)
   const sent = await $.session.send({ to: { sessionId: card.sessionId }, text: `[via office from ${self}] ${body}` })
   $.ui.toast(sent.isDelivered ? `Sent to ${card.name}` : `Not sent to ${card.name}: ${sent.reason}`)
+}
+
+// The first few sentences of a session's last reply: enough to know what it is on.
+function preview(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  const sentences = flat.match(/[^.!?]+[.!?]+(\s|$)/g)
+  const head = sentences ? sentences.slice(0, 3).join('').trim() : flat
+  return head.length > 420 ? `${head.slice(0, 419)}…` : head
 }
 
 const STATE_WORDS: Record<Crew['state'], string> = {
@@ -188,6 +202,8 @@ export function installScene(on: On) {
       // the header simply goes without it
     }
     const projectName = project ? (project.split('/').pop() ?? project) : 'no sessions'
+    const series = (await read($, SHELF)).series
+    const mangaTitle = series ? `Manga: ${series}` : 'Manga'
     const choose = (id: string) => () => update($, SELECTED, prev => (prev === id ? null : id))
     const cycle = (delta: number) => () =>
       update($, PROJECT, prev => {
@@ -214,7 +230,7 @@ export function installScene(on: On) {
           {all.length > 1 && <Button plain key="prev-proj" label="prev office" hotkey="h" onPress={cycle(-1)} />}
           {all.length > 1 && <Button plain key="next-proj" label="next office" hotkey="l" onPress={cycle(1)} />}
           <Button plain key="text" label="text board" hotkey="t" onPress={() => update($, VIEW, () => 'text')} />
-          <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', focus: true })} />
+          <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', title: mangaTitle, focus: true })} />
         </Box>
         {picture}
         <Box flexWrap="wrap" columnGap={2}>
@@ -235,7 +251,8 @@ export function installScene(on: On) {
         )}
         {picked && (
           <Box flexDirection="column">
-            <Text wrap="truncate-end">{`${picked.name}: ${picked.tag ?? STATE_WORDS[picked.state]}`}</Text>
+            <Text bold>{`${picked.name} · ${STATE_WORDS[picked.state]}${picked.activity ? ` (${picked.activity})` : ''}`}</Text>
+            <Text wrap="wrap">{preview(pickedCard?.lastText ?? picked.tag ?? '')}</Text>
             {pickedCard && !pickedCard.isSelf && Input && (
               <Box gap={1}>
                 <Button plain key="message" label="message" hotkey="m" onPress={() => $.ui.focus({ requestId: PANE, key: 'msg' })} />

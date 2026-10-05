@@ -57,6 +57,22 @@ function outline(frame: Frame, bmp: Bitmap, x: number, y: number, mirror: boolea
   }
 }
 
+const BOB_TICKS = 6
+const NOTE_TICKS = 8
+
+// What a settled crew member is quietly doing: idle ones listen to music (a note drifting up beside
+// the head, two notes taking turns), planners at the whiteboard think (a thought bubble, now and then).
+function ambient(frame: Frame, art: Art, member: Crew, sx: number, sy: number, width: number, tick: number): void {
+  if (member.state === 'idle' && art.bubbles.music.length > 0) {
+    const n = Math.floor(tick / NOTE_TICKS)
+    const note = art.bubbles.music[n % art.bubbles.music.length]
+    if (note) blit(frame, note, sx + width - 2, sy - note.height - (n % 3), false, false)
+  } else if (member.state === 'working' && member.activity === 'planning' && Math.floor(tick / 10) % 3 !== 2) {
+    const t = art.bubbles.thinking
+    blit(frame, t, sx + Math.floor((width - t.width) / 2), sy - t.height, false, false)
+  }
+}
+
 // Tiles first, then actors in the order given, each with its pose for its state and step
 // (walking: walk1/walk2 alternating; arrived: sit / type / stand by crew state), mirrored
 // when facing left, then a bubble above needs-you and failed crew, blinking on `tick`.
@@ -89,8 +105,11 @@ export function paintFrame(
     const sprite = art.sprites[look]?.[actor.facing]?.[poseFor(actor, member, tick)]
     if (!sprite) continue
     // Centered across the tile, bottom edge on the tile's bottom; a tall sprite pokes up.
+    // Someone at work and settled bobs a pixel now and then: typing, writing, reading.
+    const isSettled = actor.path.length === 0 && member !== undefined
+    const bob = isSettled && member.state === 'working' && Math.floor(tick / BOB_TICKS) % 2 === 1 ? 1 : 0
     const sx = actor.x + Math.floor((ts - sprite.width) / 2)
-    const sy = actor.y + ts - sprite.height
+    const sy = actor.y + ts - sprite.height + bob
     const mirror = false // every facing has its own frames
     blit(frame, sprite, sx, sy, false, mirror)
     if (member && member.id === selectedId) outline(frame, sprite, sx, sy, mirror, selectColor)
@@ -102,6 +121,7 @@ export function paintFrame(
           ? art.bubbles.needsYou
           : undefined
     if (bubble) blit(frame, bubble, sx + Math.floor((sprite.width - bubble.width) / 2), sy - bubble.height, false, false)
+    else if (isSettled) ambient(frame, art, member, sx, sy, sprite.width, tick)
   }
   return frame
 }
