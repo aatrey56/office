@@ -17,6 +17,8 @@ const selected = atom({ plugin: 'office', key: 'selected' } as const, null as st
 const tick = atom({ plugin: 'office', key: 'boardTick' } as const, 0)
 // 'band' draws the board above the prompt instead of in the pane; kept in $.store too.
 const mode = atom({ plugin: 'office', key: 'boardMode' } as const, 'pane' as BoardMode)
+// What the /office pane shows; scene.tsx draws 'scene', this file draws 'text'.
+const view = atom({ plugin: 'office', key: 'officeView' } as const, 'scene' as 'scene' | 'text')
 
 // Not drawn from: the poll's handle, the refresh in flight, and a transcript
 // tail cache keyed by path (re-tailed only when the file's mtime moves). A
@@ -341,7 +343,8 @@ export function installBoard(on: On, options: PluginOptions) {
     return failed === null ? { result: `Delivered to ${e.sessionId}.` } : { deny: `Not delivered: ${failed}` }
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    if ((await read($, view)) === 'scene') return next(e)
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
     const Input = 'Input' in ui ? ui.Input : undefined
@@ -360,6 +363,7 @@ export function installBoard(on: On, options: PluginOptions) {
           <Button plain key="down" label="down" hotkey="j" onPress={() => move($, 1)} />
           <Button plain key="refresh" label="refresh" hotkey="r" onPress={() => refresh($)} />
           <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', focus: true })} />
+          <Button plain key="scene" label="office view" hotkey="t" onPress={() => update($, view, () => 'scene')} />
         </Box>
         {list.length === 0 && <Text dimColor>No live sessions found.</Text>}
         {list.map((card, i) => {

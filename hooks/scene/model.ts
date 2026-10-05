@@ -1,4 +1,5 @@
 import type { Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId, SessionCard, Tile, TileMap } from '../../types'
+import { LOOKS } from './art'
 import { clip } from '../sessions'
 
 // Who is in the office and where they belong. Pure: cards and jobs in, crew out.
@@ -67,7 +68,7 @@ export function deriveCrew(
       room: roomFor(state, role),
       seat: { x: 0, y: 0 },
       facing: 'down',
-      look: lookOf(card.sessionId, 3),
+      look: lookOf(card.sessionId, LOOKS),
       ...(tag ? { tag } : {}),
       isSelectable: true,
       isSelf: card.isSelf,
@@ -93,7 +94,7 @@ export function deriveCrew(
       room: roomFor(state, 'worker'),
       seat: { x: 0, y: 0 },
       facing: 'down',
-      look: lookOf(job.id, 3),
+      look: lookOf(job.id, LOOKS),
       ...(tag ? { tag } : {}),
       isSelectable: false,
       isSelf: false,

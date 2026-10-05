@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { Actor, Art, Bitmap, Crew, CrewState, Frame, SpritePose, TileMap } from '../../types'
+import type { Actor, Art, Bitmap, Crew, CrewState, Facing, Frame, SpritePose, TileMap } from '../../types'
 import { paintFrame } from './paint'
 
 const TS = 4
@@ -14,16 +14,18 @@ function bmp(rows: string[]): Bitmap {
 }
 const solid = (i: number, w = TS, h = TS): Bitmap => bmp(Array.from({ length: h }, () => String(i).repeat(w)))
 const allPoses = (b: Bitmap): Record<SpritePose, Bitmap> => ({ stand: b, walk1: b, walk2: b, sit: b, type: b })
+// The same poses for every facing; a look whose left facing differs passes `left`.
+const facings = (p: Record<SpritePose, Bitmap>, left = p): Record<Facing, Record<SpritePose, Bitmap>> => ({ up: p, down: p, right: p, left })
 
 // look 0: one solid color per pose. look 1: a 2x2 dot. look 2: a left-edge bar. look 3: 6 tall.
 const ART: Art = {
   palette: [0, 0x111111, 0x222222, 0x333333, 0x444444, 0x555555, 0x666666, 0x777777, 0x888888, 0x999999],
   tiles: [solid(5), solid(6)],
   sprites: [
-    { stand: solid(1), walk1: solid(2), walk2: solid(3), sit: solid(4), type: solid(7) },
-    allPoses(bmp(['....', '.11.', '.11.', '....'])),
-    allPoses(bmp(['2...', '2...', '2...', '2...'])),
-    allPoses(solid(3, 4, 6)),
+    facings({ stand: solid(1), walk1: solid(2), walk2: solid(3), sit: solid(4), type: solid(7) }),
+    facings(allPoses(bmp(['....', '.11.', '.11.', '....']))),
+    facings(allPoses(bmp(['2...', '2...', '2...', '2...'])), allPoses(bmp(['...2', '...2', '...2', '...2']))),
+    facings(allPoses(solid(3, 4, 6))),
   ],
   bubbles: { needsYou: solid(8, 2, 2), failed: solid(9, 2, 2) },
 }
@@ -83,7 +85,7 @@ describe('sprites', () => {
     expect(px(f, 6, 6)).toBe(1)
     expect(px(f, 7, 7)).toBe(6)
   })
-  test('facing left mirrors the sprite', () => {
+  test('each facing draws its own frames (left is not a mirror of right)', () => {
     const crew = [member('a', 'reporting', 2)]
     const right = paint([actor('a', 1, 1, { facing: 'right' })], crew)
     expect(px(right, 4, 5)).toBe(2)

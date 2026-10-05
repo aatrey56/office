@@ -110,9 +110,9 @@ export type Frame = { width: number; height: number; pixels: Uint8Array }
 export type Bitmap = { width: number; height: number; pixels: Uint8Array }
 export type SpritePose = 'stand' | 'walk1' | 'walk2' | 'sit' | 'type'
 export type Art = {
-  palette: number[] // 0xRRGGBB, at most 16; index 0 is the transparent slot for sprites
+  palette: number[] // 0xRRGGBB, at most 256; index 0 is the transparent slot for sprites
   tiles: Bitmap[] // tileSize square, opaque
-  sprites: Record<SpritePose, Bitmap>[] // one entry per base look, drawn facing down/right
+  sprites: Record<Facing, Record<SpritePose, Bitmap>>[] // one entry per look, every facing drawn (none mirrored)
   bubbles: { needsYou: Bitmap; failed: Bitmap }
 }
 
@@ -166,6 +166,7 @@ declare module 'claude-code' {
       sceneSelected: string | null // the selected crew id (leads and managers only)
       sceneProject: string | null // the project office shown; null is the lobby
       sceneZoom: 'side' | 'big' | 'max' // dock width the scene asks for; persisted in $.store 'sceneZoom'
+      officeView: 'scene' | 'text' // what the /office pane shows; persisted in $.store 'officeView'
       // manager
       managers: Record<string, ManagerEntry>
     }

@@ -128,6 +128,9 @@ test('the pane lists sessions and selects one', async ($, on) => {
     props: { title: 'Office', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 20 } },
   } as Parameters<typeof $.ui.mount>[0])
 
+  // The office scene is the default view; t swaps to this text board, and back.
+  expect(await ui.find({ key: 'scene' })).toBeDefined()
+  await ui.press({ key: 'text' })
   expect(await ui.find({ type: 'Button', text: /coding-0b/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Working on the build/ })).toBeDefined()
   expect(await ui.find({ key: 'copy' })).toBeUndefined()
@@ -135,6 +138,8 @@ test('the pane lists sessions and selects one', async ($, on) => {
   await ui.press({ key: 'pick:aaaa-1111' })
   expect(await ui.find({ key: 'copy' })).toBeDefined()
   expect(await ui.find({ key: 'msg' })).toBeDefined()
+  await ui.press({ key: 'scene' })
+  expect(await ui.find({ key: 'copy' })).toBeUndefined()
   await ui.unmount()
 })
 

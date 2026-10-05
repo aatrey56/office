@@ -86,12 +86,12 @@ export function paintFrame(
     if (looks === 0) break
     const member = byId.get(actor.id)
     const look = (((member?.look ?? 0) % looks) + looks) % looks
-    const sprite = art.sprites[look]?.[poseFor(actor, member, tick)]
+    const sprite = art.sprites[look]?.[actor.facing]?.[poseFor(actor, member, tick)]
     if (!sprite) continue
     // Centered across the tile, bottom edge on the tile's bottom; a tall sprite pokes up.
     const sx = actor.x + Math.floor((ts - sprite.width) / 2)
     const sy = actor.y + ts - sprite.height
-    const mirror = actor.facing === 'left'
+    const mirror = false // every facing has its own frames
     blit(frame, sprite, sx, sy, false, mirror)
     if (member && member.id === selectedId) outline(frame, sprite, sx, sy, mirror, selectColor)
 
