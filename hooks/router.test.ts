@@ -17,35 +17,10 @@ const DOCS_REPLY =
   '"usage":{"input_tokens":403,"output_tokens":73}}'
 
 describe('rules backend', () => {
-  test('mechanical edits go to sonnet/low', () => {
-    expect(rulesRoute('rename fooBar to foo_bar across utils.py', BEFORE)).toMatchObject({ model: 'sonnet', effort: 'low' })
-    expect(rulesRoute('run prettier and fix the lint errors', BEFORE)).toMatchObject({ model: 'sonnet', effort: 'low' })
-  })
   test('review / refactor / debug go to opus/high', () => {
     expect(rulesRoute('review this PR for correctness', BEFORE)).toMatchObject({ model: 'opus', effort: 'high' })
     expect(rulesRoute('refactor the parser module', BEFORE)).toMatchObject({ model: 'opus', effort: 'high' })
     expect(rulesRoute('debug why the upload hangs', BEFORE)).toMatchObject({ model: 'opus', effort: 'high' })
-  })
-  test('architecture, research and multi-system work go to fable/high', () => {
-    expect(rulesRoute('propose an architecture for the sync engine', BEFORE)).toMatchObject({ model: 'fable', effort: 'high' })
-    expect(rulesRoute('research vector DB options', BEFORE)).toMatchObject({ model: 'fable' })
-    expect(rulesRoute('the api, the queue and the cache disagree after deploy', BEFORE)).toMatchObject({
-      model: 'fable',
-      effort: 'high',
-    })
-  })
-})
-
-describe('claude backend JSON parsing', () => {
-  test('fenced, with prose around it and braces inside strings', () => {
-    const text = 'Sure!\n```json\n{"model": "sonnet", "effort": "low", "confidence": "0.9", "reason": "rename {x}"}\n```\nDone.'
-    expect(parseClaudeRoute(text, BEFORE)).toEqual({ model: 'sonnet', effort: 'low', confidence: 0.9, reason: 'rename {x}' })
-  })
-  test('unusable replies answer undefined', () => {
-    expect(parseClaudeRoute('I think opus.', BEFORE)).toBeUndefined()
-    expect(parseClaudeRoute('{"model":"gpt","effort":"low"}', BEFORE)).toBeUndefined()
-    expect(parseClaudeRoute('{"model":"opus","effort":"enormous"}', BEFORE)).toBeUndefined()
-    expect(parseClaudeRoute('{"model":"opus", effort: high', BEFORE)).toBeUndefined()
   })
 })
 

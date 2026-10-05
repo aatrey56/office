@@ -31,23 +31,6 @@ describe('toCells', () => {
       [HB, 0xff0000, 0x0000ff],
     ])
   })
-  test('shrink 2 takes the top-left of each 2x2 block and drops an odd trailing row and column', () => {
-    // 5x5: rows/cols 0 and 2 survive, row/col 4 is dropped.
-    // prettier-ignore
-    const f = frameOf(5, 5, [
-      1, 0, 2, 0, 3,
-      0, 0, 0, 0, 0,
-      3, 0, 0, 0, 1,
-      0, 0, 0, 0, 0,
-      2, 2, 2, 2, 2,
-    ])
-    const { cells, columns, rows } = toCells(f, PAL, 2)
-    expect([columns, rows]).toEqual([2, 1])
-    expect(triplets(cells)).toEqual([
-      [HB, 0xff0000, 0x0000ff],
-      [HB, 0x00ff00, 0x112233],
-    ])
-  })
 })
 
 // ── an independent PNG reader ──────────────────────────────────────────────

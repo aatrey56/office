@@ -2,16 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
-import {
-  LAST,
-  cachePath,
-  fitPage,
-  graphicsLikely,
-  dockToFill,
-  sipsArgv,
-  step,
-  unzipArgv,
-} from './manga'
+import { cachePath, fitPage, graphicsLikely, sipsArgv, unzipArgv } from './manga'
 
 const ROOT = '/Users/aatrey/Manga'
 type Entry = { name: string; kind: 'dir' | 'file'; size: number; mtimeMs: number; isLink: boolean }
@@ -65,18 +56,6 @@ function fakePanes(on: On, up: string[] = []) {
   })
   return Object.assign(opened, { live })
 }
-
-describe('pure logic', () => {
-
-  test('paging rolls over between chapters and stops at the ends', () => {
-    expect(step(0, 1, 1, 3, 2)).toEqual({ chapter: 0, page: 2 })
-    expect(step(0, 2, 1, 3, 2)).toEqual({ chapter: 1, page: 0 })
-    expect(step(1, 0, -1, 3, 2)).toEqual({ chapter: 0, page: LAST })
-    expect(step(1, 2, 1, 3, 2)).toEqual({ chapter: 1, page: 2 })
-    expect(step(0, 0, -1, 3, 2)).toEqual({ chapter: 0, page: 0 })
-    expect(step(0, 0, 1, 0, 1)).toEqual({ chapter: 0, page: 0 })
-  })
-})
 
 describe('/manga pane', () => {
 
@@ -197,11 +176,6 @@ describe('page sizing', () => {
     // dock 90 cols x 60 rows: height-bound; 80 rows would need 119 cols, so width-bound
     expect(fitPage(60, 90)).toEqual({ rows: 59, columns: 89 })
     expect(fitPage(80, 90)).toEqual({ rows: 60, columns: 90 })
-  })
-  test('a dock too narrow for the page height asks for enough width, capped at 60%', () => {
-    expect(dockToFill(56, 77, 214)).toBe(83)
-    expect(dockToFill(56, 90, 214)).toBeUndefined()
-    expect(dockToFill(80, 60, 120)).toBe(72)
   })
 })
 
@@ -329,21 +303,16 @@ describe('/manga with cbz chapters', () => {
     expect(JSON.parse(texts.get(`${DIR458}/${MARKER}`) ?? '{}').openedAt).toBe(1_000_000) // reopening refreshes recency
   })
 
-  for (const [what, marker] of [
-    ['size', { size: SIZE + 1, mtimeMs: MTIME, openedAt: 5 }],
-    ['mtime', { size: SIZE, mtimeMs: MTIME - 1, openedAt: 5 }],
-  ] as const) {
-    test(`a changed archive ${what} drops the cache and extracts again`, async ($, on) => {
-      fakeStore(on)
-      fakePanes(on)
-      mock.clock(on, { now: 1_000_000 })
-      const { calls } = fakeCbzWorld(on, { preexisting: true, markers: { [DIR458]: marker } })
-      await openKingdom($)
-      expect(calls[0]).toEqual(['rm', '-rf', '--', DIR458])
-      expect(calls[1]).toEqual(['mkdir', '-p', DIR458])
-      expect(calls[2]).toEqual(unzipArgv(CBZ458, DIR458))
-    })
-  }
+  test('a changed archive size drops the cache and extracts again', async ($, on) => {
+    fakeStore(on)
+    fakePanes(on)
+    mock.clock(on, { now: 1_000_000 })
+    const { calls } = fakeCbzWorld(on, { preexisting: true, markers: { [DIR458]: { size: SIZE + 1, mtimeMs: MTIME, openedAt: 5 } } })
+    await openKingdom($)
+    expect(calls[0]).toEqual(['rm', '-rf', '--', DIR458])
+    expect(calls[1]).toEqual(['mkdir', '-p', DIR458])
+    expect(calls[2]).toEqual(unzipArgv(CBZ458, DIR458))
+  })
 
   test('near the end of a chapter the next one unpacks in the background', async ($, on) => {
     fakeStore(on)

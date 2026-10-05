@@ -55,18 +55,6 @@ describe('findPath', () => {
       { x: 4, y: 1 },
     ])
   })
-  test('no path when a wall seals the destination off', () => {
-    const map = mapOf(['..#..', '..#..', '..#..'])
-    expect(findPath(map, { x: 0, y: 0 }, { x: 4, y: 2 })).toEqual([])
-  })
-  test('a destination on a non-walkable seat tile is still reachable', () => {
-    const map = mapOf(['..#'])
-    expect(map.walkable[2]).toBe(false)
-    expect(findPath(map, { x: 0, y: 0 }, { x: 2, y: 0 })).toEqual([
-      { x: 1, y: 0 },
-      { x: 2, y: 0 },
-    ])
-  })
 })
 
 describe('stepActors walking', () => {

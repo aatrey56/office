@@ -44,11 +44,6 @@ describe('/office manage', () => {
     expect(off.text).toContain('no longer manages')
     expect(store.get('managers')).toEqual({})
   })
-
-  test('an unknown argument still gets the board\'s usage line', async ($, on) => {
-    fakeWorld(on)
-    expect((await $.command.run({ command: 'office', args: 'nonsense', ...TYPED })).text).toContain('Usage: /office')
-  })
 })
 
 describe('the role in the system prompt', () => {

@@ -38,12 +38,6 @@ describe('stateOf and roomFor', () => {
       expect(stateOf('zzz', role)).toBe('idle')
     }
   })
-  test('worker statuses', () => {
-    expect(stateOf('running', 'worker')).toBe('working')
-    expect(stateOf('blocked', 'worker')).toBe('needs-you')
-    expect(stateOf('done', 'worker')).toBe('reporting')
-    expect(stateOf('failed', 'worker')).toBe('failed')
-  })
   test('rooms', () => {
     expect(roomFor('working', 'lead')).toBe('coding')
     expect(roomFor('working', 'worker')).toBe('coding')

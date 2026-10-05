@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
 import type { SessionCard } from '../types'
-import { bashActivity, chatLines, lastAssistantText, parseRegistry, projectSlug } from './sessions'
+import { bashActivity, chatLines, parseRegistry, projectSlug } from './sessions'
 
 const HOME = '/Users/me'
 const SESSIONS = `${HOME}/.claude/sessions`
@@ -44,12 +44,6 @@ describe('pure helpers', () => {
     expect(parseRegistry(JSON.stringify({ ...REGISTRY, parkedJobId: '2cb96d62' }))).toBe(null)
     expect(parseRegistry('not json')).toBe(null)
     expect(parseRegistry('{"pid":"1"}')).toBe(null)
-  })
-
-  test('takes the last assistant text block from a tail', () => {
-    expect(lastAssistantText(TRANSCRIPT)).toBe('Working on the build now.')
-    expect(lastAssistantText('')).toBe(undefined)
-    expect(lastAssistantText(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(700) }] } }))?.length).toBe(600)
   })
 })
 

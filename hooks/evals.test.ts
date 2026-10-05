@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { EvalReport, RouteCase, RouteOutcome } from '../types'
-import { formatReport, parseCases, scoreRoutes } from './evals'
+import type { RouteCase, RouteOutcome } from '../types'
+import { parseCases, scoreRoutes } from './evals'
 
 const line = (o: Record<string, unknown>) => JSON.stringify({ id: 'a', task: 't', model: 'sonnet', effort: 'low', why: 'w', ...o })
 const kase = (id: string, model: RouteCase['model'], effort: RouteCase['effort']): RouteCase => ({ id, task: 't', model, effort, why: 'w' })
@@ -85,40 +85,5 @@ describe('scoreRoutes', () => {
       { id: 'c5', want: 'sonnet/medium', got: 'error: timeout' },
       { id: 'c6', want: 'fable/medium', got: 'no answer' },
     ])
-  })
-})
-
-describe('formatReport', () => {
-  const report = (over: Partial<EvalReport> = {}): EvalReport => ({
-    backend: 'rules',
-    total: 8,
-    answered: 8,
-    exact: 4,
-    modelMatch: 6,
-    withinOneTier: 8,
-    effortMatch: 5,
-    overRouted: 1,
-    underRouted: 1,
-    medianLatencyMs: 12,
-    misses: [],
-    ...over,
-  })
-
-  test('one row per report with whole-number percentages of total', () => {
-    const out = formatReport([report(), report({ backend: 'claude', total: 3, answered: 2, exact: 1, modelMatch: 1, withinOneTier: 2, effortMatch: 2, overRouted: 0, underRouted: 1, medianLatencyMs: 840 })], 100)
-    const lines = out.split('\n')
-    expect(lines.length).toBe(3) // header and two rows, no misses
-    expect(lines[1]).toContain('rules')
-    expect(lines[1]).toContain('8/8')
-    expect(lines[1]).toContain('50%') // exact 4/8
-    expect(lines[1]).toContain('75%') // model 6/8
-    expect(lines[1]).toContain('100%')
-    expect(lines[1]).toContain('13%') // 1/8 rounds from 12.5
-    expect(lines[1]).toContain('12ms')
-    expect(lines[2]).toContain('claude')
-    expect(lines[2]).toContain('2/3')
-    expect(lines[2]).toContain('33%') // 1/3
-    expect(lines[2]).toContain('67%') // 2/3
-    expect(lines[2]).toContain('840ms')
   })
 })

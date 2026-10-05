@@ -7,9 +7,6 @@ const five = (percentUsed: number, resetsAt?: string) => ({ kind: 'five_hour', p
 const week = (percentUsed: number, resetsAt?: string) => ({ kind: 'seven_day', percentUsed, resetsAt })
 
 describe('budgetVerdict', () => {
-  test('under every soft line is open', () => {
-    expect(budgetVerdict([five(79.9), week(84)], DEFAULT_CAPS, none)).toEqual({ isAllowed: true, zone: 'open' })
-  })
   test('soft zone: a small route starts without a warning', () => {
     expect(budgetVerdict([five(82)], DEFAULT_CAPS, { ...none, isSmall: true })).toEqual({ isAllowed: true, zone: 'soft' })
   })

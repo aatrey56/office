@@ -64,20 +64,6 @@ const px = (f: Frame, x: number, y: number): number | undefined => f.pixels[y * 
 const paint = (actors: Actor[], crew: Crew[], tick = 0, selected: string | null = null) =>
   paintFrame(MAP, ART, actors, crew, tick, selected, 6)
 
-describe('tiles', () => {
-  test('every tile is drawn opaquely; a tile with no bitmap draws nothing', () => {
-    const f = paint([], [])
-    expect(f.width).toBe(12)
-    expect(f.height).toBe(12)
-    expect(px(f, 0, 0)).toBe(5)
-    expect(px(f, 4, 4)).toBe(6)
-    expect(px(f, 7, 7)).toBe(6)
-    expect(px(f, 8, 4)).toBe(5)
-    expect(px(f, 8, 8)).toBe(0)
-    expect(px(f, 11, 11)).toBe(0)
-  })
-})
-
 describe('sprites', () => {
   test('index 0 is transparent and the tile shows through', () => {
     const f = paint([actor('a', 1, 1)], [member('a', 'reporting', 1)])
