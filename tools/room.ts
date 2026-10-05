@@ -7,6 +7,52 @@ import { draw, pieces, PALETTES, rgb8 } from './art'
 export const COLS = 12, ROWS = 10, T = 16
 const P = pieces()
 
+// Every piece in the room, where it goes, and whether its base blocks a walk. Wall pieces
+// (rows 0-1) never block: the wall already does. The floor plan is computed from this list.
+// `tall` pieces (a tree, a cabinet, a chair) block only their base: their top half stands in front of
+// the cell behind. Flat furniture (desks, tables, the couch) blocks all the cells it covers.
+type Place = { piece: keyof typeof P; x: number; y: number; blocks: boolean; tall?: true }
+export const PLACEMENTS: Place[] = [
+  // manager office
+  { piece: 'bookshelf', x: 0, y: 8, blocks: false },
+  { piece: 'desk', x: 16, y: 48, blocks: true },
+  { piece: 'tree', x: 56, y: 32, blocks: true, tall: true },
+  { piece: 'planter', x: 2, y: 64, blocks: true },
+  // meeting: whiteboard on the wall, the big table, chairs
+  { piece: 'tvBig', x: 131, y: 4, blocks: false },
+  { piece: 'bigTable', x: 139, y: 48, blocks: true },
+  { piece: 'cabinetTall', x: 176, y: 32, blocks: true, tall: true },
+  { piece: 'chairSmall', x: 123, y: 62, blocks: true, tall: true },
+  { piece: 'chairSmall', x: 176, y: 62, blocks: true, tall: true },
+  // coding corner: three computer desks on whole cells, a walkway between each pair
+  { piece: 'pcDesk', x: 0, y: 88, blocks: true },
+  { piece: 'pcDesk', x: 48, y: 88, blocks: true },
+  { piece: 'pcDesk', x: 96, y: 88, blocks: true },
+  // break room
+  { piece: 'sofaA', x: 136, y: 98, blocks: true },
+  { piece: 'coffeeTable', x: 135, y: 124, blocks: true },
+  { piece: 'fridge', x: 176, y: 95, blocks: true, tall: true },
+  // review corner: a plain desk with no computer
+  { piece: 'desk', x: 64, y: 144, blocks: true },
+  { piece: 'fern', x: 114, y: 136, blocks: true, tall: true },
+  // the door, top centre, with its light spilling in
+  { piece: 'doorLight', x: 96, y: 2, blocks: false },
+]
+
+// Cells a piece stands on: in this 3/4 view only the lower part of a piece is its base, so a
+// cell is blocked when that base covers at least 40% of it.
+export function footprint(place: Place): [number, number][] {
+  const p = P[place.piece]!
+  const baseTop = place.tall ? place.y + Math.max(0, Math.floor(p.h * 0.55)) : place.y
+  const cells: [number, number][] = []
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const w = Math.min(place.x + p.w, (c + 1) * T) - Math.max(place.x, c * T)
+    const h = Math.min(place.y + p.h, (r + 1) * T) - Math.max(baseTop, r * T)
+    if (w > 0 && h > 0 && w * h >= 0.4 * T * T) cells.push([c, r])
+  }
+  return cells
+}
+
 export function background(): Img {
   const img = blank(COLS * T, ROWS * T, [...rgb8(PALETTES.floor![0]!), 255])
   for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) draw(img, r < 2 ? P.brickLight! : P.planks!, c * T, r * T)
@@ -14,30 +60,7 @@ export function background(): Img {
   for (let x = 0; x < img.width; x++) img.data.set([...rgb8(PALETTES.wall![3]!), 255], (2 * T * img.width + x) * 4)
   // break-room rug: checker carpet under the sofa corner
   for (let r = 6; r < 9; r++) for (let c = 8; c < 12; c++) draw(img, P.checker!, c * T, r * T)
-  // manager office
-  draw(img, P.bookshelf!, 0, 8)
-  draw(img, P.desk!, 16, 48)
-  draw(img, P.tree!, 56, 32)
-  // meeting: whiteboard on the wall, the big table, stools
-  draw(img, P.tvBig!, 131, 4)
-  draw(img, P.bigTable!, 139, 48)
-  draw(img, P.cabinetTall!, 176, 32)
-  draw(img, P.chairSmall!, 123, 62)
-  draw(img, P.chairSmall!, 176, 62)
-  // coding corner: three computer desks
-  draw(img, P.pcDesk!, 8, 88)
-  draw(img, P.pcDesk!, 48, 88)
-  draw(img, P.pcDesk!, 88, 88)
-  draw(img, P.planter!, 2, 64)
-  // break room
-  draw(img, P.sofaA!, 136, 98)
-  draw(img, P.coffeeTable!, 135, 124)
-  draw(img, P.fridge!, 176, 95)
-  draw(img, P.fern!, 120, 98)
-  // review corner: a plain desk (no computer) at the bottom left, reviewers sit behind it
-  draw(img, P.desk!, 64, 144)
-  // door, bottom centre, with its light spilling in
-  draw(img, P.doorLight!, 96, 2)
+  for (const place of PLACEMENTS) draw(img, P[place.piece]!, place.x, place.y)
   return img
 }
 

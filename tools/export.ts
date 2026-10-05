@@ -1,5 +1,5 @@
 import { writeFileSync } from 'node:fs'
-import { background, COLS, ROWS, T } from './room'
+import { background, COLS, footprint, PLACEMENTS, ROWS, T } from './room'
 import { crewSheet, LOOKS } from './crew'
 import { load } from './png'
 import { PALETTES, rgb8 } from './art'
@@ -33,19 +33,10 @@ for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
 }
 
 // ── the floor plan (cells): what blocks a walk, where each room's seats are, and the door ──
-const BLOCKED = [
-  ...[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11].flatMap(c => [[c, 0], [c, 1]]), // the back wall (col 6 is the door)
-  [6, 0], [6, 1],
-  [1, 3], [2, 3], // manager desk
-  [3, 2], [3, 3], // tree
-  [0, 4], [1, 4], // planter
-  [8, 3], [9, 3], [10, 3], [8, 4], [9, 4], [10, 4], [8, 5], [9, 5], [10, 5], // meeting table
-  [11, 2], [11, 3], // tall cabinet
-  [0, 5], [1, 5], [2, 5], [0, 6], [1, 6], [2, 6], [3, 5], [4, 5], [3, 6], [4, 6], [5, 5], [6, 5], [7, 5], [5, 6], [6, 6], // computer desks
-  [7, 6], // fern
-  [8, 6], [9, 6], [10, 6], [8, 7], [9, 7], [10, 7], [8, 8], [9, 8], [10, 8], // sofa and coffee table
-  [11, 5], [11, 6], [11, 7], // fridge
-  [4, 9], [5, 9], // review desk
+// The back wall (rows 0-1) blocks everywhere; below it, each piece's base blocks the cells it stands on.
+const BLOCKED: [number, number][] = [
+  ...Array.from({ length: COLS }, (_, c) => [[c, 0], [c, 1]] as [number, number][]).flat(),
+  ...PLACEMENTS.filter(p => p.blocks).flatMap(footprint),
 ]
 const walkable = Array.from({ length: COLS * ROWS }, () => true)
 for (const [c, r] of BLOCKED) walkable[r! * COLS + c!] = false
@@ -55,7 +46,7 @@ const seat = (room: string, x: number, y: number, facing: string): Seat => ({ ro
 const seats: Seat[] = [
   seat('manager', 1, 2, 'down'), seat('manager', 2, 2, 'down'),
   seat('meeting', 7, 3, 'right'), seat('meeting', 7, 4, 'right'), seat('meeting', 11, 4, 'left'),
-  seat('coding', 1, 7, 'up'), seat('coding', 3, 7, 'up'), seat('coding', 6, 7, 'up'),
+  seat('coding', 1, 7, 'up'), seat('coding', 4, 7, 'up'), seat('coding', 7, 7, 'up'),
   seat('break', 9, 6, 'down'), seat('break', 10, 6, 'down'), seat('break', 11, 8, 'left'),
   seat('lobby', 5, 3, 'down'), seat('lobby', 7, 2, 'down'),
   seat('whiteboard', 8, 2, 'up'), seat('whiteboard', 9, 2, 'up'),
@@ -100,6 +91,24 @@ const music = [
   bubble(['..BBBBB', '..B...B', '..B...B', '..B...B', 'BBB.BBB', 'BBB.BBB']),
 ]
 const thinking = bubble(['.#######.', '#WWWWWWW#', '#W#W#W#W#', '#WWWWWWW#', '.#######.', '..##.....', '.#.......'])
+
+// Every seat must be reachable from the door: standing on a walkable cell the door reaches, or (a
+// seat on furniture) next to one. A floor plan that walls a seat off fails the export, loudly.
+{
+  const reach = new Set([`${door.x},${door.y}`]), queue = [[door.x, door.y]]
+  while (queue.length) {
+    const [x, y] = queue.shift()!
+    for (const [dx, dy] of [[0, -1], [1, 0], [0, 1], [-1, 0]]) {
+      const nx = x! + dx!, ny = y! + dy!
+      if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS || !walkable[ny * COLS + nx] || reach.has(`${nx},${ny}`)) continue
+      reach.add(`${nx},${ny}`); queue.push([nx, ny])
+    }
+  }
+  const near = (x: number, y: number) => reach.has(`${x},${y}`) || [[0, -1], [1, 0], [0, 1], [-1, 0]].some(([dx, dy]) => reach.has(`${x + dx!},${y + dy!}`))
+  const cut = seats.filter(s => !near(s.at.x, s.at.y))
+  for (let y = 0; y < ROWS; y++) console.log(String(y).padStart(2), Array.from({ length: COLS }, (_, x) => (seats.some(s => s.at.x === x && s.at.y === y) ? (near(x, y) ? 's' : 'X') : walkable[y * COLS + x] ? (reach.has(`${x},${y}`) ? '.' : '?') : '#')).join(''))
+  if (cut.length) throw new Error(`seats the door cannot reach: ${cut.map(s => `${s.room}(${s.at.x},${s.at.y})`).join(', ')}`)
+}
 
 const data = {
   palette, tileSize: T, width: COLS, height: ROWS, tiles, map, walkable, seats, door, sprites, bubbles: { needsYou, failed, music, thinking },
