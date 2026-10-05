@@ -5,7 +5,7 @@ import type { Actor, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCar
 import { budgetLine } from './budget'
 import { officeArt, officeMap } from './scene/art'
 import { toCells, toPng } from './scene/encode'
-import { assignSeats, deriveCrew, projectsOf } from './scene/model'
+import { assignSeats, deriveCrew, distinctLooks, projectsOf } from './scene/model'
 import { isSettled, stepActors } from './scene/motion'
 import { paintFrame } from './scene/paint'
 
@@ -91,7 +91,7 @@ async function currentCrew($: EngineInterface): Promise<{ crew: Crew[]; project:
   const project = shownProject(everyone, await read($, PROJECT))
   if (project === null) return { crew: [], project, all: [] }
   seated = assignSeats(everyone, officeMap(), project, seated)
-  return { crew: seated.filter(c => c.project === project), project, all: projectsOf(everyone) }
+  return { crew: distinctLooks(seated.filter(c => c.project === project), officeArt().sprites.length), project, all: projectsOf(everyone) }
 }
 
 function selectColor(): number {

@@ -68,6 +68,7 @@ export function stepActors(actors: Actor[], crew: Crew[], map: TileMap, pixels: 
     const member = crewById.get(actor.id)
     const isLeaving = !member || member.state === 'leaving'
     const target = isLeaving ? map.door : (member as Crew).seat
+    const dx = isLeaving ? 0 : ((member as Crew).seatDx ?? 0)
 
     let x = actor.x
     let y = actor.y
@@ -76,7 +77,7 @@ export function stepActors(actors: Actor[], crew: Crew[], map: TileMap, pixels: 
     const isOnTile = x % size === 0 && y % size === 0
     // Mid-step the actor is bound for path[0]; a new route must start there so it never cuts a corner.
     const heading = path[0]
-    const base: Tile = !isOnTile && heading ? heading : { x: Math.round(x / size), y: Math.round(y / size) }
+    const base: Tile = !isOnTile && heading ? heading : { x: Math.round((x - dx) / size), y: Math.round(y / size) }
     const isOnTarget = path.length === 0 && isSame(base, target)
     const last = path[path.length - 1]
     if (!isOnTarget && (!last || !isSame(last, target))) {
@@ -106,8 +107,15 @@ export function stepActors(actors: Actor[], crew: Crew[], map: TileMap, pixels: 
       }
       if (x === wx && y === wy) path.shift()
     }
+    // On the seat's cell: the last few pixels sideways, so the sitter centres on its desk.
+    const seatX = target.x * size + dx
+    if (left > 0 && path.length === 0 && y === target.y * size && x !== seatX && Math.abs(x - seatX) < size) {
+      const d = Math.min(left, Math.abs(seatX - x))
+      x += seatX > x ? d : -d
+      isMoved = true
+    }
 
-    const isArrived = path.length === 0 && x === target.x * size && y === target.y * size
+    const isArrived = path.length === 0 && x === seatX && y === target.y * size
     if (isArrived && !isLeaving) facing = (member as Crew).facing
     out.push({ id: actor.id, x, y, path, facing, step: actor.step + (isMoved ? 1 : 0), isGone: isArrived && isLeaving })
   }

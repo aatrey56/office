@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
 import type { SessionCard } from '../types'
-import { lastAssistantText, parseRegistry, projectSlug } from './sessions'
+import { bashActivity, lastAssistantText, parseRegistry, projectSlug } from './sessions'
 
 const HOME = '/Users/me'
 const SESSIONS = `${HOME}/.claude/sessions`
@@ -185,6 +185,11 @@ test('an open pane keeps its session list fresh on its own, in either view', asy
   await clock.advance(3_100)
   expect(registryReads()).toBeGreaterThan(before)
   await ui.unmount()
+})
+
+test('a shell command that only looks is reviewing, one that changes or runs things is coding', () => {
+  expect(['cd /r && git status --short', 'sed -n 1,40p a.ts', 'grep -n x *.ts'].map(bashActivity)).toEqual(['reviewing', 'reviewing', 'reviewing'])
+  expect(["sed -i '' s/a/b/ f", 'claude plugin test .', 'git commit -m x'].map(bashActivity)).toEqual(['coding', 'coding', 'coding'])
 })
 
 describe('message_session', () => {

@@ -58,7 +58,7 @@ export function officeMap(_tileSize: 8 | 16 = 16): TileMap {
     tileSize: ART_DATA.tileSize,
     tiles: [...ART_DATA.map],
     walkable: [...ART_DATA.walkable],
-    seats: ART_DATA.seats.map(s => ({ room: s.room as RoomId, at: { ...s.at }, facing: s.facing as Facing }) satisfies Seat),
+    seats: ART_DATA.seats.map(s => ({ room: s.room as RoomId, at: { ...s.at }, facing: s.facing as Facing, ...('dx' in s && s.dx ? { dx: s.dx } : {}) }) satisfies Seat),
     door: { ...ART_DATA.door },
   }
   return map

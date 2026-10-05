@@ -146,7 +146,7 @@ export function assignSeats(crew: Crew[], map: TileMap, project: string, previou
     const slot = `${c.room}:${seat ? key(seat.at) : ''}`
     if (!seat || taken.has(slot)) continue
     taken.add(slot)
-    kept.set(c.id, { ...c, seat: { ...seat.at }, facing: seat.facing })
+    kept.set(c.id, { ...c, seat: { ...seat.at }, facing: seat.facing, ...(seat.dx ? { seatDx: seat.dx } : {}) })
   }
 
   const standing = new Map<RoomId, Tile[]>()
@@ -159,7 +159,7 @@ export function assignSeats(crew: Crew[], map: TileMap, project: string, previou
     const free = map.seats.find(s => s.room === c.room && !taken.has(`${c.room}:${key(s.at)}`))
     if (free) {
       taken.add(`${c.room}:${key(free.at)}`)
-      return { ...c, seat: { ...free.at }, facing: free.facing }
+      return { ...c, seat: { ...free.at }, facing: free.facing, ...(free.dx ? { seatDx: free.dx } : {}) }
     }
 
     // Overflow: the nearest standing tile nobody has taken.
@@ -169,6 +169,21 @@ export function assignSeats(crew: Crew[], map: TileMap, project: string, previou
     used.add(key(spot))
     return { ...c, seat: spot, facing: 'down' }
   })
+}
+
+// No two people in one office wear the same look while looks remain: each keeps its own when
+// free, else takes the next free one, in a stable order (by id).
+export function distinctLooks(crew: Crew[], looks: number): Crew[] {
+  if (looks <= 0) return crew
+  const taken = new Set<number>()
+  const chosen = new Map<string, number>()
+  for (const c of [...crew].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+    let look = ((c.look % looks) + looks) % looks
+    for (let i = 0; i < looks && taken.has(look); i++) look = (look + 1) % looks
+    taken.add(look)
+    chosen.set(c.id, look)
+  }
+  return crew.map(c => ({ ...c, look: chosen.get(c.id) ?? c.look }))
 }
 
 // The distinct projects, most crew first; the lobby shows one door for each.

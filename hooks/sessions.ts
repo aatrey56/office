@@ -78,6 +78,22 @@ export function lastAssistantText(tail: string): string | undefined {
 const CODING = /^(Edit|MultiEdit|Write|NotebookEdit|Bash|PowerShell)$/
 const REVIEWING = /^(Read|Grep|Glob|LS|mcp__office__codex_review)$/
 const PLANNING = /^(EnterPlanMode|ExitPlanMode|TodoWrite|TaskCreate|TaskUpdate|WebSearch|WebFetch|Agent|Task|Workflow|mcp__office__route_task|mcp__office__spawn_worker)$/
+// A shell command that only looks (cat, grep, ls, git log …) is reviewing; anything else is coding.
+const LOOKING = /^(cat|head|tail|less|grep|rg|ls|find|wc|tree|jq|file|stat|du|diff|sort|uniq|cut|echo|which|pwd)$/
+const GIT_LOOKING = /^(log|status|diff|show|branch|blame|ls-files|rev-parse)$/
+export function bashActivity(command: string): Activity {
+  // The first real command: past `cd somewhere &&` and environment assignments.
+  const first = command
+    .split(/&&|;|\|\|/)
+    .map(part => part.trim())
+    .find(part => part && !/^cd(\s|$)/.test(part))
+  const words = (first ?? '').split(/\s+/).filter(w => !/^[A-Z_][A-Z0-9_]*=/.test(w))
+  const [cmd, sub] = [words[0] ?? '', words[1] ?? '']
+  if (cmd === 'sed') return words.includes('-i') ? 'coding' : 'reviewing'
+  if (cmd === 'git') return GIT_LOOKING.test(sub) ? 'reviewing' : 'coding'
+  return LOOKING.test(cmd.replace(/^.*\//, '')) ? 'reviewing' : 'coding'
+}
+
 export function lastActivity(tail: string): Activity | undefined {
   const lines = tail.split('\n')
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -90,9 +106,13 @@ export function lastActivity(tail: string): Activity | undefined {
       continue
     }
     if (row?.type !== 'assistant' || !Array.isArray(row.message?.content)) continue
-    const tools = (row.message.content as { type?: unknown; name?: unknown }[]).filter(b => b?.type === 'tool_use' && typeof b.name === 'string')
-    const name = tools[tools.length - 1]?.name as string | undefined
+    const tools = (row.message.content as { type?: unknown; name?: unknown; input?: { command?: unknown } }[]).filter(
+      b => b?.type === 'tool_use' && typeof b.name === 'string',
+    )
+    const newest = tools[tools.length - 1]
+    const name = newest?.name as string | undefined
     if (!name) continue
+    if (name === 'Bash' && typeof newest?.input?.command === 'string') return bashActivity(newest.input.command)
     if (CODING.test(name)) return 'coding'
     if (REVIEWING.test(name)) return 'reviewing'
     if (PLANNING.test(name)) return 'planning'

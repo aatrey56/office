@@ -66,7 +66,8 @@ export type MangaShelf = {
 export type Tile = { x: number; y: number } // tile coordinates, 0,0 at the top left
 export type Facing = 'up' | 'down' | 'left' | 'right'
 export type RoomId = 'manager' | 'meeting' | 'coding' | 'break' | 'lobby' | 'whiteboard' | 'review'
-export type Seat = { room: RoomId; at: Tile; facing: Facing }
+// dx: pixels to shift the sitter sideways, so one person centres on a two-cell desk.
+export type Seat = { room: RoomId; at: Tile; facing: Facing; dx?: number }
 // tiles / walkable are row-major, width * height long. `door` is where crew enter and leave.
 export type TileMap = {
   width: number
@@ -90,6 +91,7 @@ export type Crew = {
   state: CrewState
   room: RoomId
   seat: Tile // where it stands once it has arrived
+  seatDx?: number // the seat's sideways shift, in pixels
   facing: Facing
   look: number // which base sprite and color swap, stable per id
   tag?: string // two or three words on what it is doing
