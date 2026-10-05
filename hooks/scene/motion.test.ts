@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
-import { officeMap } from './art'
+import { officeArt, officeMap } from './art'
+import { paintFrame } from './paint'
 
 import type { Actor, Crew, Tile, TileMap } from '../../types'
 import { findPath, isSettled, stepActors } from './motion'
@@ -141,5 +142,17 @@ describe('the real office', () => {
       const path = findPath(map, map.door, seat.at)
       expect(path.at(-1)).toEqual(seat.at)
     }
+  })
+})
+
+describe('the real office, drawn', () => {
+  // A fingerprint of the empty room as drawn: tiles, floor props, then furniture in sort order.
+  // Any change to the art or the layout changes it. After a deliberate change, re-export the art
+  // (bun tools/export.ts in ~/Coding/office-art), look at out/debug.png, and update this value.
+  test('the empty office matches its snapshot', () => {
+    const frame = paintFrame(officeMap(), officeArt(), [], [], 0, null, 1)
+    let hash = 0x811c9dc5
+    for (const p of frame.pixels) hash = Math.imul(hash ^ p, 0x01000193) >>> 0
+    expect(`${frame.width}x${frame.height} 0x${hash.toString(16)}`).toBe('192x160 0xfca33227')
   })
 })
