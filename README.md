@@ -75,10 +75,11 @@ bun tools/export.ts --debug   # writes mod/hooks/scene/art-data.ts, art/out/debu
 bun tools/demo.ts             # rebuilds docs/office-demo.gif (needs ffmpeg)
 ```
 
-The source art is not in the repo. Download the two packs listed in [CREDITS](mod/CREDITS.md) into `art/raw/` first: the export reads `art/raw/character_base_16x16.png` (zaphgames) and `art/raw/monkeyimage-interior/2367228` (the MonkeyImage tilesheet PNG, kept under its itch.io file id).
+The source art is not in the repo. Download the two packs listed under [Credits](#credits) into `art/raw/` first: the export reads `art/raw/character_base_16x16.png` (zaphgames) and `art/raw/monkeyimage-interior/2367228` (the MonkeyImage tilesheet PNG, kept under its itch.io file id).
 
-## Credits and license
+## Credits
 
-Art sources and their licenses are in [mod/CREDITS.md](mod/CREDITS.md).
+- Furniture, floors and walls: [Home Interior Tilesheet (Game Boy styled)](https://monkeyimage.itch.io/home-interior-tilesheet-gameboy-styled) by MonkeyImage. Free download; no formal license on the page. Used with credit.
+- Characters: [Simple Character Base 16x16](https://opengameart.org/content/simple-character-base-16x16) by zaphgames, CC0.
 
-Code: MIT. Art: see CREDITS.md.
+Both were recoloured into original palettes. Code is MIT.
