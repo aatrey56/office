@@ -33,6 +33,8 @@ const SHELF = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', ch
 
 // Not drawn from: the animation's own state. A reload starts the walk over, which is harmless.
 let timer: Timer | undefined
+let lastFrameAt = 0
+let blitRefused = '' // why the engine last refused a frame swap, shown under the picture
 let frameNo = 0
 let actors: Actor[] = []
 let seated: Crew[] = []
@@ -91,6 +93,7 @@ function selectColor(): number {
 
 // One frame: walk everyone a step, paint, and hand the picture over when it changed.
 async function frame($: EngineInterface): Promise<void> {
+  lastFrameAt = Date.now()
   const { crew } = await currentCrew($)
   const selected = await read($, SELECTED)
   const wasSettled = isSettled(actors)
@@ -110,9 +113,14 @@ async function frame($: EngineInterface): Promise<void> {
   if (quiet && hasPicture && blinking && frameNo % 2 === 1) return
   paint(crew, selected)
   const sent = box.graphics
-    ? await $.ui.blit({ requestId: PANE, key: 'scene', source: { png: lastPicture.png! } }).catch(() => undefined)
-    : await $.ui.blit({ requestId: PANE, key: 'scene', cells: lastPicture.cells! }).catch(() => undefined)
-  void sent
+    ? await $.ui.blit({ requestId: PANE, key: 'scene', source: { png: lastPicture.png! } }).catch((err: unknown) => ({ deny: String(err) }))
+    : await $.ui.blit({ requestId: PANE, key: 'scene', cells: lastPicture.cells! }).catch((err: unknown) => ({ deny: String(err) }))
+  // A refused swap would leave the picture frozen: redraw the pane instead, and say why once.
+  const refused = 'deny' in sent && sent.deny ? String(sent.deny) : ''
+  if (refused !== blitRefused || refused) {
+    blitRefused = refused
+    await update($, TICK, n => (n + 1) % 1_000_000)
+  }
 }
 
 function paint(crew: Crew[], selected: string | null): void {
@@ -121,8 +129,12 @@ function paint(crew: Crew[], selected: string | null): void {
   lastPicture = box.graphics ? { png: toPng(pixels, art.palette, box.scale) } : { cells: toCells(pixels, art.palette, 2).cells }
 }
 
+// Idempotent and self-healing like the board's poll: a reload drops the timer, a refused period
+// ends it quietly, so every redraw calls this and a loop silent for a second starts over.
 function startTimer($: EngineInterface): void {
-  if (timer) return
+  if (timer && Date.now() - lastFrameAt < FRAME_MS * 10) return
+  timer?.cancel()
+  lastFrameAt = Date.now()
   timer = $.clock.every(FRAME_MS, () => {
     void frame($)
   })
@@ -233,6 +245,7 @@ export function installScene(on: On) {
           <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', title: mangaTitle, focus: true })} />
         </Box>
         {picture}
+        {blitRefused && <Text dimColor wrap="truncate-end">{`frames redrawn whole: the engine refused a swap (${blitRefused})`}</Text>}
         <Box flexWrap="wrap" columnGap={2}>
           {leads.length === 0 && <Text dimColor>No sessions in this office yet.</Text>}
           {leads.map((c, i) => {

@@ -26,6 +26,7 @@ const shelf = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', ch
 // tail cache keyed by path (re-tailed only when the file's mtime moves). A
 // reload drops them along with the environment's timers.
 let poll: Timer | undefined
+let lastPoll = 0
 let inFlight: Promise<void> | undefined
 const tails = new Map<string, { mtimeMs: number; text?: string; activity?: Activity }>()
 // Git toplevel per cwd, null outside a repo.
@@ -200,10 +201,17 @@ async function approveSend($: EngineInterface, approval: Approval, sessionId: st
 }
 
 // Poll only while the pane is open or band mode is on; each tick also redraws the age column.
+// Idempotent, and self-healing: a reload drops the timer, and an interval whose period the engine
+// refused ends quietly, so any redraw calls this and a poll silent for three periods starts over.
 function startPolling($: EngineInterface): void {
-  if (poll) return
+  if (poll && Date.now() - lastPoll < POLL_MS * 3) return
+  poll?.cancel()
+  lastPoll = Date.now()
   poll = $.clock.every(POLL_MS, () => {
-    void refresh($).then(() => update($, tick, n => (n ?? 0) + 1))
+    lastPoll = Date.now()
+    void refresh($)
+      .then(() => update($, tick, n => (n ?? 0) + 1))
+      .catch(() => undefined)
   })
 }
 
@@ -348,6 +356,8 @@ export function installBoard(on: On, options: PluginOptions) {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    // Drawn means open: keep the session list fresh whichever view is showing.
+    startPolling($)
     if ((await read($, view)) === 'scene') return next(e)
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui

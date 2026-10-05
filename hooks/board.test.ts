@@ -98,7 +98,7 @@ function fakeHost(on: On, reads: string[], world: World = {}) {
     return { value: { tool: `mcp__office__${e.name}` } }
   })
   on('ui.panes', () => ({ value: [] }))
-  mock.clock(on, { now: 5000 })
+  return mock.clock(on, { now: 5000 })
 }
 
 test('list_sessions reads only live <pid>.json entries and their transcript tail', async ($, on) => {
@@ -164,6 +164,26 @@ test('the office scene with sessions in two projects: pictures, the crew list, a
   await ui.press({ key: 'next-proj' })
   const after = (await ui.find({ type: 'Button', text: /coding-0b|other-1/ }))?.props.label
   expect(after).not.toBe(before)
+  await ui.unmount()
+})
+
+test('an open pane keeps its session list fresh on its own, in either view', async ($, on) => {
+  mock.env(on, { HOME })
+  const reads: string[] = []
+  const clock = fakeHost(on, reads)
+  await $.session.start({ cwd: HOME, surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({
+    plugin: 'office',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'office',
+    props: { title: 'Office', isFocused: true, bodyColumns: 80, placement: 'dock', scroll: { offset: 0, bodyRows: 40 } },
+  } as Parameters<typeof $.ui.mount>[0])
+  const registryReads = () => reads.filter(path => path.endsWith('/49178.json')).length
+  const before = registryReads()
+  await clock.advance(3_100)
+  await clock.advance(3_100)
+  expect(registryReads()).toBeGreaterThan(before)
   await ui.unmount()
 })
 
