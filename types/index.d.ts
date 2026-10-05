@@ -14,6 +14,9 @@ export type SessionCard = {
   activity?: Activity // what its newest tool call says it is doing
 }
 
+// One line of a session's conversation, as the office's chat window shows it.
+export type ChatLine = { who: 'you' | 'claude'; text: string }
+
 // From the newest tool call in a transcript: edits and commands, reading, or planning.
 export type Activity = 'coding' | 'reviewing' | 'planning'
 

@@ -1,4 +1,4 @@
-import type { Activity, SessionCard } from '../types'
+import type { Activity, ChatLine, SessionCard } from '../types'
 
 // Registry of live Claude Code processes (<config>/sessions/<pid>.json) and the
 // last assistant line of each one's transcript. The registry folder also holds
@@ -119,6 +119,57 @@ export function lastActivity(tail: string): Activity | undefined {
     return undefined
   }
   return undefined
+}
+
+// The conversation in a transcript tail: what the person typed and what Claude answered in words.
+// Tool calls and results, thinking, system notes and bookkeeping rows are left out; a slash command
+// shows as `/name args`. Oldest first; a line cut by the tail (the first) is skipped.
+const CHAT_MAX = 2000 // characters kept per message
+export function chatLines(tail: string): ChatLine[] {
+  const out: ChatLine[] = []
+  for (const line of tail.split('\n')) {
+    if (!line.startsWith('{')) continue
+    let row: { type?: unknown; isMeta?: unknown; message?: { content?: unknown } }
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row.isMeta === true) continue
+    const content = row.message?.content
+    if (row.type === 'assistant' && Array.isArray(content)) {
+      const text = (content as { type?: unknown; text?: unknown }[])
+        .filter(b => b?.type === 'text' && typeof b.text === 'string')
+        .map(b => b.text as string)
+        .join('\n')
+        .trim()
+      if (text) out.push({ who: 'claude', text: text.slice(0, CHAT_MAX) })
+    } else if (row.type === 'user') {
+      const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? (content as { type?: unknown; text?: unknown }[]) : []
+      if (blocks.some(b => b?.type === 'tool_result')) continue
+      const text = blocks
+        .map(b => (b?.type === 'text' && typeof b.text === 'string' ? personText(b.text) : b?.type === 'image' ? '[image]' : ''))
+        .filter(Boolean)
+        .join(' ')
+        .trim()
+      if (text) out.push({ who: 'you', text: text.slice(0, CHAT_MAX) })
+    }
+  }
+  return out
+}
+
+// What the person typed, without the engine's wrappers: system notes and command output go,
+// a slash command becomes `/name args`.
+function personText(text: string): string {
+  const command = text.match(/<command-name>([^<]*)<\/command-name>/)
+  if (command) {
+    const args = text.match(/<command-args>([^<]*)<\/command-args>/)?.[1]?.trim()
+    return `${command[1]!.trim()}${args ? ` ${args}` : ''}`
+  }
+  return text
+    .replace(/<(system-reminder|local-command-caveat|local-command-stdout|local-command-stderr|bash-stdout|bash-stderr)>[\s\S]*?<\/\1>/g, '')
+    .replace(/<bash-input>([\s\S]*?)<\/bash-input>/g, '! $1')
+    .trim()
 }
 
 export function shortCwd(cwd: string, home: string | undefined): string {

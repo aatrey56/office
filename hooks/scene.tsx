@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, Timer } from 'claude-code'
 
-import type { Actor, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
+import type { Actor, ChatLine, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
 import { budgetLine } from './budget'
+import { chatLines, projectSlug, SLUG_MAX } from './sessions'
 import { officeArt, officeMap } from './scene/art'
 import { toCells, toPng } from './scene/encode'
 import { assignSeats, deriveCrew, distinctLooks, projectsOf } from './scene/model'
@@ -35,6 +36,60 @@ const SHELF = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', ch
 let timer: Timer | undefined
 let lastFrameAt = 0
 let blitRefused = '' // why the engine last refused a frame swap, shown under the picture
+// The chat window: the selected session's conversation, read again only when its transcript changes.
+// Screenshots and tool output make transcript lines huge, so a byte tail holds little talk. This reader
+// scans the last 20 MB, drops tool results and image data before parsing, and prints only the
+// conversation rows (the last 400) for chatLines() to read.
+const CHAT_READER = [
+  'import sys,json,collections',
+  'keep=collections.deque(maxlen=400)',
+  'with open(sys.argv[1],"rb") as f:',
+  ' f.seek(0,2); f.seek(max(0,f.tell()-20000000))',
+  ' if f.tell(): f.readline()',
+  ' for raw in f:',
+  '  if b\'"tool_result"\' in raw or not (b\'"type":"user"\' in raw or b\'"type":"assistant"\' in raw): continue',
+  '  try: r=json.loads(raw)',
+  '  except Exception: continue',
+  '  c=(r.get("message") or {}).get("content")',
+  '  if isinstance(c,list):',
+  '   c=[b if b.get("type")=="text" else {"type":"image"} for b in c if isinstance(b,dict) and b.get("type") in ("text","image")]',
+  '   if not c: continue',
+  '  keep.append(json.dumps({"type":r.get("type"),"isMeta":r.get("isMeta",False),"message":{"content":c}}))',
+  'print("\\n".join(keep))',
+].join('\n')
+let chat: { id: string; mtimeMs: number; lines: ChatLine[] } | undefined
+let chatScroll = 0 // messages hidden below the window, 0 = newest at the bottom
+
+async function chatOf($: EngineInterface, card: SessionCard): Promise<ChatLine[]> {
+  try {
+    const root = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+    const slug = projectSlug(card.cwd)
+    if (slug.length > SLUG_MAX) return chat?.id === card.sessionId ? chat.lines : []
+    const path = `${root}/projects/${slug}/${card.sessionId}.jsonl`
+    const stat = await $.fs.stat(path)
+    if (chat && chat.id === card.sessionId && chat.mtimeMs === stat.mtimeMs) return chat.lines
+    const ran = await $.process.run(['python3', '-c', CHAT_READER, path], { timeoutMs: 10_000 })
+    chat = { id: card.sessionId, mtimeMs: stat.mtimeMs, lines: chatLines(ran.stdout) }
+    return chat.lines
+  } catch {
+    return chat?.id === card.sessionId ? chat.lines : []
+  }
+}
+
+// The newest messages that fit `rows` lines of `columns`, `skip` newest ones left out (scrolling up).
+function chatWindow(lines: ChatLine[], rows: number, columns: number, skip: number): ChatLine[] {
+  const shown: ChatLine[] = []
+  let used = 0
+  for (let i = lines.length - 1 - skip; i >= 0; i--) {
+    const line = lines[i]!
+    const height = line.text.split('\n').reduce((n, part) => n + Math.max(1, Math.ceil((part.length + 8) / columns)), 0)
+    if (used + height > rows && shown.length > 0) break
+    shown.unshift(line)
+    used += height
+  }
+  return shown
+}
+
 // The `d` line: proof of life for the animation, to tell a stopped timer from frames that never show.
 let debug = false
 let stats = { painted: 0, swapped: 0, last: '' }
@@ -255,7 +310,19 @@ export function installScene(on: On) {
     const projectName = project ? (project.split('/').pop() ?? project) : 'no sessions'
     const series = (await read($, SHELF)).series
     const mangaTitle = series ? `Manga: ${series}` : 'Manga'
-    const choose = (id: string) => () => update($, SELECTED, prev => (prev === id ? null : id))
+    const choose = (id: string) => () => {
+      chatScroll = 0
+      return update($, SELECTED, prev => (prev === id ? null : id))
+    }
+    const scrollChat = (delta: number) => () => {
+      chatScroll = Math.max(0, chatScroll + delta)
+      return update($, TICK, n => (n + 1) % 1_000_000)
+    }
+    const talk = pickedCard ? await chatOf($, pickedCard) : []
+    // The chat fills the pane below the picture, the crew list and the message box.
+    const chatRows = Math.max(4, (e.props.scroll?.bodyRows ?? 40) - rows - 8)
+    chatScroll = Math.min(chatScroll, Math.max(0, talk.length - 1))
+    const shownTalk = chatWindow(talk, chatRows, Math.max(20, columns - 2), chatScroll)
     const cycle = (delta: number) => () =>
       update($, PROJECT, prev => {
         if (all.length === 0) return null
@@ -318,8 +385,21 @@ export function installScene(on: On) {
         )}
         {picked && (
           <Box flexDirection="column">
-            <Text bold>{`${picked.name} · ${STATE_WORDS[picked.state]}${picked.activity ? ` (${picked.activity})` : ''}`}</Text>
-            <Text wrap="wrap">{preview(pickedCard?.lastText ?? picked.tag ?? '')}</Text>
+            <Box gap={1}>
+              <Text bold>{`${picked.name} · ${STATE_WORDS[picked.state]}${picked.activity ? ` (${picked.activity})` : ''}`}</Text>
+              <Button plain key="older" label="older" hotkey="u" onPress={scrollChat(1)} />
+              <Button plain key="newer" label="newer" hotkey="n" onPress={scrollChat(-1)} />
+              {chatScroll > 0 && <Text dimColor>{`${chatScroll} newer below`}</Text>}
+            </Box>
+            <Box flexDirection="column" height={chatRows} overflow="hidden">
+              {shownTalk.length === 0 && <Text dimColor>{preview(pickedCard?.lastText ?? picked.tag ?? 'No conversation found for this session.')}</Text>}
+              {shownTalk.map((line, i) => (
+                <Text key={`chat:${i}`} wrap="wrap">
+                  <Text bold color={line.who === 'you' ? 'cyan' : 'yellow'}>{line.who === 'you' ? 'you › ' : `${picked.name} › `}</Text>
+                  {line.text}
+                </Text>
+              ))}
+            </Box>
             {pickedCard && !pickedCard.isSelf && Input && (
               <Box gap={1}>
                 <Button plain key="message" label="message" hotkey="m" onPress={() => $.ui.focus({ requestId: PANE, key: 'msg' })} />

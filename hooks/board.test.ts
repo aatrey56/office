@@ -3,7 +3,7 @@ import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
 import type { SessionCard } from '../types'
-import { bashActivity, lastAssistantText, parseRegistry, projectSlug } from './sessions'
+import { bashActivity, chatLines, lastAssistantText, parseRegistry, projectSlug } from './sessions'
 
 const HOME = '/Users/me'
 const SESSIONS = `${HOME}/.claude/sessions`
@@ -160,6 +160,10 @@ test('the office scene with sessions in two projects: pictures, the crew list, a
   } as Parameters<typeof $.ui.mount>[0])
   expect(await ui.find({ type: 'Image', key: 'scene' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /error/ })).toBeUndefined()
+  // Selecting a session opens its chat under the picture; the scene still draws without error.
+  await ui.press({ key: 'crew:aaaa-1111' })
+  expect(await ui.find({ key: 'older' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /error/ })).toBeUndefined()
   const before = (await ui.find({ type: 'Button', text: /coding-0b|other-1/ }))?.props.label
   await ui.press({ key: 'next-proj' })
   const after = (await ui.find({ type: 'Button', text: /coding-0b|other-1/ }))?.props.label
@@ -190,6 +194,22 @@ test('an open pane keeps its session list fresh on its own, in either view', asy
 test('a shell command that only looks is reviewing, one that changes or runs things is coding', () => {
   expect(['cd /r && git status --short', 'sed -n 1,40p a.ts', 'grep -n x *.ts'].map(bashActivity)).toEqual(['reviewing', 'reviewing', 'reviewing'])
   expect(["sed -i '' s/a/b/ f", 'claude plugin test .', 'git commit -m x'].map(bashActivity)).toEqual(['coding', 'coding', 'coding'])
+})
+
+test('the chat window keeps what was said, not the machinery', () => {
+  const rows = [
+    { type: 'user', message: { content: 'fix the map<system-reminder>engine note</system-reminder>' } },
+    { type: 'user', isMeta: true, message: { content: 'hidden context' } },
+    { type: 'assistant', message: { content: [{ type: 'thinking', thinking: 'hm' }, { type: 'tool_use', name: 'Bash', input: {} }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', content: 'output' }] } },
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Fixed.' }] } },
+    { type: 'user', message: { content: '<command-name>/office</command-name><command-args>manage</command-args>' } },
+  ]
+  expect(chatLines(rows.map(r => JSON.stringify(r)).join('\n'))).toEqual([
+    { who: 'you', text: 'fix the map' },
+    { who: 'claude', text: 'Fixed.' },
+    { who: 'you', text: '/office manage' },
+  ])
 })
 
 describe('message_session', () => {
