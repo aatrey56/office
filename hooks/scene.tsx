@@ -35,6 +35,9 @@ const SHELF = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', ch
 let timer: Timer | undefined
 let lastFrameAt = 0
 let blitRefused = '' // why the engine last refused a frame swap, shown under the picture
+// The `d` line: proof of life for the animation, to tell a stopped timer from frames that never show.
+let debug = false
+let stats = { painted: 0, swapped: 0, last: '' }
 let frameNo = 0
 let actors: Actor[] = []
 let seated: Crew[] = []
@@ -112,11 +115,16 @@ async function frame($: EngineInterface): Promise<void> {
   if (quiet && hasPicture && (crew.length === 0 || frameNo % 2 === 1) && !blinking) return
   if (quiet && hasPicture && blinking && frameNo % 2 === 1) return
   paint(crew, selected)
+  stats.painted++
   const sent = box.graphics
     ? await $.ui.blit({ requestId: PANE, key: 'scene', source: { png: lastPicture.png! } }).catch((err: unknown) => ({ deny: String(err) }))
     : await $.ui.blit({ requestId: PANE, key: 'scene', cells: lastPicture.cells! }).catch((err: unknown) => ({ deny: String(err) }))
   // A refused swap would leave the picture frozen: redraw the pane instead, and say why once.
   const refused = 'deny' in sent && sent.deny ? String(sent.deny) : ''
+  stats.last = refused ? `refused: ${refused}` : 'ok'
+  if (!refused) stats.swapped++
+  // While the d line shows, redraw it about once a second so its numbers move.
+  if (debug && frameNo % 10 === 0) await update($, TICK, n => (n + 1) % 1_000_000)
   if (refused !== blitRefused || refused) {
     blitRefused = refused
     await update($, TICK, n => (n + 1) % 1_000_000)
@@ -242,9 +250,24 @@ export function installScene(on: On) {
           {all.length > 1 && <Button plain key="prev-proj" label="prev office" hotkey="h" onPress={cycle(-1)} />}
           {all.length > 1 && <Button plain key="next-proj" label="next office" hotkey="l" onPress={cycle(1)} />}
           <Button plain key="text" label="text board" hotkey="t" onPress={() => update($, VIEW, () => 'text')} />
+          <Button
+            plain
+            key="debug"
+            label="debug"
+            hotkey="d"
+            onPress={() => {
+              debug = !debug
+              return update($, TICK, n => (n + 1) % 1_000_000)
+            }}
+          />
           <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', title: mangaTitle, focus: true })} />
         </Box>
         {picture}
+        {debug && (
+          <Text dimColor wrap="truncate-end">
+            {`frames drawn ${stats.painted} · swapped ${stats.swapped} · last swap ${stats.last || 'none yet'} · timer ${timer ? `running, last tick ${Math.round((Date.now() - lastFrameAt) / 100) / 10}s ago` : 'stopped'} · ${box.graphics ? `picture ×${box.scale}` : 'cells'} · walking ${actors.filter(a => a.path.length > 0).length}`}
+          </Text>
+        )}
         {blitRefused && <Text dimColor wrap="truncate-end">{`frames redrawn whole: the engine refused a swap (${blitRefused})`}</Text>}
         <Box flexWrap="wrap" columnGap={2}>
           {leads.length === 0 && <Text dimColor>No sessions in this office yet.</Text>}
