@@ -73,10 +73,14 @@ function ambient(frame: Frame, art: Art, member: Crew, sx: number, sy: number, w
   }
 }
 
-// Tiles first, then actors in the order given, each with its pose for its state and step
-// (walking: walk1/walk2 alternating; arrived: sit / type / stand by crew state), mirrored
-// when facing left, then a bubble above needs-you and failed crew, blinking on `tick`.
-// The selected crew member gets a one-pixel outline in `selectColor`.
+const SEAT_Z = 24 // an arrived seatZ sitter sorts this many rows lower, so it draws over its seat
+
+// Painter's order: opaque tiles, then floor props (rugs) in array order, then every other prop and
+// every actor sorted by bottom pixel row (actors win ties; a seated seatZ crew member counts
+// SEAT_Z rows lower), then bubbles and the selection outline over everything.
+// Each actor gets its pose for its state and step (walking: walk1/walk2 alternating; arrived:
+// sit / type / stand by crew state); a bubble shows above needs-you and failed crew, blinking on
+// `tick`. The selected crew member gets a one-pixel outline in `selectColor`.
 export function paintFrame(
   map: TileMap,
   art: Art,
@@ -95,25 +99,42 @@ export function paintFrame(
       if (bmp) blit(frame, bmp, tx * ts, ty * ts, true, false)
     }
   }
+  for (const prop of art.props) if (prop.floor) blit(frame, prop.bitmap, prop.x, prop.y, false, false)
+
+  // Where each actor's sprite lands, kept for the overlay pass.
+  type Placed = { member: Crew | undefined; sprite: Bitmap; sx: number; sy: number; isSettled: boolean }
+  type Item = { key: number; order: number; draw: () => void }
+  const items: Item[] = []
+  const placed: Placed[] = []
+  art.props.forEach((prop, i) => {
+    if (!prop.floor) items.push({ key: prop.sortY, order: i, draw: () => blit(frame, prop.bitmap, prop.x, prop.y, false, false) })
+  })
 
   const byId = new Map(crew.map(c => [c.id, c]))
   const looks = art.sprites.length
-  for (const actor of actors) {
-    if (looks === 0) break
+  actors.forEach((actor, i) => {
+    if (looks === 0) return
     const member = byId.get(actor.id)
     const look = (((member?.look ?? 0) % looks) + looks) % looks
     const sprite = art.sprites[look]?.[actor.facing]?.[poseFor(actor, member, tick)]
-    if (!sprite) continue
+    if (!sprite) return
     // Centered across the tile, bottom edge on the tile's bottom; a tall sprite pokes up.
     // Someone at work and settled bobs a pixel now and then: typing, writing, reading.
     const isSettled = actor.path.length === 0 && member !== undefined
     const bob = isSettled && member.state === 'working' && Math.floor(tick / BOB_TICKS) % 2 === 1 ? 1 : 0
     const sx = actor.x + Math.floor((ts - sprite.width) / 2)
     const sy = actor.y + ts - sprite.height + bob
-    const mirror = false // every facing has its own frames
-    blit(frame, sprite, sx, sy, false, mirror)
-    if (member && member.id === selectedId) outline(frame, sprite, sx, sy, mirror, selectColor)
+    const isOnSeat = isSettled && member.seatZ === true && isAtSeat(actor, member, ts)
+    const key = sy - bob + sprite.height - 1 + 0.5 + (isOnSeat ? SEAT_Z : 0) // the bob never re-sorts
+    placed.push({ member, sprite, sx, sy, isSettled })
+    items.push({ key, order: art.props.length + i, draw: () => blit(frame, sprite, sx, sy, false, false) })
+  })
 
+  items.sort((a, b) => a.key - b.key || a.order - b.order)
+  for (const item of items) item.draw()
+
+  for (const { member, sprite, sx, sy, isSettled } of placed) {
+    if (member && member.id === selectedId) outline(frame, sprite, sx, sy, false, selectColor)
     const bubble =
       member?.state === 'failed'
         ? art.bubbles.failed
@@ -121,7 +142,12 @@ export function paintFrame(
           ? art.bubbles.needsYou
           : undefined
     if (bubble) blit(frame, bubble, sx + Math.floor((sprite.width - bubble.width) / 2), sy - bubble.height, false, false)
-    else if (isSettled) ambient(frame, art, member, sx, sy, sprite.width, tick)
+    else if (isSettled && member) ambient(frame, art, member, sx, sy, sprite.width, tick)
   }
   return frame
+}
+
+// True when the actor stands on its crew's seat pixel (the seat's cell nudged by dx / dy).
+function isAtSeat(actor: Actor, member: Crew, ts: number): boolean {
+  return actor.x === member.seat.x * ts + (member.seatDx ?? 0) && actor.y === member.seat.y * ts + (member.seatDy ?? 0)
 }

@@ -119,6 +119,16 @@ describe('pose table', () => {
   })
 })
 
+describe('depth', () => {
+  test('a prop lower than an actor covers it; the same actor seated with seatZ covers the prop', () => {
+    // A 4x2 desk at rows 7..8 (bottom 8) over the actor at tile 1,1 (bottom 7).
+    const art: Art = { ...ART, props: [{ name: 'desk', bitmap: solid(8, 4, 2), x: 4, y: 7, sortY: 8, floor: false }] }
+    const draw = (crew: Crew) => paintFrame(MAP, art, [actor('a', 1, 1)], [crew], 0, null, 6)
+    expect(px(draw(member('a', 'reporting', 0)), 5, 7)).toBe(8)
+    expect(px(draw({ ...member('a', 'reporting', 0), seatZ: true }), 5, 7)).toBe(1)
+  })
+})
+
 describe('bubbles', () => {
   // The sprite at tile 1,1 spans 4..7; the 2x2 bubble is centred above it at 5..6, rows 2..3.
   test('needs-you blinks on tick / 4', () => {
