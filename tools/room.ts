@@ -34,6 +34,8 @@ export function background(): Img {
   draw(img, P.coffeeTable!, 135, 124)
   draw(img, P.fridge!, 176, 95)
   draw(img, P.fern!, 120, 98)
+  // review corner: a plain desk (no computer) at the bottom left, reviewers sit behind it
+  draw(img, P.desk!, 64, 144)
   // door, bottom centre, with its light spilling in
   draw(img, P.doorLight!, 96, 2)
   return img
