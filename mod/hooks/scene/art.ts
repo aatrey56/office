@@ -1,7 +1,7 @@
 import type { Art, Bitmap, Facing, Prop, RoomId, Seat, SpritePose, TileMap } from '../../types'
 import { ART_DATA } from './art-data'
 
-// The office map, its tiles, and the crew sprites. The pixels are made in ~/Coding/office-art
+// The office map, its tiles, and the crew sprites. The pixels are made in the repo's art/
 // (tools/export.ts writes art-data.ts); this file only turns them into the scene's types.
 
 const fromBase64 = (s: string): Uint8Array => (Uint8Array as unknown as { fromBase64(s: string): Uint8Array }).fromBase64(s)

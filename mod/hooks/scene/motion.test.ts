@@ -136,7 +136,7 @@ describe('the real office', () => {
 describe('the real office, drawn', () => {
   // A fingerprint of the empty room as drawn: tiles, floor props, then furniture in sort order.
   // Any change to the art or the layout changes it. After a deliberate change, re-export the art
-  // (bun tools/export.ts in ~/Coding/office-art), look at out/debug.png, and update this value.
+  // (bun tools/export.ts in art/), look at art/out/debug.png, and update this value.
   test('the empty office matches its snapshot', () => {
     const frame = paintFrame(officeMap(), officeArt(), [], [], 0, null, 1)
     let hash = 0x811c9dc5

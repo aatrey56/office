@@ -1,0 +1,7 @@
+.DS_Store
+art/raw/
+art/out/
+art/node_modules/
+mod/.claude-plugin/types/
+evals/results
+mod/evals/results/
