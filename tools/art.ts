@@ -85,9 +85,24 @@ export const CUTS: Record<string, [number, number, number, number, string]> = {
   chairSmall: [18, 239, 13, 17, 'wood'],
 }
 
+// ── small desk props drawn by hand: 0 transparent, 1-4 = the palette's off-white, light, dark, outline ──
+export const GRIDS: Record<string, [string, string[]]> = {
+  paper: ['gray', ['44444440', '41111114', '41333114', '41111114', '04444444']],
+  pencilCup: ['red', ['01030', '01030', '44444', '42224', '42234', '42334', '04440']],
+  mug: ['blue', ['044440', '433334', '422224', '422224', '044440']],
+}
+export function grid(rows: string[], pal: string): Piece {
+  const w = rows[0]!.length, slots = new Int8Array(w * rows.length)
+  rows.forEach((row, j) => row.split('').forEach((ch, i) => (slots[j * w + i] = Number(ch) - 1)))
+  return { w, h: rows.length, slots, pal }
+}
+
 export function pieces(): Record<string, Piece> {
   const s = sheet()
-  return Object.fromEntries(Object.entries(CUTS).map(([k, [x, y, w, h, p]]) => [k, cut(s, x, y, w, h, p)]))
+  return {
+    ...Object.fromEntries(Object.entries(CUTS).map(([k, [x, y, w, h, p]]) => [k, cut(s, x, y, w, h, p)])),
+    ...Object.fromEntries(Object.entries(GRIDS).map(([k, [p, rows]]) => [k, grid(rows, p)])),
+  }
 }
 
 // A contact sheet: every piece on off-white, in cut-list order, wrapped at `width`.
