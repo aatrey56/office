@@ -200,7 +200,9 @@ function zlibDeflate(raw: Uint8Array, stride: number): Uint8Array {
 // For Image: a whole PNG, base64. Indexed color (PLTE from `palette`), each pixel repeated
 // `scale` times both ways. No compression library exists here, so IDAT uses stored deflate
 // blocks; CRC-32 and Adler-32 are computed in this file.
-export function toPng(frame: Frame, palette: number[], scale: number, compress = true): string {
+// `stamp`, when given, rides in a tEXt chunk right after IHDR: frames of one size and palette would
+// otherwise start with identical bytes, and a viewer that compares sources by their start sees no change.
+export function toPng(frame: Frame, palette: number[], scale: number, compress = true, stamp?: number): string {
   const s = Math.max(1, Math.floor(scale) || 1)
   const width = frame.width * s
   const height = frame.height * s
@@ -232,6 +234,7 @@ export function toPng(frame: Frame, palette: number[], scale: number, compress =
   const parts = [
     new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     chunk('IHDR', ihdr),
+    ...(stamp === undefined ? [] : [chunk('tEXt', new Uint8Array([...'frame\0'].map(c => c.charCodeAt(0)).concat([...String(stamp)].map(c => c.charCodeAt(0)))))]),
     chunk('PLTE', plte),
     chunk('IDAT', compress ? zlibDeflate(raw, stride) : zlibStored(raw)),
     chunk('IEND', new Uint8Array(0)),

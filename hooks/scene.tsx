@@ -43,7 +43,12 @@ let actors: Actor[] = []
 let seated: Crew[] = []
 let roots: Record<string, string | null> = {}
 let listKey = ''
-let lastPicture: { png?: string; cells?: string } = {}
+let lastPicture: { png?: string; cells?: string; file?: string; generation?: number } = {}
+// Frames go to two files taken in turn and are shown by path with a rising `generation`: the
+// documented way to tell the terminal that new content sits under a known name. Inline PNGs of
+// one size and palette were accepted ("ok") yet never replaced on screen.
+let frameDir: string | undefined
+let fileFrames = true // false once writing a frame fails; inline PNGs from then on
 let box = { columns: 0, rows: 0, scale: 4, graphics: true }
 
 function graphicsLikely(termProgram?: string, term?: string, kittyWindow?: string): boolean {
@@ -116,8 +121,9 @@ async function frame($: EngineInterface): Promise<void> {
   if (quiet && hasPicture && blinking && frameNo % 2 === 1) return
   paint(crew, selected)
   stats.painted++
+  if (box.graphics) await toFile($)
   const sent = box.graphics
-    ? await $.ui.blit({ requestId: PANE, key: 'scene', source: { png: lastPicture.png! } }).catch((err: unknown) => ({ deny: String(err) }))
+    ? await $.ui.blit({ requestId: PANE, key: 'scene', source: imageSource() }).catch((err: unknown) => ({ deny: String(err) }))
     : await $.ui.blit({ requestId: PANE, key: 'scene', cells: lastPicture.cells! }).catch((err: unknown) => ({ deny: String(err) }))
   // A refused swap would leave the picture frozen: redraw the pane instead, and say why once.
   const refused = 'deny' in sent && sent.deny ? String(sent.deny) : ''
@@ -134,11 +140,36 @@ async function frame($: EngineInterface): Promise<void> {
 function paint(crew: Crew[], selected: string | null): void {
   const art = officeArt()
   const pixels = paintFrame(officeMap(), art, actors, crew, frameNo, selected, selectColor())
-  lastPicture = box.graphics ? { png: toPng(pixels, art.palette, box.scale) } : { cells: toCells(pixels, art.palette, 2).cells }
+  lastPicture = box.graphics ? { png: toPng(pixels, art.palette, box.scale, true, frameNo) } : { cells: toCells(pixels, art.palette, 2).cells }
 }
 
 // Idempotent and self-healing like the board's poll: a reload drops the timer, a refused period
 // ends it quietly, so every redraw calls this and a loop silent for a second starts over.
+// Writes the newest PNG to the next of the two frame files; on any failure, inline PNGs from then on.
+async function toFile($: EngineInterface): Promise<void> {
+  if (!fileFrames || !lastPicture.png) return
+  try {
+    if (!frameDir) {
+      const home = (await $.env.get('HOME')) ?? ''
+      const dir = `${home}/Library/Caches/office-scene`
+      await $.process.run(['mkdir', '-p', dir])
+      frameDir = `${dir}/${(await $.session.id()).slice(0, 8)}`
+    }
+    const file = `${frameDir}-${frameNo % 2}.png`
+    const ran = await $.process.run(['/usr/bin/base64', '-D', '-o', file], { stdin: lastPicture.png })
+    if (ran.exitCode !== 0) throw new Error(ran.stderr.trim() || `base64 exited ${ran.exitCode}`)
+    lastPicture = { ...lastPicture, file, generation: frameNo }
+  } catch {
+    fileFrames = false
+  }
+}
+
+function imageSource() {
+  return lastPicture.file !== undefined && fileFrames
+    ? { file: lastPicture.file, format: 'png' as const, generation: lastPicture.generation ?? 0 }
+    : { png: lastPicture.png ?? '' }
+}
+
 function startTimer($: EngineInterface): void {
   if (timer && Date.now() - lastFrameAt < FRAME_MS * 10) return
   timer?.cancel()
@@ -234,7 +265,7 @@ export function installScene(on: On) {
 
     let picture
     if (graphics && Image) {
-      picture = <Image key="scene" source={{ png: lastPicture.png ?? '' }} columns={columns} rows={rows} alt="the office" />
+      picture = <Image key="scene" source={imageSource()} columns={columns} rows={rows} alt="the office" />
     } else if (Raster) {
       const cells = lastPicture.cells ?? ''
       picture = <Raster key="scene" columns={W / 2} rows={H / 4} cells={cells} />
@@ -265,7 +296,7 @@ export function installScene(on: On) {
         {picture}
         {debug && (
           <Text dimColor wrap="truncate-end">
-            {`frames drawn ${stats.painted} · swapped ${stats.swapped} · last swap ${stats.last || 'none yet'} · timer ${timer ? `running, last tick ${Math.round((Date.now() - lastFrameAt) / 100) / 10}s ago` : 'stopped'} · ${box.graphics ? `picture ×${box.scale}` : 'cells'} · walking ${actors.filter(a => a.path.length > 0).length}`}
+            {`frames drawn ${stats.painted} · swapped ${stats.swapped} · last swap ${stats.last || 'none yet'} · timer ${timer ? `running, last tick ${Math.round((Date.now() - lastFrameAt) / 100) / 10}s ago` : 'stopped'} · ${box.graphics ? `picture ×${box.scale} ${lastPicture.file && fileFrames ? `file gen ${lastPicture.generation}` : 'inline'}` : 'cells'} · walking ${actors.filter(a => a.path.length > 0).length}`}
           </Text>
         )}
         {blitRefused && <Text dimColor wrap="truncate-end">{`frames redrawn whole: the engine refused a swap (${blitRefused})`}</Text>}
