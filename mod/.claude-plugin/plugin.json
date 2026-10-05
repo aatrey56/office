@@ -1,0 +1,123 @@
+{
+  "name": "office",
+  "version": "0.2.0",
+  "description": "Multi-session switchboard: session board + tap-in, Codex review handoff, model router/spawner, manga reader",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "routerBackend": {
+      "type": "string",
+      "title": "Router backend",
+      "description": "auto tries jev, then claude, then rules; any other value forces that backend (rules stays the never-fail fallback).",
+      "options": [
+        "auto",
+        "jev",
+        "claude",
+        "rules"
+      ],
+      "default": "auto"
+    },
+    "routerModel": {
+      "type": "string",
+      "title": "Router model (claude backend)",
+      "description": "Cheap, fast model the claude router backend asks for a JSON routing decision.",
+      "default": "claude-sonnet-5-5"
+    },
+    "jevApiKey": {
+      "type": "string",
+      "title": "AI/ML API key (TypeSafe Jev)",
+      "description": "Prefer Keychain: security add-generic-password -a \"$USER\" -s aimlapi -w (looked up first; then this field, then $AIMLAPI_KEY). Without a key the jev router backend is skipped.",
+      "sensitive": true,
+      "required": false
+    },
+    "jevEndpoint": {
+      "type": "string",
+      "title": "Jev decisions endpoint",
+      "description": "POST endpoint serving typesafe/jev decisions.",
+      "default": "https://api.aimlapi.com/v1/decisions"
+    },
+    "codexPath": {
+      "type": "string",
+      "title": "codex executable",
+      "description": "Path to the codex CLI.",
+      "default": "/opt/homebrew/bin/codex"
+    },
+    "codexReviewModel": {
+      "type": "string",
+      "title": "Codex review model",
+      "description": "Model for /codex-review and codex_review (run at reasoning effort high).",
+      "default": "gpt-6-sol"
+    },
+    "codexExecModel": {
+      "type": "string",
+      "title": "Codex second-opinion model",
+      "description": "Model for codex_exec (run at reasoning effort medium).",
+      "default": "gpt-6-luna"
+    },
+    "codexDeepModel": {
+      "type": "string",
+      "title": "Codex deep-review model",
+      "description": "Scarce model used only by /codex-review --deep or deep: true (effort high); never chosen automatically.",
+      "default": "gpt-6-astra"
+    },
+    "claudePath": {
+      "type": "string",
+      "title": "claude executable",
+      "description": "The claude CLI used for headless workers.",
+      "default": "claude"
+    },
+    "workerPermissionMode": {
+      "type": "string",
+      "title": "Headless worker permission mode",
+      "description": "Passed to claude --bg / claude -p workers as --permission-mode.",
+      "options": [
+        "acceptEdits",
+        "auto",
+        "dontAsk",
+        "plan",
+        "bypassPermissions"
+      ],
+      "default": "acceptEdits"
+    },
+    "maxWorkers": {
+      "type": "number",
+      "title": "Max concurrent jobs",
+      "description": "Codex reviews and workers running at once; more are refused.",
+      "default": 4
+    },
+    "jobTimeoutMin": {
+      "type": "number",
+      "title": "Job timeout (minutes)",
+      "description": "A job still running after this long is ended.",
+      "default": 30
+    },
+    "messageApproval": {
+      "type": "string",
+      "title": "Message approval",
+      "description": "When a Claude session messages another via the office mod",
+      "options": [
+        "ask",
+        "same-repo",
+        "allow"
+      ],
+      "default": "same-repo"
+    },
+    "budgetSoftFiveHourPct": {
+      "type": "number",
+      "title": "Budget: 5-hour soft line (%)",
+      "description": "From this share of the 5-hour limit, only small routed tasks (sonnet at low or medium effort) start as workers.",
+      "default": 80
+    },
+    "budgetSoftSevenDayPct": {
+      "type": "number",
+      "title": "Budget: weekly soft line (%)",
+      "description": "From this share of the weekly limit, only small routed tasks start as workers.",
+      "default": 85
+    },
+    "budgetHardPct": {
+      "type": "number",
+      "title": "Budget: hard limit (%)",
+      "description": "At this share of either limit no worker starts, unless you type /spawn --force.",
+      "default": 95
+    }
+  }
+}
