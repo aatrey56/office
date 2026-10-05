@@ -57,7 +57,7 @@ const seats: Seat[] = [
   seat('break', 9, 6, 'down', 0, 3, true), seat('break', 10, 6, 'down', 0, 3, true),
   seat('break', 9, 9, 'up', 0, -4, true), seat('break', 10, 9, 'up', 0, -4, true),
   seat('break', 8, 7, 'right', 0, 0, true),
-  seat('lobby', 5, 3, 'down'), seat('lobby', 7, 2, 'down'),
+  seat('lobby', 5, 3, 'down'), seat('lobby', 4, 3, 'down'),
 ]
 const door = { x: 6, y: 2 }
 
