@@ -87,6 +87,52 @@ export const CUTS: Record<string, [number, number, number, number, string]> = {
 
 // ── small desk props drawn by hand: 0 transparent, 1-4 = the palette's off-white, light, dark, outline ──
 export const GRIDS: Record<string, [string, string[]]> = {
+  // One-cell desks, 16 x 13: a lit top, a shaded front with one drawer line, and legs. `pcDesk` (gray)
+  // carries the `monitor` prop above it like a Pokémon Center PC; `deskSmall` (wood) is a reviewer's desk.
+  pcDesk: ['gray', [
+    '0000004444000000',
+    '4444444444444444',
+    '4111114444411114',
+    '4111111111111114',
+    '4122222222222224',
+    '4122222222222224',
+    '4333333333333334',
+    '4333333333333334',
+    '4333444444444334',
+    '4333333333333334',
+    '4444444444444444',
+    '0433400000004334',
+    '0444400000004444',
+  ]],
+  deskSmall: ['wood', [
+    '0444444444444440',
+    '4111111111111114',
+    '4122222222222224',
+    '4122222222222224',
+    '4122222222222224',
+    '4122222222222224',
+    '4333333333333334',
+    '4333333333333334',
+    '4333444444444334',
+    '4333333333333334',
+    '4444444444444444',
+    '0433400000004334',
+    '0444400000004444',
+  ]],
+  // The PC's monitor: a dark frame around a lit blue screen with a few lines of text, 12 x 11.
+  monitor: ['blue', [
+    '044444444440',
+    '433333333334',
+    '432222222234',
+    '432122222234',
+    '432233322234',
+    '432222222234',
+    '432233332234',
+    '432222222234',
+    '433333333334',
+    '044444444440',
+    '000004444000',
+  ]],
   paper: ['gray', ['44444440', '41111114', '41333114', '41111114', '04444444']],
   pencilCup: ['red', ['01030', '01030', '44444', '42224', '42234', '42334', '04440']],
   mug: ['blue', ['044440', '433334', '422224', '422224', '044440']],
