@@ -40,7 +40,7 @@ export const TIER_CRITERIA: Record<ModelTier, string> = {
   opus:
     'claude-opus-5-5 ($4/$20): real engineering judgment: debugging, code review, refactors, multi-file features, writing meaningful tests.',
   fable:
-    'claude-fable-5-1 ($10/$50, slowest): architecture and system design, open-ended research, ambiguous problems spanning several systems, high-stakes decisions.',
+    'claude-fable-5-1 ($10/$50, slowest): architecture and system design, open-ended research, ambiguous problems spanning several systems, changes to live production data or schemas, migrations, decisions with high stakes or vague requirements.',
 }
 export const EFFORT_CRITERIA: Record<Effort, string> = {
   low: 'Mechanical; the answer is obvious once the files are open.',
@@ -57,6 +57,7 @@ export function rubricText(now: number): string {
   const efforts = ROUTED_EFFORTS.map(e => `- ${e}: ${EFFORT_CRITERIA[e]}`).join('\n')
   return [
     'Pick the CHEAPEST model tier that will do the task well, and the lowest effort that suffices.',
+    'Judge difficulty by what the task requires, not by how long or detailed the request is: a detailed brief with exact files and steps usually makes a task easier.',
     'Model tiers:',
     tiers,
     'Effort levels (high is the maximum you may choose):',
@@ -74,11 +75,11 @@ const SYSTEM_WORDS =
 
 const RULES: readonly Rule[] = [
   {
-    test: /\b(architect\w*|system design|design (?:a|the|our) \w+ system|research|investigat\w*|trade-?offs?|migration (?:plan|strategy)|across (?:services|systems|repos))\b/i,
+    test: /\b(architect\w*|system design|design (?:a|the|our) \w+ system|research|investigat\w*|trade-?offs?|migration (?:plan|strategy)|in production|production (?:data|database|db|schema)|across (?:services|systems|repos))\b/i,
     model: 'fable',
     effort: 'high',
     confidence: 0.6,
-    why: 'architecture / research / cross-system work',
+    why: 'architecture / research / cross-system / production work',
   },
   {
     test: /\b(review|refactor\w*|debug\w*|root cause|race condition|flaky|regression|failing tests?|fix (?:a |the )?bug|bug ?fix|security)\b/i,
