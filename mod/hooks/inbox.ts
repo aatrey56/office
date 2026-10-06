@@ -1,11 +1,12 @@
 import type { Job, RouteDecision } from '../types'
 
 // The routing inbox: every routed worker's task (and each Agent call a manager's router sized)
-// and how it went, appended to the git-ignored evals/routing.inbox.jsonl so real tasks can be
-// labelled into routing.local.jsonl later.
+// and how it went, appended to <config dir>/office/evals/routing.inbox.jsonl so real tasks can be
+// labelled into routing.local.jsonl (same folder) later. That folder sits outside the plugin, so
+// every copy of the plugin (dev checkout, stable clone, marketplace install) shares one inbox.
 // Pure: jobs.tsx writes the lines and runs /route-inbox.
 
-export const INBOX_PATH = 'evals/routing.inbox.jsonl'
+export const INBOX_FILE = 'routing.inbox.jsonl'
 const SHOW = 10
 
 export type InboxEntry = {
@@ -102,11 +103,11 @@ export function foldInbox(inbox: string, labels: string): InboxEntry[] {
 }
 
 /** /route-inbox: the unlabelled count, then the newest unlabelled tasks, at most `columns` wide. */
-export function formatInbox(entries: InboxEntry[], columns: number): string {
+export function formatInbox(entries: InboxEntry[], columns: number, file: string): string {
   const width = Math.max(1, Math.floor(columns))
   const fit = (s: string) => (s.length > width ? `${s.slice(0, width - 1)}…` : s)
   const open = entries.filter(e => !e.isLabelled)
-  const head = `${open.length} of ${entries.length} routed tasks unlabelled (${INBOX_PATH})`
+  const head = `${open.length} of ${entries.length} routed tasks unlabelled (${file})`
   if (open.length === 0) return fit(head)
   const rows = open.slice(0, SHOW).map(e => {
     const task = sameText(e.task)

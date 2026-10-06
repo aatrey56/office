@@ -6,9 +6,14 @@ import { foldInbox } from './inbox'
 const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 const OPTIONS = { options: { routerBackend: 'rules', workerWorktree: 'off' } }
 
-// A headless worker outside any repo; the inbox is an in-memory file.
-function fakeWorker(on: On) {
-  const files: Record<string, string> = {}
+const CONFIG = '/fake/config'
+const ASK = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
+
+// A headless worker outside any repo, with a fake config dir; files are in memory, and the
+// plugin folder's evals/ is filed under `plugin:evals/`.
+function fakeWorker(on: On, files: Record<string, string> = {}) {
+  const key = (path: string) => (path.startsWith(CONFIG) ? path : path.replace(/^.*\/evals\//, 'plugin:evals/'))
+  on('env.get', (_$, e) => ({ value: e.name === 'CLAUDE_CONFIG_DIR' ? CONFIG : undefined }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }))
   on('session.cwd', () => ({ value: '/r' }))
   on('store.get', () => ({ value: undefined }))
@@ -17,10 +22,10 @@ function fakeWorker(on: On) {
     yield { stream: 'stdout' as const, text: '{"type":"result","subtype":"success","result":"Renamed it.","total_cost_usd":0.25}\n' }
     return { value: { code: 0, signal: null } }
   })
-  on('fs.exists', (_$, e) => ({ value: e.path in files }))
-  on('fs.read', (_$, e) => ({ value: files[e.path] ?? '' }))
+  on('fs.exists', (_$, e) => ({ value: key(e.path) in files }))
+  on('fs.read', (_$, e) => ({ value: files[key(e.path)] ?? '' }))
   on('fs.write', (_$, e) => {
-    files[e.path] = e.text
+    files[key(e.path)] = e.text
     return { value: undefined }
   })
   on('prompt.submit', () => ({ text: '' }))
@@ -28,7 +33,7 @@ function fakeWorker(on: On) {
   on('ui.log', () => ({ value: undefined }))
   const inbox = () =>
     Object.entries(files)
-      .filter(([path]) => path.endsWith('/evals/routing.inbox.jsonl'))
+      .filter(([path]) => path === `${CONFIG}/office/evals/routing.inbox.jsonl`)
       .flatMap(([, text]) => text.trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>))
   return inbox
 }
@@ -43,6 +48,24 @@ describe('routing inbox', () => {
     expect(start).toMatchObject({ kind: 'routed', task: 'rename x to y', backend: 'rules' })
     expect(end).toMatchObject({ kind: 'finished', job: start?.job, status: 'done', costUsd: 0.25 })
     expect(typeof end?.minutes).toBe('number')
+  })
+
+  test('an old plugin-folder label file is copied to the config dir once, then read from there', OPTIONS, async ($, on) => {
+    const old = 'plugin:evals/routing.local.jsonl'
+    const label = (task: string) => `{"id":"l01","task":"${task}","model":"sonnet","effort":"low","why":"x"}\n`
+    const files: Record<string, string> = { [old]: label('rename x to y') }
+    fakeWorker(on, files)
+    const clock = mock.clock(on)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', cwd: '/r' })
+    await clock.settle()
+    const first = await $.command.run({ command: 'route-inbox', args: '', ...ASK })
+    expect(first.text).toContain(`0 of 1 routed tasks unlabelled (${CONFIG}/office/evals/routing.inbox.jsonl)`)
+    expect(files[`${CONFIG}/office/evals/routing.local.jsonl`]).toBe(label('rename x to y'))
+    // A later change to the old file is not copied again: the new file is the one read.
+    files[old] = label('something else')
+    const second = await $.command.run({ command: 'route-inbox', args: '', ...ASK })
+    expect(second.text).toContain('0 of 1 routed tasks unlabelled')
+    expect(files[old]).toBe(label('something else'))
   })
 
   test('a worker given its model logs nothing', OPTIONS, async ($, on) => {

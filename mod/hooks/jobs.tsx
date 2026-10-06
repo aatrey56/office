@@ -6,7 +6,7 @@ import type { AgentDef, AgentPin } from './agentguard'
 import { agentGuard, agentRouteText, hardDeny, isManagerSession, needsRoute, parseAgentFile, pinOf } from './agentguard'
 import { budgetVerdict, DEFAULT_CAPS, isSmallRoute, tierOfModelId } from './budget'
 import { formatSets, parseCases, scoreRoutes } from './evals'
-import { endLine, finishedLine, foldInbox, formatInbox, INBOX_PATH, routeLine, routedLine } from './inbox'
+import { endLine, finishedLine, foldInbox, formatInbox, INBOX_FILE, routeLine, routedLine } from './inbox'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -212,12 +212,12 @@ export function installJobs(on: On, options: PluginOptions) {
       })
       await $.command.register({
         name: 'route-eval',
-        description: 'Score the router against the labeled tasks in evals/routing.jsonl (and routing.local.jsonl)',
+        description: "Score the router against the plugin's evals/routing.jsonl (and ~/.claude/office/evals/routing.local.jsonl)",
         argumentHint: '[rules|claude|jev|all]',
       })
       await $.command.register({
         name: 'route-inbox',
-        description: 'Routed worker tasks not yet labelled in evals/routing.local.jsonl, newest first',
+        description: 'Routed worker tasks not yet labelled in ~/.claude/office/evals/routing.local.jsonl, newest first',
       })
       for (const spec of WORKER_AGENT_SPECS) {
         try {
@@ -328,14 +328,13 @@ export function installJobs(on: On, options: PluginOptions) {
   on('command.run', { command: 'route-eval' }, async ($, e) => {
     const asked = e.args.trim().toLowerCase() || 'all'
     if (!EVAL_BACKENDS.includes(asked) && asked !== 'all') return { text: 'Usage: /route-eval [rules|claude|jev|all]' }
-    // The public labels, plus the owner's real tasks when the git-ignored local file exists.
+    // The public labels in the plugin, plus the owner's real tasks when the private local file exists.
     const sets: { name: string; tag: string; cases: RouteCase[]; reports: EvalReport[] }[] = []
     const errors: string[] = []
-    for (const [name, tag, path] of [
-      ['public', '', 'evals/routing.jsonl'],
-      ['local', 'local-', 'evals/routing.local.jsonl'],
+    for (const [name, tag, path, file] of [
+      ['public', '', 'evals/routing.jsonl', `${$.plugin.root}/evals/routing.jsonl`],
+      ['local', 'local-', `${OFFICE_EVALS}/${LOCAL_LABELS}`, await privateEval($, LOCAL_LABELS)],
     ] as const) {
-      const file = `${$.plugin.root}/${path}`
       let text: string
       try {
         text = await $.fs.read(file)
@@ -356,6 +355,7 @@ export function installJobs(on: On, options: PluginOptions) {
     const backends = asked === 'all' ? (jevKey ? EVAL_BACKENDS : EVAL_BACKENDS.filter(b => b !== 'jev')) : [asked]
 
     const saved: string[] = []
+    const results = await privateEval($, RESULTS)
     const stamp = new Date(now).toISOString().replace(/[:.]/g, '-')
     for (const backend of backends as RouteDecision['backend'][]) {
       for (const set of sets) {
@@ -363,7 +363,7 @@ export function installJobs(on: On, options: PluginOptions) {
         const report = scoreRoutes(set.cases, outcomes, backend)
         set.reports.push(report)
         // A dated record, so a later run (a new rubric, Jev) has something to compare against.
-        const out = `${$.plugin.root}/evals/results/${stamp}-${set.tag}${backend}.json`
+        const out = `${results}/${stamp}-${set.tag}${backend}.json`
         try {
           await $.fs.write(out, JSON.stringify({ at: now, backend, report, outcomes }, null, 2))
           saved.push(out)
@@ -375,16 +375,17 @@ export function installJobs(on: On, options: PluginOptions) {
     const notes = [
       errors.length > 0 ? `${errors.length} line(s) skipped: ${errors.slice(0, 2).join('; ')}` : '',
       asked === 'all' && !jevKey ? 'Jev skipped: no key yet.' : '',
-      saved.length > 0 ? `Saved under ${$.plugin.root}/evals/results/` : '',
+      saved.length > 0 ? `Saved under ${results}/` : '',
     ].filter(Boolean)
     return { text: [formatSets(sets, e.presentation.columns), ...notes].join('\n') }
   })
 
   on('command.run', { command: 'route-inbox' }, async ($, e) => {
-    const readOr = (path: string) => $.fs.read(`${$.plugin.root}/${path}`).catch(() => '')
-    const entries = foldInbox(await readOr(INBOX_PATH), await readOr('evals/routing.local.jsonl'))
-    if (entries.length === 0) return { text: `No routed tasks logged yet (${INBOX_PATH}).` }
-    return { text: formatInbox(entries, e.presentation.columns) }
+    const inbox = await privateEval($, INBOX_FILE)
+    const readOr = (file: string) => $.fs.read(file).catch(() => '')
+    const entries = foldInbox(await readOr(inbox), await readOr(await privateEval($, LOCAL_LABELS)))
+    if (entries.length === 0) return { text: `No routed tasks logged yet (${inbox}).` }
+    return { text: formatInbox(entries, e.presentation.columns, inbox) }
   })
 
   on('command.run', { command: 'jobs' }, async $ => {
@@ -704,9 +705,9 @@ let inboxChain: Promise<void> = Promise.resolve()
 /** Appends a routing-inbox line off the caller's path; a failure is logged, never thrown. */
 function logInbox($: EngineInterface, line: string | undefined): void {
   if (line === undefined) return
-  const file = `${$.plugin.root}/${INBOX_PATH}`
   inboxChain = inboxChain.then(async () => {
     try {
+      const file = await privateEval($, INBOX_FILE)
       // fs has no append: a file that exists but cannot be read is left alone, not overwritten.
       const old = (await $.fs.exists(file)) ? await $.fs.read(file) : ''
       await $.fs.write(file, `${old}${old === '' || old.endsWith('\n') ? '' : '\n'}${line}\n`)
@@ -932,6 +933,39 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
 
 async function configDirOf($: EngineInterface): Promise<string> {
   return (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
+}
+
+// Private router data lives in <config dir>/office/evals, beside the manager notebooks, so the dev
+// checkout, the stable clone and a marketplace install share one set. Only the public labels
+// (evals/routing.jsonl) stay in the plugin folder.
+const OFFICE_EVALS = '~/.claude/office/evals'
+const LOCAL_LABELS = 'routing.local.jsonl'
+const RESULTS = 'results'
+
+/**
+ * The path of a private eval file or folder, first copied from the plugin folder where older
+ * versions kept it: only when the new one does not exist yet. The old copy is never touched.
+ */
+async function privateEval($: EngineInterface, name: string): Promise<string> {
+  const to = `${(await configDirOf($)).replace(/\/+$/, '')}/office/evals/${name}`
+  const from = `${$.plugin.root}/evals/${name}`
+  try {
+    if ((await $.fs.exists(to)) || !(await $.fs.exists(from))) return to
+    if (name === RESULTS) {
+      for (const f of await $.fs.list(from)) {
+        if (f.kind === 'file') await $.fs.write(`${to}/${f.name}`, await $.fs.read(`${from}/${f.name}`))
+      }
+    } else {
+      await $.fs.write(to, await $.fs.read(from))
+    }
+  } catch (err) {
+    try {
+      $.ui.log(`office: ${from} not copied to ${to}: ${String(err)}`, { to: 'debug' })
+    } catch {
+      // logging is best effort
+    }
+  }
+  return to
 }
 
 async function resolveCwd($: EngineInterface, cwd: string | undefined): Promise<string> {

@@ -20,7 +20,7 @@ A [Claude Code](https://claude.com/claude-code) mod that turns your sessions int
 - **Session board.** A text list of your other sessions: see their status, message them, copy a resume command. It works in any terminal and in the desktop app.
 - **Agent orchestration.**
   - *Manager role* (`/office manage`): one session becomes its project's manager. It splits the goal, routes and delegates tasks, and keeps a shared notebook (`post_note` / `read_notes`).
-  - *Model router* (`/route-task`, `/route-eval`): picks a model tier and effort for a task, using a rules backend, Claude, or an external router, and scores itself against labelled tasks in `mod/evals/`.
+  - *Model router* (`/route-task`, `/route-eval`): picks a model tier and effort for a task, using a rules backend, Claude, or an external router, and scores itself against labelled tasks: the public `mod/evals/routing.jsonl`, plus your own private labels, the log of routed tasks (`/route-inbox`) and `/route-eval` results in `~/.claude/office/evals/` (or `$CLAUDE_CONFIG_DIR/office/evals/`), shared by every copy of the plugin. Files an older version left in `mod/evals/` are copied there once.
   - *Workers* (`/spawn`): run a routed task as a background `claude --bg` worker. Workers show up in the office too. A **budget guard** blocks new workers when your rate-limit windows run high.
   - *Worktrees per worker*: a worker started in a git repo works on its own branch in its own git worktree under `~/.claude/office/worktrees/`, commits there, and its result reports the branch, commits and diffstat. A clean worktree is removed when it finishes and the branch stays for review (option `workerWorktree`: `auto` | `off`).
   - *Codex handoff* (`/codex-review`): Codex reviews the repo in the background. A **Codex budget guard** reads Codex's 5-hour and weekly usage before each job (free: no message spent), warns from 80% and refuses at 95%, and after a quota hit refuses that model until Codex's reset time. Only a typed `/codex-review --force` overrides.
@@ -57,7 +57,8 @@ export CLAUDE_CODE_PLUGIN_DIRS=/path/to/office/mod
 | `/office manage`, `/office manage off` | Make this session its project's manager, or stop |
 | `/spawn <task>` | Route a task and run it as a background worker |
 | `/route-task <task>` | Dry run: which model and effort the router would pick |
-| `/route-eval [rules\|claude\|jev\|all]` | Score the router against `evals/routing.jsonl` |
+| `/route-eval [rules\|claude\|jev\|all]` | Score the router against `evals/routing.jsonl` and your `~/.claude/office/evals/routing.local.jsonl` |
+| `/route-inbox` | Routed tasks not yet labelled in `routing.local.jsonl` |
 | `/codex-review [--deep] [--model m] [--force]` | Background Codex review of the repo |
 | `/jobs` | The jobs pane: workers and reviews |
 | `/manga [series]` | Open the manga reader |
