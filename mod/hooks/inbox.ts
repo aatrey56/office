@@ -1,7 +1,8 @@
-import type { Job } from '../types'
+import type { Job, RouteDecision } from '../types'
 
-// The routing inbox: every routed worker's task and how it went, appended to the git-ignored
-// evals/routing.inbox.jsonl so real tasks can be labelled into routing.local.jsonl later.
+// The routing inbox: every routed worker's task (and each Agent call a manager's router sized)
+// and how it went, appended to the git-ignored evals/routing.inbox.jsonl so real tasks can be
+// labelled into routing.local.jsonl later.
 // Pure: jobs.tsx writes the lines and runs /route-inbox.
 
 export const INBOX_PATH = 'evals/routing.inbox.jsonl'
@@ -18,11 +19,14 @@ export type InboxEntry = {
 
 /** The start line of a routed worker; undefined for a job whose model was given. */
 export function routedLine(job: Job, task: string, at: number): string | undefined {
-  const r = job.route
-  if (r === undefined) return undefined
+  return job.route === undefined ? undefined : routeLine(job.id, job.route, task, at)
+}
+
+/** A routed line by id: a worker job's, or an Agent call's tool_use_id. */
+export function routeLine(id: string, r: RouteDecision, task: string, at: number): string {
   return JSON.stringify({
     kind: 'routed',
-    job: job.id,
+    job: id,
     at: new Date(at).toISOString(),
     task,
     model: r.model,
@@ -36,13 +40,18 @@ export function routedLine(job: Job, task: string, at: number): string | undefin
 export function finishedLine(job: Job): string | undefined {
   if (job.route === undefined || job.endedAt === undefined) return undefined
   if (job.status !== 'done' && job.status !== 'failed') return undefined
+  return endLine(job.id, job.status, job.startedAt, job.endedAt, job.costUsd)
+}
+
+/** A finished line by id, for a worker job or an Agent call. */
+export function endLine(id: string, status: 'done' | 'failed', startedAt: number, endedAt: number, costUsd?: number): string {
   return JSON.stringify({
     kind: 'finished',
-    job: job.id,
-    at: new Date(job.endedAt).toISOString(),
-    status: job.status,
-    minutes: Math.round((job.endedAt - job.startedAt) / 6000) / 10,
-    ...(job.costUsd !== undefined ? { costUsd: job.costUsd } : {}),
+    job: id,
+    at: new Date(endedAt).toISOString(),
+    status,
+    minutes: Math.round((endedAt - startedAt) / 6000) / 10,
+    ...(costUsd !== undefined ? { costUsd } : {}),
   })
 }
 
