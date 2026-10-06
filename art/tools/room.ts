@@ -26,7 +26,7 @@ export const PLACEMENTS: Place[] = [
   // manager's corner: the big desk, a chair behind it, a tree
   { piece: 'chairSmall', x: 25, y: 32, blocks: true, tall: true },
   { piece: 'desk', x: 16, y: 48, blocks: true, props: [['paper', 1, 3], ['mug', 24, 2]] },
-  { piece: 'tree', x: 56, y: 32, blocks: true, tall: true },
+  { piece: 'tree', x: 48, y: 32, blocks: true, tall: true },
   // coding: five PCs in a row along the bottom, each one cell, the sitter in the cell below
   ...[1, 2, 3, 4, 5].map(c => ({ piece: 'pcDesk' as const, x: c * T, y: 131, blocks: true, props: [['monitor', 2, -11]] as [keyof typeof P, number, number][] })),
   // meeting: the big table, two chairs either side, two stools in front, a cabinet in the corner
