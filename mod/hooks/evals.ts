@@ -142,3 +142,13 @@ export function formatReport(reports: EvalReport[], columns: number): string {
   }
   return out.join('\n')
 }
+
+// One table per label set (the public routing.jsonl, the git-ignored routing.local.jsonl), so
+// each set's numbers stay comparable across runs whatever the other set holds.
+export function formatSets(sets: { name: string; reports: EvalReport[] }[], columns: number): string {
+  if (sets.length === 1) return formatReport(sets[0]?.reports ?? [], columns)
+  const width = Math.max(1, Math.floor(columns))
+  return sets
+    .map(s => `${`${s.name} (${s.reports[0]?.total ?? 0} tasks)`.slice(0, width)}\n${formatReport(s.reports, columns)}`)
+    .join('\n\n')
+}

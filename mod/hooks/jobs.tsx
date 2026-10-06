@@ -3,7 +3,7 @@ import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
 import type { BudgetCaps, Effort, EvalReport, Job, ModelTier, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
 import { budgetVerdict, DEFAULT_CAPS, isSmallRoute } from './budget'
-import { formatReport, parseCases, scoreRoutes } from './evals'
+import { formatSets, parseCases, scoreRoutes } from './evals'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -190,7 +190,7 @@ export function installJobs(on: On, options: PluginOptions) {
       })
       await $.command.register({
         name: 'route-eval',
-        description: 'Score the router against the labeled tasks in evals/routing.jsonl',
+        description: 'Score the router against the labeled tasks in evals/routing.jsonl (and routing.local.jsonl)',
         argumentHint: '[rules|claude|jev|all]',
       })
       for (const spec of WORKER_AGENT_SPECS) {
@@ -273,15 +273,26 @@ export function installJobs(on: On, options: PluginOptions) {
   on('command.run', { command: 'route-eval' }, async ($, e) => {
     const asked = e.args.trim().toLowerCase() || 'all'
     if (!EVAL_BACKENDS.includes(asked) && asked !== 'all') return { text: 'Usage: /route-eval [rules|claude|jev|all]' }
-    const file = `${$.plugin.root}/evals/routing.jsonl`
-    let text: string
-    try {
-      text = await $.fs.read(file)
-    } catch {
-      return { text: `No labeled tasks at ${file}.` }
+    // The public labels, plus the owner's real tasks when the git-ignored local file exists.
+    const sets: { name: string; tag: string; cases: RouteCase[]; reports: EvalReport[] }[] = []
+    const errors: string[] = []
+    for (const [name, tag, path] of [
+      ['public', '', 'evals/routing.jsonl'],
+      ['local', 'local-', 'evals/routing.local.jsonl'],
+    ] as const) {
+      const file = `${$.plugin.root}/${path}`
+      let text: string
+      try {
+        text = await $.fs.read(file)
+      } catch {
+        if (name === 'public') return { text: `No labeled tasks at ${file}.` }
+        continue
+      }
+      const parsed = parseCases(text)
+      errors.push(...parsed.errors.map(err => `${path} ${err}`))
+      if (name === 'public' && parsed.cases.length === 0) return { text: `No usable cases in ${file}. ${parsed.errors.slice(0, 3).join('; ')}` }
+      if (parsed.cases.length > 0) sets.push({ name: `${name}: ${path}`, tag, cases: parsed.cases, reports: [] })
     }
-    const { cases, errors } = parseCases(text)
-    if (cases.length === 0) return { text: `No usable cases in ${file}. ${errors.slice(0, 3).join('; ')}` }
 
     const now = Date.now()
     const jevKey = asked === 'jev' || asked === 'all' ? await resolveJevKey($, options) : undefined
@@ -289,19 +300,21 @@ export function installJobs(on: On, options: PluginOptions) {
     // all: every backend that can answer now; Jev joins once a key exists.
     const backends = asked === 'all' ? (jevKey ? EVAL_BACKENDS : EVAL_BACKENDS.filter(b => b !== 'jev')) : [asked]
 
-    const reports: EvalReport[] = []
     const saved: string[] = []
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-')
     for (const backend of backends as RouteDecision['backend'][]) {
-      const outcomes = await evalBackend($, options, backend, cases, jevKey, now)
-      const report = scoreRoutes(cases, outcomes, backend)
-      reports.push(report)
-      // A dated record, so a later run (a new rubric, Jev) has something to compare against.
-      const out = `${$.plugin.root}/evals/results/${new Date(now).toISOString().replace(/[:.]/g, '-')}-${backend}.json`
-      try {
-        await $.fs.write(out, JSON.stringify({ at: now, backend, report, outcomes }, null, 2))
-        saved.push(out)
-      } catch {
-        // the table below is the result; a record that could not be written is not worth failing for
+      for (const set of sets) {
+        const outcomes = await evalBackend($, options, backend, set.cases, jevKey, now)
+        const report = scoreRoutes(set.cases, outcomes, backend)
+        set.reports.push(report)
+        // A dated record, so a later run (a new rubric, Jev) has something to compare against.
+        const out = `${$.plugin.root}/evals/results/${stamp}-${set.tag}${backend}.json`
+        try {
+          await $.fs.write(out, JSON.stringify({ at: now, backend, report, outcomes }, null, 2))
+          saved.push(out)
+        } catch {
+          // the table below is the result; a record that could not be written is not worth failing for
+        }
       }
     }
     const notes = [
@@ -309,7 +322,7 @@ export function installJobs(on: On, options: PluginOptions) {
       asked === 'all' && !jevKey ? 'Jev skipped: no key yet.' : '',
       saved.length > 0 ? `Saved under ${$.plugin.root}/evals/results/` : '',
     ].filter(Boolean)
-    return { text: [formatReport(reports, e.presentation.columns), ...notes].join('\n') }
+    return { text: [formatSets(sets, e.presentation.columns), ...notes].join('\n') }
   })
 
   on('command.run', { command: 'jobs' }, async $ => {
