@@ -4,6 +4,7 @@ import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { BudgetCaps, Effort, EvalReport, Job, ModelTier, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
 import { budgetVerdict, DEFAULT_CAPS, isSmallRoute } from './budget'
 import { formatSets, parseCases, scoreRoutes } from './evals'
+import { finishedLine, foldInbox, formatInbox, INBOX_PATH, routedLine } from './inbox'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -110,7 +111,7 @@ const WORKER_ENV = { [WORKER_ENV_NAME]: WORKER_ENV_VALUE }
 const BG_STORE_KEY = 'bgIds'
 
 type Input = Record<string, unknown>
-type LineEvent = { tail?: string; result?: string; isError?: boolean; error?: string }
+type LineEvent = { tail?: string; result?: string; isError?: boolean; error?: string; costUsd?: number }
 type RunPlan = {
   argv: string[]
   cwd: string
@@ -192,6 +193,10 @@ export function installJobs(on: On, options: PluginOptions) {
         name: 'route-eval',
         description: 'Score the router against the labeled tasks in evals/routing.jsonl (and routing.local.jsonl)',
         argumentHint: '[rules|claude|jev|all]',
+      })
+      await $.command.register({
+        name: 'route-inbox',
+        description: 'Routed worker tasks not yet labelled in evals/routing.local.jsonl, newest first',
       })
       for (const spec of WORKER_AGENT_SPECS) {
         try {
@@ -323,6 +328,13 @@ export function installJobs(on: On, options: PluginOptions) {
       saved.length > 0 ? `Saved under ${$.plugin.root}/evals/results/` : '',
     ].filter(Boolean)
     return { text: [formatSets(sets, e.presentation.columns), ...notes].join('\n') }
+  })
+
+  on('command.run', { command: 'route-inbox' }, async ($, e) => {
+    const readOr = (path: string) => $.fs.read(`${$.plugin.root}/${path}`).catch(() => '')
+    const entries = foldInbox(await readOr(INBOX_PATH), await readOr('evals/routing.local.jsonl'))
+    if (entries.length === 0) return { text: `No routed tasks logged yet (${INBOX_PATH}).` }
+    return { text: formatInbox(entries, e.presentation.columns) }
   })
 
   on('command.run', { command: 'jobs' }, async $ => {
@@ -600,6 +612,7 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   )
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
+  logInbox($, finishedLine(finished))
   // Only a 'done' worker has surely stopped: a killed or timed-out one may still write there.
   await deliver($, finished.worktree !== undefined ? await settleWorktree($, finished, status === 'done') : finished)
 }
@@ -628,6 +641,28 @@ async function notifyModel($: EngineInterface, jobId: string, text: string, nudg
   } catch (err) {
     $.ui.log(`office: could not wake the session for job ${jobId}: ${String(err)}`, { to: 'debug' })
   }
+}
+
+/** Lines wait here so two writers never read the same old file; each write is read, append, write back. */
+let inboxChain: Promise<void> = Promise.resolve()
+
+/** Appends a routing-inbox line off the caller's path; a failure is logged, never thrown. */
+function logInbox($: EngineInterface, line: string | undefined): void {
+  if (line === undefined) return
+  const file = `${$.plugin.root}/${INBOX_PATH}`
+  inboxChain = inboxChain.then(async () => {
+    try {
+      // fs has no append: a file that exists but cannot be read is left alone, not overwritten.
+      const old = (await $.fs.exists(file)) ? await $.fs.read(file) : ''
+      await $.fs.write(file, `${old}${old === '' || old.endsWith('\n') ? '' : '\n'}${line}\n`)
+    } catch (err) {
+      try {
+        $.ui.log(`office: routing inbox not written: ${String(err)}`, { to: 'debug' })
+      } catch {
+        // logging is best effort too
+      }
+    }
+  })
 }
 
 /**
@@ -849,6 +884,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   let killed = false
   let result: string | undefined
   let errorText: string | undefined
+  let costUsd: number | undefined
   let stderr = ''
   let pending = ''
   let stdoutRest = ''
@@ -867,6 +903,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     const ev = plan.parse(line)
     if (ev.tail) pending += ev.tail
     if (ev.result !== undefined) result = ev.result
+    if (ev.costUsd !== undefined) costUsd = ev.costUsd
     if (ev.error !== undefined) errorText = ev.error
     else if (ev.isError) errorText = ev.result ?? 'error'
   }
@@ -925,6 +962,10 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     final = quota ?? [`exit ${exit?.code ?? exit?.signal ?? '?'}: ${why}`, hint, result ?? ''].filter(Boolean).join('\n')
   }
   if (!final) final = lastLine(stderr) || '(no output)'
+  if (costUsd !== undefined) {
+    const cost = costUsd
+    await patchJob($, jobId, j => ({ ...j, costUsd: cost }))
+  }
   await finishJob($, jobId, status, final)
 }
 
@@ -1146,6 +1187,7 @@ async function startWorker(
     const agentId = spawned.agentId
     const withAgent = { ...job, agentId }
     await addJob($, withAgent)
+    logInbox($, routedLine(job, task, now))
     adoptSubagent($, options, withAgent, agentId)
     return { ok: true, text: `Started subagent worker job ${job.id} (agent ${agentId}) on ${how} ${where} /jobs shows it.` }
   }
@@ -1173,6 +1215,7 @@ async function startWorker(
     }
     const withBg = { ...job, bgId }
     await addJob($, withBg)
+    logInbox($, routedLine(job, task, now))
     await rememberBgId($, bgId)
     adoptBg($, options, withBg, bgId)
     return {
@@ -1182,6 +1225,7 @@ async function startWorker(
   }
 
   await addJob($, job)
+  logInbox($, routedLine(job, task, now))
   const plan: RunPlan = {
     argv: headlessArgv(claudeBin, modelId, effort, permissionMode),
     cwd: job.cwd,
