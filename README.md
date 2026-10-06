@@ -23,7 +23,7 @@ A [Claude Code](https://claude.com/claude-code) mod that turns your sessions int
   - *Model router* (`/route-task`, `/route-eval`): picks a model tier and effort for a task, using a rules backend, Claude, or an external router, and scores itself against labelled tasks in `mod/evals/`.
   - *Workers* (`/spawn`): run a routed task as a background `claude --bg` worker. Workers show up in the office too. A **budget guard** blocks new workers when your rate-limit windows run high.
   - *Worktrees per worker*: a worker started in a git repo works on its own branch in its own git worktree under `~/.claude/office/worktrees/`, commits there, and its result reports the branch, commits and diffstat. A clean worktree is removed when it finishes and the branch stays for review (option `workerWorktree`: `auto` | `off`).
-  - *Codex handoff* (`/codex-review`): Codex reviews the repo in the background.
+  - *Codex handoff* (`/codex-review`): Codex reviews the repo in the background. A **Codex budget guard** reads Codex's 5-hour and weekly usage before each job (free: no message spent), warns from 80% and refuses at 95%, and after a quota hit refuses that model until Codex's reset time. Only a typed `/codex-review --force` overrides.
 - **Manga reader** (`/manga`): reads chapters from `~/Manga/<Series>/` (folders of PNGs or `.cbz`) in a side pane while Claude works.
 
 ## Install
@@ -58,7 +58,7 @@ export CLAUDE_CODE_PLUGIN_DIRS=/path/to/office/mod
 | `/spawn <task>` | Route a task and run it as a background worker |
 | `/route-task <task>` | Dry run: which model and effort the router would pick |
 | `/route-eval [rules\|claude\|jev\|all]` | Score the router against `evals/routing.jsonl` |
-| `/codex-review` | Background Codex review of the repo |
+| `/codex-review [--deep] [--model m] [--force]` | Background Codex review of the repo |
 | `/jobs` | The jobs pane: workers and reviews |
 | `/manga [series]` | Open the manga reader |
 

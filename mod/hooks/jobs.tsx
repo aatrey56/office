@@ -18,9 +18,18 @@ import {
   CODEX_DEFAULTS,
   defaultReviewTarget,
   parseReviewTarget,
-  splitDeep,
 } from './codex'
 import type { CodexTier, ReviewTarget } from './codex'
+import {
+  CODEX_LIMITS_REQUEST,
+  CODEX_OUT_FALLBACK_MS,
+  codexGuardVerdict,
+  codexLimitsArgv,
+  codexLimitsFrom,
+  codexResetAt,
+  parseCodexReviewArgs,
+} from './codex-budget'
+import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
 import {
   CLAUDE_SYSTEM,
   claudePrompt,
@@ -109,6 +118,10 @@ let jevKeyCache: { key?: string; at: number } | undefined
 const WORKER_ENV = { [WORKER_ENV_NAME]: WORKER_ENV_VALUE }
 /** $.store key: the --bg ids this plugin started (counted against maxWorkers across sessions). */
 const BG_STORE_KEY = 'bgIds'
+/** $.store keys: Codex's last read rate limits, and the models out of quota until their reset. */
+const CODEX_LIMITS_KEY = 'codexLimits'
+const CODEX_OUT_KEY = 'codexOut'
+const CODEX_LIMITS_TIMEOUT_MS = 6000
 
 type Input = Record<string, unknown>
 type LineEvent = { tail?: string; result?: string; isError?: boolean; error?: string; costUsd?: number }
@@ -177,7 +190,7 @@ export function installJobs(on: On, options: PluginOptions) {
       await $.command.register({
         name: 'codex-review',
         description: 'Codex reviews this repo in the background (dirty tree: uncommitted; else vs main/master)',
-        argumentHint: '[--deep] [base|--uncommitted|--commit <sha>]',
+        argumentHint: '[--deep] [--model m] [--force] [base|--uncommitted|--commit <sha>]',
       })
       await $.command.register({
         name: 'spawn',
@@ -225,7 +238,7 @@ export function installJobs(on: On, options: PluginOptions) {
   on('tool.call', { tool: 'mcp__office__codex_review' }, async ($, e) => {
     const input = e as unknown as Input
     const deep = input.deep === true
-    const msg = await startCodexReview($, options, str(input.target), str(input.instructions), str(input.cwd), deep)
+    const msg = await startCodexReview($, options, str(input.target), str(input.instructions), str(input.cwd), deep, BY_AGENT_CODEX)
     return msg.ok ? { result: msg.text } : { deny: msg.text }
   })
 
@@ -254,8 +267,8 @@ export function installJobs(on: On, options: PluginOptions) {
 
   // ── commands ────────────────────────────────────────────────────────────
   on('command.run', { command: 'codex-review' }, async ($, e) => {
-    const { deep, rest } = splitDeep(e.args)
-    const msg = await startCodexReview($, options, str(rest), undefined, undefined, deep)
+    const { deep, force, model, rest } = parseCodexReviewArgs(e.args)
+    const msg = await startCodexReview($, options, str(rest), undefined, undefined, deep, { isForced: force, model })
     return { text: msg.text }
   })
 
@@ -967,6 +980,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
 
   let status: 'done' | 'failed' = 'done'
   let final = result ?? ''
+  let quotaText: string | undefined
   if (startError !== undefined) {
     status = 'failed'
     final = `could not run ${plan.argv[0]}: ${startError}`
@@ -976,13 +990,17 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     const quota = plan.codexModel !== undefined ? codexQuotaMessage(`${why}\n${stderr}`, plan.codexModel) : undefined
     const hint = plan.codexModel !== undefined ? codexFailureHint(`${why}\n${stderr}`) : ''
     final = quota ?? [`exit ${exit?.code ?? exit?.signal ?? '?'}: ${why}`, hint, result ?? ''].filter(Boolean).join('\n')
+    if (quota !== undefined) quotaText = `${why}\n${stderr}`
   }
   if (!final) final = lastLine(stderr) || '(no output)'
   if (costUsd !== undefined) {
     const cost = costUsd
     await patchJob($, jobId, j => ({ ...j, costUsd: cost }))
   }
+  // Marked before delivery, so a job started on reading the result already meets the guard.
+  if (plan.codexModel !== undefined && quotaText !== undefined) await markCodexOut($, plan.codexModel, quotaText)
   await finishJob($, jobId, status, final)
+  if (plan.codexModel !== undefined) void readCodexLimits($, plan.argv[0]!, plan.cwd)
 }
 
 // ── codex ───────────────────────────────────────────────────────────────
@@ -994,6 +1012,61 @@ async function codexNotReady($: EngineInterface, bin: string, cwd: string): Prom
   } catch (err) {
     return `Could not run codex (${bin}): ${String(err).slice(0, 120)}\nInstall the Codex CLI with \`npm install -g @openai/codex\`, or set the office plugin's codexPath to where it lives.`
   }
+}
+
+/** Who asked for a Codex job: only the person's typed /codex-review sets `isForced` or `model`. */
+type CodexAsk = { isForced: boolean; model?: string }
+const BY_AGENT_CODEX: CodexAsk = { isForced: false }
+
+/**
+ * Codex's rate limits, read live through `codex app-server` (no message spent)
+ * and kept in $.store; undefined when it does not answer in time.
+ */
+async function readCodexLimits($: EngineInterface, bin: string, cwd: string): Promise<CodexLimits | undefined> {
+  const stream = $.process.spawn({ argv: codexLimitsArgv(bin), cwd, input: CODEX_LIMITS_REQUEST })
+  const timer = $.clock.after(CODEX_LIMITS_TIMEOUT_MS, () => void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined))
+  let out = ''
+  let limits: CodexLimits | undefined
+  try {
+    for await (const chunk of stream) {
+      if (chunk.stream !== 'stdout') continue
+      out = (out + chunk.text).slice(-65536)
+      limits = codexLimitsFrom(out, Date.now())
+      if (limits) break // leaving the loop ends the child
+    }
+  } catch {
+    // codex missing or app-server refused: the stored read stands
+  } finally {
+    timer.cancel()
+  }
+  if (limits) await $.store.set(CODEX_LIMITS_KEY, limits).catch(() => undefined)
+  return limits
+}
+
+async function storedCodexOut($: EngineInterface): Promise<CodexOut> {
+  const stored = await $.store.get(CODEX_OUT_KEY).catch(() => undefined)
+  return stored !== null && typeof stored === 'object' ? (stored as CodexOut) : {}
+}
+
+/** A quota hit: the model is out until codex's reset time (an hour when it named none). */
+async function markCodexOut($: EngineInterface, model: string, errorText: string): Promise<void> {
+  const now = Date.now()
+  const until = codexResetAt(errorText, now) ?? now + CODEX_OUT_FALLBACK_MS
+  const kept = Object.fromEntries(Object.entries(await storedCodexOut($)).filter(([, o]) => o.until > now))
+  await $.store.set(CODEX_OUT_KEY, { ...kept, [model]: { until, note: lastLine(errorText) } }).catch(() => undefined)
+}
+
+/** The budget guard before a Codex job: a live read of the limits, else the last one kept. */
+async function codexGuard($: EngineInterface, bin: string, cwd: string, model: string, isForced: boolean): Promise<CodexVerdict> {
+  const out = await storedCodexOut($)
+  const limits =
+    (await readCodexLimits($, bin, cwd)) ??
+    ((await $.store.get(CODEX_LIMITS_KEY).catch(() => undefined)) as CodexLimits | undefined)
+  return codexGuardVerdict(model, Date.now(), { limits: Array.isArray(limits?.buckets) ? limits : undefined, out }, isForced)
+}
+
+function refusedText(verdict: { reason: string }, ask: CodexAsk): string {
+  return `${verdict.reason} ${ask === BY_AGENT_CODEX ? 'Only the person can override, with /codex-review --force.' : '/codex-review --force overrides.'}`
 }
 
 async function failedJob($: EngineInterface, job: Job, why: string): Promise<Started> {
@@ -1008,14 +1081,18 @@ async function startCodexReview(
   instructions: string | undefined,
   cwdArg: string | undefined,
   deep: boolean,
+  ask: CodexAsk,
 ): Promise<Started> {
   const full = await capacityError($, options)
   if (full) return { ok: false, text: full }
   const cwd = await resolveCwd($, cwdArg)
   const bin = opt(options, 'codexPath', 'codex')
-  const tier: CodexTier = deep
+  const base: CodexTier = deep
     ? { model: opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model), effort: CODEX_DEFAULTS.deep.effort }
     : { model: opt(options, 'codexReviewModel', CODEX_DEFAULTS.review.model), effort: CODEX_DEFAULTS.review.effort }
+  const tier: CodexTier = ask.model !== undefined ? { ...base, model: ask.model } : base
+  const verdict = await codexGuard($, bin, cwd, tier.model, ask.isForced)
+  if (!verdict.isAllowed) return { ok: false, text: refusedText(verdict, ask) }
   const now = Date.now()
   let target: ReviewTarget | undefined = parseReviewTarget(targetArg)
   if (targetArg && !target) return { ok: false, text: `Unknown review target "${targetArg}".` }
@@ -1056,7 +1133,7 @@ async function startCodexReview(
   $.clock.after(0, () => void runJob($, options, job, plan))
   return {
     ok: true,
-    text: `Started Codex review job ${job.id} (${target.label}) in ${cwd}. It runs in the background; the review is appended to this conversation when it finishes. /jobs shows progress.`,
+    text: `Started Codex review job ${job.id} (${target.label}, ${tier.model}) in ${cwd}. It runs in the background; the review is appended to this conversation when it finishes. /jobs shows progress.${verdict.warning ? ` Budget: ${verdict.warning}` : ''}`,
   }
 }
 
@@ -1071,6 +1148,9 @@ async function startCodexExec(
   const cwd = await resolveCwd($, cwdArg)
   const bin = opt(options, 'codexPath', 'codex')
   const tier: CodexTier = { model: opt(options, 'codexExecModel', CODEX_DEFAULTS.exec.model), effort: CODEX_DEFAULTS.exec.effort }
+  // codex_exec is only ever an agent's call: the guard holds, with no override.
+  const verdict = await codexGuard($, bin, cwd, tier.model, false)
+  if (!verdict.isAllowed) return { ok: false, text: refusedText(verdict, BY_AGENT_CODEX) }
   const now = Date.now()
   const job: Job = {
     id: newJobId(now),
@@ -1099,7 +1179,7 @@ async function startCodexExec(
   $.clock.after(0, () => void runJob($, options, job, plan))
   return {
     ok: true,
-    text: `Started Codex job ${job.id} (read-only sandbox) in ${cwd}. Its answer is appended to this conversation when it finishes. /jobs shows progress.`,
+    text: `Started Codex job ${job.id} (read-only sandbox) in ${cwd}. Its answer is appended to this conversation when it finishes. /jobs shows progress.${verdict.warning ? ` Budget: ${verdict.warning}` : ''}`,
   }
 }
 
