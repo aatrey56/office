@@ -203,6 +203,8 @@ describe('/route-eval', () => {
   ].join('\n')
 
   test('rules: scores the labeled file, saves a dated record, and never calls a model', async ($, on) => {
+    on('env.get', (_$, e) => ({ value: e.name === 'CLAUDE_CONFIG_DIR' ? '/fake/config' : undefined }))
+    on('fs.exists', () => ({ value: false }))
     let modelCalls = 0
     const written: { path: string; text: string }[] = []
     on('fs.read', (_$, e) => {
@@ -223,12 +225,14 @@ describe('/route-eval', () => {
     expect(ran.text).toContain('b: want fable/high, got sonnet/low')
     expect(modelCalls).toBe(0)
     expect(written).toHaveLength(1)
-    expect(written[0]?.path).toMatch(/evals\/results\/.*-rules\.json$/)
+    expect(written[0]?.path).toMatch(/^\/fake\/config\/office\/evals\/results\/.*-rules\.json$/)
     expect(JSON.parse(written[0]?.text ?? '{}').report).toMatchObject({ backend: 'rules', total: 2, exact: 1, underRouted: 1 })
   })
 
   test('a local label file is scored and reported apart from the public one', async ($, on) => {
     const LOCAL = '{"id":"l01","task":"Bump the version in package.json","model":"opus","effort":"high","why":"deliberately wrong label"}'
+    on('env.get', (_$, e) => ({ value: e.name === 'CLAUDE_CONFIG_DIR' ? '/fake/config' : undefined }))
+    on('fs.exists', () => ({ value: false }))
     const written: string[] = []
     on('fs.read', (_$, e) => ({ value: e.path.endsWith('/routing.local.jsonl') ? LOCAL : CASES }))
     on('fs.write', (_$, e) => {
@@ -236,7 +240,7 @@ describe('/route-eval', () => {
       return { value: undefined }
     })
     const ran = await $.command.run({ command: 'route-eval', args: 'rules', ...ASK })
-    const [pub, local] = (ran.text ?? '').split('local: evals/routing.local.jsonl (1 tasks)')
+    const [pub, local] = (ran.text ?? '').split('local: ~/.claude/office/evals/routing.local.jsonl (1 tasks)')
     expect(pub).toContain('public: evals/routing.jsonl (2 tasks)')
     expect(pub).toContain('2/2')
     expect(local).toContain('1/1')
