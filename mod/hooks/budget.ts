@@ -9,6 +9,14 @@ export function isSmallRoute(model: ModelTier, effort: Effort): boolean {
   return (model === 'sonnet' || model === 'haiku') && (effort === 'low' || effort === 'medium')
 }
 
+/** The tier a model alias or full id belongs to, for sizing a model the caller named; unknown ids count as large. */
+export function tierOfModelId(modelId: string): ModelTier {
+  if (modelId.includes('haiku')) return 'haiku'
+  if (modelId.includes('sonnet')) return 'sonnet'
+  if (modelId.includes('fable')) return 'fable'
+  return 'opus'
+}
+
 // Kinds without a soft line (a gateway's spend_limit) only ever hit the hard one.
 function softLine(w: RateWindow, caps: BudgetCaps): number | undefined {
   if (w.kind === 'five_hour') return caps.softFiveHourPct

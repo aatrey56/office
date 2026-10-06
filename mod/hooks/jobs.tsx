@@ -1,10 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
+import type { AgentSpawnInput, EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-import type { BudgetCaps, Effort, EvalReport, Job, ModelTier, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
-import { budgetVerdict, DEFAULT_CAPS, isSmallRoute } from './budget'
+import type { BudgetCaps, Effort, EvalReport, Job, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
+import type { AgentDef, AgentPin } from './agentguard'
+import { agentGuard, agentRouteText, hardDeny, isManagerSession, needsRoute, parseAgentFile, pinOf } from './agentguard'
+import { budgetVerdict, DEFAULT_CAPS, isSmallRoute, tierOfModelId } from './budget'
 import { formatSets, parseCases, scoreRoutes } from './evals'
-import { finishedLine, foldInbox, formatInbox, INBOX_PATH, routedLine } from './inbox'
+import { endLine, finishedLine, foldInbox, formatInbox, INBOX_PATH, routeLine, routedLine } from './inbox'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -109,6 +111,8 @@ let jevKeyCache: { key?: string; at: number } | undefined
 const WORKER_ENV = { [WORKER_ENV_NAME]: WORKER_ENV_VALUE }
 /** $.store key: the --bg ids this plugin started (counted against maxWorkers across sessions). */
 const BG_STORE_KEY = 'bgIds'
+/** $.store key manage.tsx keeps: project root → its manager session. */
+const MANAGERS_KEY = 'managers'
 
 type Input = Record<string, unknown>
 type LineEvent = { tail?: string; result?: string; isError?: boolean; error?: string; costUsd?: number }
@@ -140,6 +144,10 @@ const BLOCKED_AT = new Map<string, number>()
 const TIMERS = new Map<string, Timer>()
 /** Whether the main loop is mid-turn (an appended row is then read at once). */
 let mainTurnRunning = false
+/** Agent calls the router sized in a manager session, awaiting their turn.complete: agentId → inbox id and start. */
+const SIZED_AGENTS = new Map<string, { id: string; startedAt: number }>()
+/** Where the engine says an agent type comes from (agent.offer's `source`), by type. */
+const OFFERED = new Map<string, string>()
 
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined
@@ -220,6 +228,35 @@ export function installJobs(on: On, options: PluginOptions) {
   })
 
   on('agent.offer', { agent: /^office:worker-/ }, () => ({ isOffered: false }))
+  // Only general-purpose is ever sized among the built-ins: its source says it is the built-in.
+  on('agent.offer', { agent: 'general-purpose' }, ($, e, next) => {
+    OFFERED.set(e.agent, e.source)
+    return next(e)
+  })
+
+  // A manager's own Agent calls pass the budget guard, the router and the routing inbox, as
+  // spawn_worker does. A failure here lets the spawn through unchanged.
+  on('agent.spawn', async ($, e, next) => {
+    let plan: AgentPlan
+    try {
+      plan = next.origin.plugin === 'engine' ? await planAgent($, options, e) : {}
+    } catch (err) {
+      debugLog($, `office: agent guard skipped for ${e.tool_use_id}: ${String(err)}`)
+      return next(e)
+    }
+    if (plan.deny !== undefined) return { deny: plan.deny }
+    const spawned = await next(plan.model !== undefined ? { ...e, model: plan.model } : e)
+    if (plan.routed !== undefined && spawned.deny === undefined) {
+      try {
+        const now = Date.now()
+        logInbox($, routeLine(e.tool_use_id, plan.routed, e.prompt, now))
+        if (spawned.agentId !== undefined) SIZED_AGENTS.set(spawned.agentId, { id: e.tool_use_id, startedAt: now })
+      } catch (err) {
+        debugLog($, `office: agent ${e.tool_use_id} not logged: ${String(err)}`)
+      }
+    }
+    return spawned
+  })
 
   // ── tools ───────────────────────────────────────────────────────────────
   on('tool.call', { tool: 'mcp__office__codex_review' }, async ($, e) => {
@@ -353,6 +390,11 @@ export function installJobs(on: On, options: PluginOptions) {
     if (agentId === undefined) {
       mainTurnRunning = false
       return next(e)
+    }
+    const sized = SIZED_AGENTS.get(agentId)
+    if (sized !== undefined) {
+      SIZED_AGENTS.delete(agentId)
+      logInbox($, endLine(sized.id, e.reason === 'answer' ? 'done' : 'failed', sized.startedAt, Date.now()))
     }
     const jobId = SUBAGENT_JOBS.get(agentId)
     if (jobId !== undefined) {
@@ -1126,14 +1168,6 @@ function budgetCaps(options: PluginOptions): BudgetCaps {
   }
 }
 
-/** The tier a full model id belongs to, for sizing a model the caller named; unknown ids count as large. */
-function tierOfModelId(modelId: string): ModelTier {
-  if (modelId.includes('haiku')) return 'haiku'
-  if (modelId.includes('sonnet')) return 'sonnet'
-  if (modelId.includes('fable')) return 'fable'
-  return 'opus'
-}
-
 async function startWorker(
   $: EngineInterface,
   options: PluginOptions,
@@ -1254,6 +1288,81 @@ async function startWorker(
     ok: true,
     text: `Started headless worker job ${job.id} on ${how} ${where} Its result is appended to this conversation when it finishes; /jobs shows progress.`,
   }
+}
+
+// ── the Agent tool in manager sessions ($ halves; the rules are in agentguard.ts) ──
+
+/** What the agent.spawn hook does: refuse, set the model, and the route to log; {} leaves the spawn alone. */
+type AgentPlan = { deny?: string; model?: string; routed?: RouteDecision }
+
+function debugLog($: EngineInterface, text: string): void {
+  try {
+    $.ui.log(text, { to: 'debug' })
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * Only a session that manages a project now, and never an office worker. Budget first: past the
+ * hard line every agent is refused before anything else is read or routed.
+ */
+async function planAgent($: EngineInterface, options: PluginOptions, e: AgentSpawnInput): Promise<AgentPlan> {
+  if ((await $.env.get('OFFICE_WORKER')) !== undefined) return {}
+  if (!isManagerSession(await $.store.get(MANAGERS_KEY), await $.session.id())) return {}
+  const windows = await rateWindows($)
+  const caps = budgetCaps(options)
+  const hard = hardDeny(windows, caps)
+  if (hard !== undefined) return { deny: hard }
+  const pin = await agentPin($, e)
+  const routed = needsRoute(windows, caps, pin, e.parentModel)
+    ? await route($, options, agentRouteText(e.description, e.prompt))
+    : undefined
+  const verdict = agentGuard(windows, caps, pin, e.parentModel, routed)
+  if ('deny' in verdict) return { deny: verdict.deny }
+  if (verdict.size === undefined || routed === undefined) return {}
+  return { model: modelIdFor(verdict.size, Date.now()), routed }
+}
+
+/** What pins this spawn's model; a definition that cannot be read leaves it unknown, so never overridden. */
+async function agentPin($: EngineInterface, e: AgentSpawnInput): Promise<AgentPin> {
+  const base = { callModel: e.model, isFork: e.fork, type: e.subagentType, offeredAs: OFFERED.get(e.subagentType) }
+  try {
+    const envModel = str(await $.env.get('CLAUDE_CODE_SUBAGENT_MODEL'))
+    return pinOf({ ...base, ...(await agentDefs($)), envModel })
+  } catch (err) {
+    debugLog($, `office: agent definitions not read: ${String(err)}`)
+    return pinOf({ ...base, defs: [], isComplete: false })
+  }
+}
+
+/**
+ * The agent files the engine reads, nearest first: .claude/agents in the session's folder and
+ * each folder above it, then the user's. isComplete is false when any of them could not be read.
+ */
+async function agentDefs($: EngineInterface): Promise<{ defs: AgentDef[]; isComplete: boolean }> {
+  const dirs: string[] = []
+  let dir = (await $.session.cwd()).replace(/\/+$/, '')
+  while (dir !== '') {
+    dirs.push(`${dir}/.claude/agents`)
+    dir = dir.slice(0, dir.lastIndexOf('/'))
+  }
+  dirs.push(`${(await configDirOf($)).replace(/\/+$/, '')}/agents`)
+  const defs: AgentDef[] = []
+  let isComplete = true
+  for (const d of [...new Set(dirs)]) {
+    try {
+      if (!(await $.fs.exists(d))) continue
+      for (const entry of await $.fs.list(d)) {
+        if (entry.kind === 'dir' || !entry.name.endsWith('.md')) continue
+        const def = parseAgentFile(await $.fs.read(`${d}/${entry.name}`))
+        if (def !== undefined) defs.push(def)
+      }
+    } catch {
+      isComplete = false
+    }
+  }
+  return { defs, isComplete }
 }
 
 // ── worker worktrees ($ halves; the argv and texts are in worktree.ts) ───
