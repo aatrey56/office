@@ -48,14 +48,14 @@ type Seat = { room: string; at: { x: number; y: number }; facing: Facing; dx?: n
 const seat = (room: string, x: number, y: number, facing: Facing, dx = 0, dy = 0, zBias = false): Seat =>
   ({ room, at: { x, y }, facing, ...(dx ? { dx } : {}), ...(dy ? { dy } : {}), ...(zBias ? { zBias: true as const } : {}) })
 const seats: Seat[] = [
-  seat('manager', 2, 8, 'down', -8, 6),
+  seat('manager', 2, 2, 'down', -8, 6),
   // meeting: two chairs either side of the table, two stools in front of it
   seat('meeting', 7, 4, 'right', 3, 0, true), seat('meeting', 7, 5, 'right', 3, 0, true),
   seat('meeting', 10, 4, 'left', -5, 0, true), seat('meeting', 10, 5, 'left', -5, 0, true),
   seat('meeting', 8, 6, 'up', 0, -4, true), seat('meeting', 9, 6, 'up', 0, -4, true),
   seat('whiteboard', 8, 2, 'up', -4), seat('whiteboard', 9, 2, 'up', -4),
   // coding: one sitter in front of each PC, facing it
-  ...[0, 1, 2, 3, 4].map(c => seat('coding', c, 3, 'up', 0, -3)),
+  ...[1, 2, 3, 4, 5].map(c => seat('coding', c, 9, 'up', 0, -3)),
   // review: behind each small desk
   seat('review', 0, 5, 'down', 0, 8), seat('review', 1, 5, 'down', 0, 8), seat('review', 3, 5, 'down', 0, 8), seat('review', 4, 5, 'down', 0, 8),
   // break room: two on the couch facing out, one on the bench facing them
