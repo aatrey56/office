@@ -6,7 +6,7 @@ A [Claude Code](https://claude.com/claude-code) mod that turns your sessions int
 
 ## Features
 
-- **Office scene.** One character per session, animated at 10 fps: they walk in through the door, sit, type, think, hum music on the couch, and blink a "!" when they need you. Room follows state:
+- **Office scene.** One character per session (and per subagent of a conversation), animated at 10 fps: they walk in through the door, sit, type, think, hum music on the couch, and blink a "!" when they need you. Room follows state:
 
   | Session is | Goes to |
   | --- | --- |
@@ -22,6 +22,7 @@ A [Claude Code](https://claude.com/claude-code) mod that turns your sessions int
   - *Manager role* (`/office manage`): one session becomes its project's manager. It splits the goal, routes and delegates tasks, and keeps a shared notebook (`post_note` / `read_notes`).
   - *Model router* (`/route-task`, `/route-eval`): picks a model tier and effort for a task, using a rules backend, Claude, or an external router, and scores itself against labelled tasks in `mod/evals/`.
   - *Workers* (`/spawn`): run a routed task as a background `claude --bg` worker. Workers show up in the office too. A **budget guard** blocks new workers when your rate-limit windows run high.
+  - *Worktrees per worker*: a worker started in a git repo works on its own branch in its own git worktree under `~/.claude/office/worktrees/`, commits there, and its result reports the branch, commits and diffstat. A clean worktree is removed when it finishes and the branch stays for review (option `workerWorktree`: `auto` | `off`).
   - *Codex handoff* (`/codex-review`): Codex reviews the repo in the background.
 - **Manga reader** (`/manga`): reads chapters from `~/Manga/<Series>/` (folders of PNGs or `.cbz`) in a side pane while Claude works.
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { Crew, Job, ManagerEntry, SessionCard, TileMap } from '../../types'
+import type { AgentRecord, Crew, Job, ManagerEntry, SessionCard, TileMap } from '../../types'
 import { assignSeats, deriveCrew, roomFor, stateOf } from './model'
 
 const NOW = 1_000_000
@@ -72,6 +72,24 @@ describe('deriveCrew workers', () => {
     expect(at(LINGER / 2)[0]).toMatchObject({ state: 'leaving', room: 'lobby' })
     expect(at(LINGER)[0]?.state).toBe('leaving')
     expect(at(LINGER + 1)).toEqual([])
+  })
+})
+
+describe('deriveCrew agents', () => {
+  const agent = (over: Partial<AgentRecord> = {}): AgentRecord => ({ id: 'a1', sessionId: 's1', cwd: '/elsewhere', name: 'explore', ...over })
+  test("an agent works in its parent's project, in the room for its activity; a finished one walks out", () => {
+    const crew = deriveCrew([card({ cwd: '/repo/a/sub' })], [], {}, ROOTS, NOW, LINGER, [
+      agent({ activity: 'planning' }),
+      agent({ id: 'a2', endedAt: NOW - 1 }),
+      agent({ id: 'a3', endedAt: NOW - LINGER - 1 }),
+    ])
+    expect(crew.map(c => c.id)).toEqual(['s1', 'a1', 'a2'])
+    expect(crew[1]).toMatchObject({ project: '/repo/a', role: 'worker', state: 'working', room: 'whiteboard', isSelectable: false })
+    expect(crew[2]).toMatchObject({ project: '/repo/a', state: 'leaving', room: 'lobby' })
+  })
+  test('a bg worker that is also a session is drawn once, as the worker, in its project', () => {
+    const crew = derive([card({ sessionId: 'bg1', cwd: '/wt/j1' })], [job({ sessionId: 'bg1', cwd: '/wt/j1', project: '/repo/a' })])
+    expect(crew.map(c => [c.id, c.role, c.project])).toEqual([['j1', 'worker', '/repo/a']])
   })
 })
 

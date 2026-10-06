@@ -145,10 +145,13 @@ export const WORKER_SETTINGS = JSON.stringify({ env: { [WORKER_ENV_NAME]: WORKER
 
 /** `claude agents --json` states: done ends a job well; these end it badly. */
 export const BG_FAILED_STATES: readonly string[] = ['failed', 'stopped', 'error', 'errored', 'killed']
-export function bgPhase(state: string | undefined): 'done' | 'failed' | 'blocked' | 'active' {
+// Seen with claude 2.1.289 (2026-10-05): a worker whose turn ended can stay at
+// state 'working' with status 'idle' indefinitely, never reaching 'done'.
+export function bgPhase(state: string | undefined, status?: string): 'done' | 'failed' | 'blocked' | 'active' | 'idle' {
   if (state === 'done') return 'done'
   if (state !== undefined && BG_FAILED_STATES.includes(state)) return 'failed'
-  return state === 'blocked' ? 'blocked' : 'active'
+  if (state === 'blocked') return 'blocked'
+  return status === 'idle' ? 'idle' : 'active'
 }
 
 export type WorkerMode = 'bg' | 'headless' | 'subagent'

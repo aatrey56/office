@@ -1,8 +1,32 @@
 # Office: orchestration + pixel office — build plan
 
 Written 2026-10-04 on Fable 5.1 (xhigh). Supersedes `redesign-plan.md`.
-Status: **waiting for your approval. Nothing in this plan is built yet** (except where marked "exists").
+~~Status: waiting for your approval. Nothing in this plan is built yet~~ (superseded by the status below).
 Revised 2026-10-04 after your review: two-level budget guard, bigger scene, build ceilings, labels explained.
+
+## Status, 2026-10-05
+
+Checked against the code in `mod/hooks`. The rest of this document is the original plan, kept as history.
+
+| Plan item | Status |
+| --- | --- |
+| Office scene with walking characters, drawn in depth order | Built, tested |
+| Activities shown from each session's last tool | Built, tested |
+| Chat window for the selected session | Built |
+| Text board (`t`) | Built |
+| Manager role (`/office manage`) and project notebook (`post_note` / `read_notes`) | Built, tested |
+| Router with rules / Claude / Jev backends | Built, tested |
+| `/route-eval` and `evals/routing.jsonl` | Built, tested; never run, so no accuracy numbers yet |
+| Budget guard (soft and hard lines) | Built, tested |
+| `/spawn` workers in `bg`, `headless` and `subagent` modes | Built, tested |
+| Codex review (`/codex-review`) | Built |
+| Worker git worktrees (option `workerWorktree`) | Partly built, in progress on `feat/worker-worktrees` |
+| Every subagent of a conversation drawn as a character | Partly built, in progress on `feat/worker-worktrees` |
+| Lobby view with one door per project | Not built; only a fallback lobby room (`h`/`l` switch offices) |
+| `z` size key (§5.5) | Not built |
+| Clicking sprites in the picture | Not built; crew list rows below the picture are clickable |
+| Manager walking to desks when delegating | Not built |
+| Per-job usage deltas (§3.4) | Not built; `costUsd` is parsed in `spawn.ts` but never stored |
 
 ## 0. Goal and what "done" means
 

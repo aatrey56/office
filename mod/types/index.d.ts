@@ -49,6 +49,10 @@ export type Job = {
   bgId?: string // bg-mode worker: the short id `claude --bg` printed (attach/logs/stop take it)
   sessionId?: string // bg-mode worker: its session id (names its transcript)
   isSelected?: boolean // the /jobs pane's selection (at most one job)
+  project?: string // worker: the main repo root it works for (a worktree's cwd is not it)
+  worktree?: string // worker: its own git worktree dir, while that exists
+  branch?: string // worker: the branch its worktree is on (kept after the worktree goes)
+  baseRef?: string // worker: the commit its branch started from
 }
 
 // ── manga (manga.tsx) ────────────────────────────────────────────────────
@@ -104,6 +108,17 @@ export type Crew = {
   activity?: Activity
   isSelectable: boolean // leads and managers only; workers never
   isSelf: boolean
+}
+
+// One subagent of a live session (a Task/Agent call or a workflow agent), from its transcript
+// under <config>/projects/<slug>/<sessionId>/subagents/. Drawn as a worker of its parent's project.
+export type AgentRecord = {
+  id: string // the transcript's agentId
+  sessionId: string // the parent session
+  cwd: string
+  name: string // the meta's description, else its agentType; never drawn
+  activity?: Activity
+  endedAt?: number // finished: its transcript's last write (ms); absent while it runs
 }
 
 // A crew member on screen: pixel position, the tiles still to walk, and its animation step.

@@ -3,6 +3,7 @@ import type { EngineInterface, On } from 'claude-code'
 
 import type { ManagerEntry, Note, SessionCard } from '../types'
 import { formatNote, managerSection, NOTE_TAGS, notesFileName, notesSection, parseNotes, reportToSection } from './manager'
+import { projectRootArgv, repoRootFromCommonDir } from './worktree'
 
 // Owner: orchestration. `/office manage` makes this session the manager of its project:
 // its system prompt gains the manager role, the project's other sessions are told to report
@@ -23,14 +24,15 @@ const SESSIONS = atom({ plugin: 'office', key: 'sessions' } as const, [] as Sess
 type Input = Record<string, unknown>
 
 // This session's project never changes, so one `git rev-parse` serves every prompt.
+// The common dir, not the toplevel: a worker in a worktree belongs to its main repo's project.
 let projectCache: string | undefined
 
 async function projectOfSession($: EngineInterface): Promise<string> {
   if (projectCache !== undefined) return projectCache
   const cwd = await $.session.cwd()
-  const ran = await $.process.run(['git', '-C', cwd, 'rev-parse', '--show-toplevel']).catch(() => undefined)
+  const ran = await $.process.run(projectRootArgv(cwd)).catch(() => undefined)
   if (!ran) return cwd // could not run: decide again next time
-  projectCache = (ran.exitCode === 0 && ran.stdout.trim()) || cwd
+  projectCache = (ran.exitCode === 0 && repoRootFromCommonDir(ran.stdout)) || cwd
   return projectCache
 }
 

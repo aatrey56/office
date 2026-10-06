@@ -36,7 +36,7 @@ export function defaultReviewTarget(porcelain: string, branches: readonly string
  */
 export type CodexTier = { model: string; effort: string }
 export const CODEX_DEFAULTS = {
-  review: { model: 'gpt-6-sol', effort: 'high' }, // /codex-review, codex_review
+  review: { model: 'gpt-6.1-sol', effort: 'high' }, // /codex-review, codex_review
   exec: { model: 'gpt-6-luna', effort: 'medium' }, // codex_exec second opinions
   deep: { model: 'gpt-6-astra', effort: 'high' }, // only `--deep` / deep: true; scarce quota
 } as const satisfies Record<string, CodexTier>

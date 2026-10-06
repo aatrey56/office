@@ -2,15 +2,17 @@ import { crewSheet, LOOKS } from './crew'
 import { blank, load, save, scale, type Img } from './png'
 import { draw, pieces, PALETTES, rgb8, type Piece } from './art'
 
-// The office: 12 x 10 cells of 16 px (192 x 160). Back wall on rows 0-1, open-plan zones below:
-// manager top-left, meeting top-right, coding desks centre-left, break room bottom-right, review bottom-left.
+// The office: 12 x 10 cells of 16 px (192 x 160), laid out like a Pokémon Center: small one-cell
+// pieces and open floor. Back wall on rows 0-1 with the bookshelf, the door (col 6) and the whiteboard
+// (cols 8-9); the manager's desk top-left, the meeting table top-right, four small review desks mid-left,
+// a bank of five PCs along the bottom and a small break room bottom-right.
 export const COLS = 12, ROWS = 10, T = 16
 const P = pieces()
 
 // Every piece in the room, where it goes, and whether its base blocks a walk. Wall pieces
 // (rows 0-1) never block: the wall already does. The floor plan is computed from this list.
-// `tall` pieces (a tree, a cabinet, a chair) block only their base: their top half stands in front of
-// the cell behind. Flat furniture (desks, tables, the couch) blocks all the cells it covers.
+// `tall` pieces (a tree, a cabinet, a chair, a PC) block only their base: their top half stands in front
+// of the cell behind. Flat furniture (desks, tables, the couch) blocks all the cells it covers.
 // Layers: 'wall' is baked into the background tiles (always behind everyone); 'floor' is drawn after
 // the tiles but under everything sorted; 'sorted' (the default) is drawn in bottom-edge order with the crew.
 // `props` are small things on a desk, offset from its top-left, drawn just after it.
@@ -21,33 +23,30 @@ export const PLACEMENTS: Place[] = [
   { piece: 'bookshelf', x: 0, y: 8, blocks: false, layer: 'wall' },
   { piece: 'doorLight', x: 96, y: 2, blocks: false, layer: 'wall' },
   { piece: 'tvBig', x: 127, y: 4, blocks: false, layer: 'wall' },
-  // manager office
+  // manager's corner: the big desk, a chair behind it, a tree
   { piece: 'chairSmall', x: 25, y: 32, blocks: true, tall: true },
   { piece: 'desk', x: 16, y: 48, blocks: true, props: [['paper', 1, 3], ['mug', 24, 2]] },
   { piece: 'tree', x: 56, y: 32, blocks: true, tall: true },
-  // meeting: the big table, chairs either side, a cabinet
-  { piece: 'bigTable', x: 133, y: 48, blocks: true },
+  // coding: five PCs in a row along the bottom, each one cell, the sitter in the cell below
+  ...[1, 2, 3, 4, 5].map(c => ({ piece: 'pcDesk' as const, x: c * T, y: 131, blocks: true, props: [['monitor', 2, -11]] as [keyof typeof P, number, number][] })),
+  // meeting: the big table, two chairs either side, two stools in front, a cabinet in the corner
+  { piece: 'bigTable', x: 126, y: 64, blocks: true },
   { piece: 'cabinetTall', x: 176, y: 32, blocks: true, tall: true },
-  { piece: 'chairSmall', x: 117, y: 47, blocks: true, tall: true },
-  { piece: 'chairSmall', x: 117, y: 63, blocks: true, tall: true },
-  { piece: 'chairSmall', x: 171, y: 63, blocks: true, tall: true },
-  // coding corner: three computer desks on whole cells, a walkway between each pair, chairs on the floor
-  { piece: 'pcDesk', x: 0, y: 88, blocks: true },
-  { piece: 'pcDesk', x: 48, y: 88, blocks: true },
-  { piece: 'pcDesk', x: 96, y: 88, blocks: true },
-  { piece: 'officeChair', x: 8, y: 112, blocks: false, layer: 'floor' },
-  { piece: 'officeChair', x: 56, y: 112, blocks: false, layer: 'floor' },
-  { piece: 'officeChair', x: 104, y: 112, blocks: false, layer: 'floor' },
-  // review corner: two plain desks with no computer
-  { piece: 'desk', x: 16, y: 144, blocks: true, props: [['paper', 1, 3], ['pencilCup', 25, 1]] },
-  { piece: 'desk', x: 64, y: 144, blocks: true, props: [['paper', 2, 3], ['mug', 24, 2]] },
-  { piece: 'fern', x: 114, y: 136, blocks: true, tall: true },
-  // break room
-  { piece: 'sofaA', x: 144, y: 98, blocks: true },
-  { piece: 'fridge', x: 176, y: 95, blocks: true, tall: true },
-  { piece: 'coffeeTable', x: 144, y: 119, blocks: true, props: [['mug', 4, 2], ['mug', 23, 3]] },
-  { piece: 'benchLong', x: 144, y: 144, blocks: true },
-  { piece: 'benchSmall', x: 128, y: 112, blocks: false },
+  { piece: 'chairSmall', x: 110, y: 63, blocks: true, tall: true },
+  { piece: 'chairSmall', x: 110, y: 79, blocks: true, tall: true },
+  { piece: 'chairSmall', x: 164, y: 63, blocks: true, tall: true },
+  { piece: 'chairSmall', x: 164, y: 79, blocks: true, tall: true },
+  { piece: 'stool', x: 129, y: 99, blocks: false, layer: 'floor' },
+  { piece: 'stool', x: 145, y: 99, blocks: false, layer: 'floor' },
+  // review: four small desks in two pairs, the reader behind each
+  { piece: 'deskSmall', x: 0, y: 99, blocks: true, props: [['paper', 2, 1]] },
+  { piece: 'deskSmall', x: 16, y: 99, blocks: true, props: [['mug', 8, 1]] },
+  { piece: 'deskSmall', x: 48, y: 99, blocks: true, props: [['paper', 2, 1]] },
+  { piece: 'deskSmall', x: 64, y: 99, blocks: true, props: [['pencilCup', 9, -1]] },
+  // break room: a couch, a bench facing it, the fridge
+  { piece: 'benchSmall', x: 128, y: 128, blocks: false },
+  { piece: 'sofaA', x: 144, y: 130, blocks: true },
+  { piece: 'fridge', x: 176, y: 135, blocks: true, tall: true },
 ]
 
 // Cells a piece stands on: in this 3/4 view only the lower part of a piece is its base, so a
@@ -71,7 +70,7 @@ export function background(): Img {
   // a dark skirting line where the wall meets the floor
   for (let x = 0; x < img.width; x++) img.data.set([...rgb8(PALETTES.wall![3]!), 255], (2 * T * img.width + x) * 4)
   // break-room rug: checker carpet under the sofa corner
-  for (let r = 6; r <= 9; r++) for (let c = 8; c < 12; c++) draw(img, P.checker!, c * T, r * T)
+  for (let r = 7; r <= 9; r++) for (let c = 8; c < 12; c++) draw(img, P.checker!, c * T, r * T)
   for (const place of PLACEMENTS) if (place.layer === 'wall') draw(img, P[place.piece]!, place.x, place.y)
   return img
 }
