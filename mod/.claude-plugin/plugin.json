@@ -1,6 +1,10 @@
 {
   "name": "office",
-  "version": "0.2.0",
+  "version": "0.3.0",
+  "author": {
+    "name": "Aatrey Sahay",
+    "url": "https://github.com/aatrey56"
+  },
   "description": "Multi-session switchboard: session board + tap-in, Codex review handoff, model router/spawner, manga reader",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -38,8 +42,8 @@
     "codexPath": {
       "type": "string",
       "title": "codex executable",
-      "description": "Path to the codex CLI.",
-      "default": "/opt/homebrew/bin/codex"
+      "description": "The codex CLI: a bare name is looked up on PATH, or give a full path.",
+      "default": "codex"
     },
     "codexReviewModel": {
       "type": "string",

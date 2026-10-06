@@ -992,7 +992,7 @@ async function codexNotReady($: EngineInterface, bin: string, cwd: string): Prom
     const r = await $.process.run([bin, 'login', 'status'], { cwd, timeoutMs: 15000 })
     return r.exitCode === 0 ? undefined : `${CODEX_LOGIN_HINT}\n${(r.stderr || r.stdout).trim()}`
   } catch (err) {
-    return `Could not run codex at ${bin} (${String(err).slice(0, 120)}). Set the office plugin's codexPath.`
+    return `Could not run codex (${bin}): ${String(err).slice(0, 120)}\nInstall the Codex CLI with \`npm install -g @openai/codex\`, or set the office plugin's codexPath to where it lives.`
   }
 }
 

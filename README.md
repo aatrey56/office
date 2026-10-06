@@ -28,16 +28,26 @@ A [Claude Code](https://claude.com/claude-code) mod that turns your sessions int
 
 ## Install
 
-You need a Claude Code build with mod (function-hook plugin) support. The scene, the manga reader and the frame cache assume macOS.
+```sh
+claude plugin marketplace add aatrey56/office
+claude plugin install office@office
+```
+
+You need:
+
+- a Claude Code build with mod (function-hook plugin) support (2.1.289 is known to work);
+- macOS: the scene, the manga reader and the frame cache assume it;
+- for the pixel office, a terminal that speaks the kitty graphics protocol: [Ghostty](https://ghostty.org), kitty, WezTerm or iTerm2. The desktop app shows the text board but not the pictures;
+- optionally, the [Codex CLI](https://github.com/openai/codex) for `/codex-review` (`npm install -g @openai/codex`; the plugin finds it on PATH, or set its `codexPath`).
+
+To work on the plugin, load it from a clone instead:
 
 ```sh
-git clone <this repo> office
+git clone https://github.com/aatrey56/office
 claude --plugin-dir /path/to/office/mod
 # or, for every session:
 export CLAUDE_CODE_PLUGIN_DIRS=/path/to/office/mod
 ```
-
-The pictures need a terminal that speaks the kitty graphics protocol, such as [Ghostty](https://ghostty.org) (kitty, WezTerm and iTerm2 also work). The desktop app shows the text board but not the pictures.
 
 ## Commands and keys
 
