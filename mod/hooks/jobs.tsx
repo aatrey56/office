@@ -752,18 +752,23 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       if (agent === undefined) {
         const misses = (BG_MISSES.get(jobId) ?? 0) + 1
         BG_MISSES.set(jobId, misses)
-        if (misses >= 2) await finishJob($, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)`)
+        if (misses < 2) continue
+        // A worker removed after its last reply may still have finished: its transcript says so.
+        const seen = job.sessionId !== undefined
+          ? await bgSeen($, configDir, job.cwd, job.sessionId).catch(() => ({ tail: '' }) as Seen)
+          : { tail: '' }
+        if (hasDoneMarker(seen.result)) {
+          await finishJob($, jobId, 'done', seen.result ?? '')
+          continue
+        }
+        const last = seen.result ? `\nLast reply:\n${seen.result}` : ''
+        await finishJob($, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)${last}`)
         continue
       }
       BG_MISSES.delete(jobId)
-      let seen: { result?: string; tail: string } = { tail: '' }
-      if (agent.sessionId !== undefined) {
-        const path = await bgTranscript($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
-        const t = path
-          ? await $.process.run(['tail', '-c', '262144', path], { timeoutMs: 10000 }).catch(() => undefined)
-          : undefined
-        if (t !== undefined && t.exitCode === 0) seen = readTranscript(t.stdout)
-      }
+      const seen = agent.sessionId !== undefined
+        ? await bgSeen($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
+        : { tail: '' }
       const phase = bgPhase(agent.state, agent.status)
       const idlePolls = phase === 'idle' && seen.result !== undefined ? (BG_IDLE.get(jobId) ?? 0) + 1 : 0
       BG_IDLE.set(jobId, idlePolls)
@@ -806,6 +811,17 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
   } finally {
     bgPolling = false
   }
+}
+
+type Seen = { result?: string; tail: string }
+
+/** The latest reply and tail of a --bg session's transcript (empty when it cannot be read). */
+async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<Seen> {
+  const path = await bgTranscript($, configDir, cwd, sessionId)
+  const t = path
+    ? await $.process.run(['tail', '-c', '262144', path], { timeoutMs: 10000 }).catch(() => undefined)
+    : undefined
+  return t !== undefined && t.exitCode === 0 ? readTranscript(t.stdout) : { tail: '' }
 }
 
 /** The transcript of a --bg session; a long (cut + hashed) slug is found by its prefix and the session's file. */
