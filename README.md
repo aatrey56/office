@@ -23,21 +23,31 @@ A [Claude Code](https://claude.com/claude-code) mod that turns your sessions int
   - *Model router* (`/route-task`, `/route-eval`): picks a model tier and effort for a task, using a rules backend, Claude, or an external router, and scores itself against labelled tasks in `mod/evals/`.
   - *Workers* (`/spawn`): run a routed task as a background `claude --bg` worker. Workers show up in the office too. A **budget guard** blocks new workers when your rate-limit windows run high.
   - *Worktrees per worker*: a worker started in a git repo works on its own branch in its own git worktree under `~/.claude/office/worktrees/`, commits there, and its result reports the branch, commits and diffstat. A clean worktree is removed when it finishes and the branch stays for review (option `workerWorktree`: `auto` | `off`).
-  - *Codex handoff* (`/codex-review`): Codex reviews the repo in the background.
+  - *Codex handoff* (`/codex-review`): Codex reviews the repo in the background. A **Codex budget guard** reads Codex's 5-hour and weekly usage before each job (free: no message spent), warns from 80% and refuses at 95%, and after a quota hit refuses that model until Codex's reset time. Only a typed `/codex-review --force` overrides.
 - **Manga reader** (`/manga`): reads chapters from `~/Manga/<Series>/` (folders of PNGs or `.cbz`) in a side pane while Claude works.
 
 ## Install
 
-You need a Claude Code build with mod (function-hook plugin) support. The scene, the manga reader and the frame cache assume macOS.
+```sh
+claude plugin marketplace add aatrey56/office
+claude plugin install office@office
+```
+
+You need:
+
+- a Claude Code build with mod (function-hook plugin) support (2.1.289 is known to work);
+- macOS: the scene, the manga reader and the frame cache assume it;
+- for the pixel office, a terminal that speaks the kitty graphics protocol: [Ghostty](https://ghostty.org), kitty, WezTerm or iTerm2. The desktop app shows the text board but not the pictures;
+- optionally, the [Codex CLI](https://github.com/openai/codex) for `/codex-review` (`npm install -g @openai/codex`; the plugin finds it on PATH, or set its `codexPath`).
+
+To work on the plugin, load it from a clone instead:
 
 ```sh
-git clone <this repo> office
+git clone https://github.com/aatrey56/office
 claude --plugin-dir /path/to/office/mod
 # or, for every session:
 export CLAUDE_CODE_PLUGIN_DIRS=/path/to/office/mod
 ```
-
-The pictures need a terminal that speaks the kitty graphics protocol, such as [Ghostty](https://ghostty.org) (kitty, WezTerm and iTerm2 also work). The desktop app shows the text board but not the pictures.
 
 ## Commands and keys
 
@@ -48,7 +58,7 @@ The pictures need a terminal that speaks the kitty graphics protocol, such as [G
 | `/spawn <task>` | Route a task and run it as a background worker |
 | `/route-task <task>` | Dry run: which model and effort the router would pick |
 | `/route-eval [rules\|claude\|jev\|all]` | Score the router against `evals/routing.jsonl` |
-| `/codex-review` | Background Codex review of the repo |
+| `/codex-review [--deep] [--model m] [--force]` | Background Codex review of the repo |
 | `/jobs` | The jobs pane: workers and reviews |
 | `/manga [series]` | Open the manga reader |
 

@@ -51,13 +51,6 @@ export function codexTierArgs(tier: CodexTier, isReview = false): string[] {
   return out
 }
 
-/** `/codex-review` args: `--deep` anywhere asks for the deep tier; the rest is the target. */
-export function splitDeep(raw: string | undefined): { deep: boolean; rest: string } {
-  const words = (raw ?? '').trim().split(/\s+/).filter(Boolean)
-  const deep = words.includes('--deep')
-  return { deep, rest: words.filter(w => w !== '--deep').join(' ') }
-}
-
 /**
  * `codex exec review` (the non-interactive review, with `--json` events and
  * `-o` for the final message). codex 0.142 refuses a [PROMPT] beside

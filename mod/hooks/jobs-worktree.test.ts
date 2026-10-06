@@ -160,6 +160,25 @@ describe('--bg worker finish: the [office: done] marker', () => {
     expect(text).not.toContain('FAILED')
   })
 
+  test('a finished worker removed from the listing is done, not failed (regression, 2026-10-05)', async ($, on) => {
+    let listed = agent('working', 'busy')
+    let last = reply('Renaming x.')
+    fakeRepo(on, { agents: () => listed, transcript: () => last })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000) // the poll learns the session id
+    last = reply('Renamed it.\n[office: done]')
+    listed = '[]'
+    await clock.advance(10_000) // gone for two polls
+    const text = delivered.join('\n')
+    expect(text).toContain('Worker finished: rename x to y')
+    expect(text).toContain('Renamed it.')
+    expect(text).not.toContain('FAILED')
+  })
+
   test('blocked without the marker still waits for input', async ($, on) => {
     fakeRepo(on, { agents: () => agent('blocked'), transcript: () => reply('Rename x in tests too?') })
     const clock = mock.clock(on)

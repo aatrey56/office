@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "office",
+  "description": "The office Claude Code plugin: session board, pixel office, Codex review handoff, model router",
+  "owner": {
+    "name": "Aatrey Sahay",
+    "url": "https://github.com/aatrey56"
+  },
+  "plugins": [
+    {
+      "name": "office",
+      "source": "./mod",
+      "description": "Multi-session switchboard: session board + tap-in, Codex review handoff, model router/spawner, manga reader",
+      "author": {
+        "name": "Aatrey Sahay",
+        "url": "https://github.com/aatrey56"
+      },
+      "homepage": "https://github.com/aatrey56/office",
+      "license": "MIT"
+    }
+  ]
+}

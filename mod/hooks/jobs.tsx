@@ -1,10 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
+import type { AgentSpawnInput, EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-import type { BudgetCaps, Effort, EvalReport, Job, ModelTier, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
-import { budgetVerdict, DEFAULT_CAPS, isSmallRoute } from './budget'
+import type { BudgetCaps, Effort, EvalReport, Job, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
+import type { AgentDef, AgentPin } from './agentguard'
+import { agentGuard, agentRouteText, hardDeny, isManagerSession, needsRoute, parseAgentFile, pinOf } from './agentguard'
+import { budgetVerdict, DEFAULT_CAPS, isSmallRoute, tierOfModelId } from './budget'
 import { formatSets, parseCases, scoreRoutes } from './evals'
-import { finishedLine, foldInbox, formatInbox, INBOX_PATH, routedLine } from './inbox'
+import { endLine, finishedLine, foldInbox, formatInbox, INBOX_PATH, routeLine, routedLine } from './inbox'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -18,9 +20,18 @@ import {
   CODEX_DEFAULTS,
   defaultReviewTarget,
   parseReviewTarget,
-  splitDeep,
 } from './codex'
 import type { CodexTier, ReviewTarget } from './codex'
+import {
+  CODEX_LIMITS_REQUEST,
+  CODEX_OUT_FALLBACK_MS,
+  codexGuardVerdict,
+  codexLimitsArgv,
+  codexLimitsFrom,
+  codexResetAt,
+  parseCodexReviewArgs,
+} from './codex-budget'
+import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
 import {
   CLAUDE_SYSTEM,
   claudePrompt,
@@ -109,6 +120,12 @@ let jevKeyCache: { key?: string; at: number } | undefined
 const WORKER_ENV = { [WORKER_ENV_NAME]: WORKER_ENV_VALUE }
 /** $.store key: the --bg ids this plugin started (counted against maxWorkers across sessions). */
 const BG_STORE_KEY = 'bgIds'
+/** $.store keys: Codex's last read rate limits, and the models out of quota until their reset. */
+const CODEX_LIMITS_KEY = 'codexLimits'
+const CODEX_OUT_KEY = 'codexOut'
+const CODEX_LIMITS_TIMEOUT_MS = 6000
+/** $.store key manage.tsx keeps: project root → its manager session. */
+const MANAGERS_KEY = 'managers'
 
 type Input = Record<string, unknown>
 type LineEvent = { tail?: string; result?: string; isError?: boolean; error?: string; costUsd?: number }
@@ -140,6 +157,10 @@ const BLOCKED_AT = new Map<string, number>()
 const TIMERS = new Map<string, Timer>()
 /** Whether the main loop is mid-turn (an appended row is then read at once). */
 let mainTurnRunning = false
+/** Agent calls the router sized in a manager session, awaiting their turn.complete: agentId → inbox id and start. */
+const SIZED_AGENTS = new Map<string, { id: string; startedAt: number }>()
+/** Where the engine says an agent type comes from (agent.offer's `source`), by type. */
+const OFFERED = new Map<string, string>()
 
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined
@@ -177,7 +198,7 @@ export function installJobs(on: On, options: PluginOptions) {
       await $.command.register({
         name: 'codex-review',
         description: 'Codex reviews this repo in the background (dirty tree: uncommitted; else vs main/master)',
-        argumentHint: '[--deep] [base|--uncommitted|--commit <sha>]',
+        argumentHint: '[--deep] [--model m] [--force] [base|--uncommitted|--commit <sha>]',
       })
       await $.command.register({
         name: 'spawn',
@@ -220,12 +241,41 @@ export function installJobs(on: On, options: PluginOptions) {
   })
 
   on('agent.offer', { agent: /^office:worker-/ }, () => ({ isOffered: false }))
+  // Only general-purpose is ever sized among the built-ins: its source says it is the built-in.
+  on('agent.offer', { agent: 'general-purpose' }, ($, e, next) => {
+    OFFERED.set(e.agent, e.source)
+    return next(e)
+  })
+
+  // A manager's own Agent calls pass the budget guard, the router and the routing inbox, as
+  // spawn_worker does. A failure here lets the spawn through unchanged.
+  on('agent.spawn', async ($, e, next) => {
+    let plan: AgentPlan
+    try {
+      plan = next.origin.plugin === 'engine' ? await planAgent($, options, e) : {}
+    } catch (err) {
+      debugLog($, `office: agent guard skipped for ${e.tool_use_id}: ${String(err)}`)
+      return next(e)
+    }
+    if (plan.deny !== undefined) return { deny: plan.deny }
+    const spawned = await next(plan.model !== undefined ? { ...e, model: plan.model } : e)
+    if (plan.routed !== undefined && spawned.deny === undefined) {
+      try {
+        const now = Date.now()
+        logInbox($, routeLine(e.tool_use_id, plan.routed, e.prompt, now))
+        if (spawned.agentId !== undefined) SIZED_AGENTS.set(spawned.agentId, { id: e.tool_use_id, startedAt: now })
+      } catch (err) {
+        debugLog($, `office: agent ${e.tool_use_id} not logged: ${String(err)}`)
+      }
+    }
+    return spawned
+  })
 
   // ── tools ───────────────────────────────────────────────────────────────
   on('tool.call', { tool: 'mcp__office__codex_review' }, async ($, e) => {
     const input = e as unknown as Input
     const deep = input.deep === true
-    const msg = await startCodexReview($, options, str(input.target), str(input.instructions), str(input.cwd), deep)
+    const msg = await startCodexReview($, options, str(input.target), str(input.instructions), str(input.cwd), deep, BY_AGENT_CODEX)
     return msg.ok ? { result: msg.text } : { deny: msg.text }
   })
 
@@ -254,8 +304,8 @@ export function installJobs(on: On, options: PluginOptions) {
 
   // ── commands ────────────────────────────────────────────────────────────
   on('command.run', { command: 'codex-review' }, async ($, e) => {
-    const { deep, rest } = splitDeep(e.args)
-    const msg = await startCodexReview($, options, str(rest), undefined, undefined, deep)
+    const { deep, force, model, rest } = parseCodexReviewArgs(e.args)
+    const msg = await startCodexReview($, options, str(rest), undefined, undefined, deep, { isForced: force, model })
     return { text: msg.text }
   })
 
@@ -353,6 +403,11 @@ export function installJobs(on: On, options: PluginOptions) {
     if (agentId === undefined) {
       mainTurnRunning = false
       return next(e)
+    }
+    const sized = SIZED_AGENTS.get(agentId)
+    if (sized !== undefined) {
+      SIZED_AGENTS.delete(agentId)
+      logInbox($, endLine(sized.id, e.reason === 'answer' ? 'done' : 'failed', sized.startedAt, Date.now()))
     }
     const jobId = SUBAGENT_JOBS.get(agentId)
     if (jobId !== undefined) {
@@ -752,18 +807,23 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       if (agent === undefined) {
         const misses = (BG_MISSES.get(jobId) ?? 0) + 1
         BG_MISSES.set(jobId, misses)
-        if (misses >= 2) await finishJob($, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)`)
+        if (misses < 2) continue
+        // A worker removed after its last reply may still have finished: its transcript says so.
+        const seen = job.sessionId !== undefined
+          ? await bgSeen($, configDir, job.cwd, job.sessionId).catch(() => ({ tail: '' }) as Seen)
+          : { tail: '' }
+        if (hasDoneMarker(seen.result)) {
+          await finishJob($, jobId, 'done', seen.result ?? '')
+          continue
+        }
+        const last = seen.result ? `\nLast reply:\n${seen.result}` : ''
+        await finishJob($, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)${last}`)
         continue
       }
       BG_MISSES.delete(jobId)
-      let seen: { result?: string; tail: string } = { tail: '' }
-      if (agent.sessionId !== undefined) {
-        const path = await bgTranscript($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
-        const t = path
-          ? await $.process.run(['tail', '-c', '262144', path], { timeoutMs: 10000 }).catch(() => undefined)
-          : undefined
-        if (t !== undefined && t.exitCode === 0) seen = readTranscript(t.stdout)
-      }
+      const seen = agent.sessionId !== undefined
+        ? await bgSeen($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
+        : { tail: '' }
       const phase = bgPhase(agent.state, agent.status)
       const idlePolls = phase === 'idle' && seen.result !== undefined ? (BG_IDLE.get(jobId) ?? 0) + 1 : 0
       BG_IDLE.set(jobId, idlePolls)
@@ -806,6 +866,17 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
   } finally {
     bgPolling = false
   }
+}
+
+type Seen = { result?: string; tail: string }
+
+/** The latest reply and tail of a --bg session's transcript (empty when it cannot be read). */
+async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<Seen> {
+  const path = await bgTranscript($, configDir, cwd, sessionId)
+  const t = path
+    ? await $.process.run(['tail', '-c', '262144', path], { timeoutMs: 10000 }).catch(() => undefined)
+    : undefined
+  return t !== undefined && t.exitCode === 0 ? readTranscript(t.stdout) : { tail: '' }
 }
 
 /** The transcript of a --bg session; a long (cut + hashed) slug is found by its prefix and the session's file. */
@@ -951,6 +1022,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
 
   let status: 'done' | 'failed' = 'done'
   let final = result ?? ''
+  let quotaText: string | undefined
   if (startError !== undefined) {
     status = 'failed'
     final = `could not run ${plan.argv[0]}: ${startError}`
@@ -960,13 +1032,17 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     const quota = plan.codexModel !== undefined ? codexQuotaMessage(`${why}\n${stderr}`, plan.codexModel) : undefined
     const hint = plan.codexModel !== undefined ? codexFailureHint(`${why}\n${stderr}`) : ''
     final = quota ?? [`exit ${exit?.code ?? exit?.signal ?? '?'}: ${why}`, hint, result ?? ''].filter(Boolean).join('\n')
+    if (quota !== undefined) quotaText = `${why}\n${stderr}`
   }
   if (!final) final = lastLine(stderr) || '(no output)'
   if (costUsd !== undefined) {
     const cost = costUsd
     await patchJob($, jobId, j => ({ ...j, costUsd: cost }))
   }
+  // Marked before delivery, so a job started on reading the result already meets the guard.
+  if (plan.codexModel !== undefined && quotaText !== undefined) await markCodexOut($, plan.codexModel, quotaText)
   await finishJob($, jobId, status, final)
+  if (plan.codexModel !== undefined) void readCodexLimits($, plan.argv[0]!, plan.cwd)
 }
 
 // ── codex ───────────────────────────────────────────────────────────────
@@ -976,8 +1052,63 @@ async function codexNotReady($: EngineInterface, bin: string, cwd: string): Prom
     const r = await $.process.run([bin, 'login', 'status'], { cwd, timeoutMs: 15000 })
     return r.exitCode === 0 ? undefined : `${CODEX_LOGIN_HINT}\n${(r.stderr || r.stdout).trim()}`
   } catch (err) {
-    return `Could not run codex at ${bin} (${String(err).slice(0, 120)}). Set the office plugin's codexPath.`
+    return `Could not run codex (${bin}): ${String(err).slice(0, 120)}\nInstall the Codex CLI with \`npm install -g @openai/codex\`, or set the office plugin's codexPath to where it lives.`
   }
+}
+
+/** Who asked for a Codex job: only the person's typed /codex-review sets `isForced` or `model`. */
+type CodexAsk = { isForced: boolean; model?: string }
+const BY_AGENT_CODEX: CodexAsk = { isForced: false }
+
+/**
+ * Codex's rate limits, read live through `codex app-server` (no message spent)
+ * and kept in $.store; undefined when it does not answer in time.
+ */
+async function readCodexLimits($: EngineInterface, bin: string, cwd: string): Promise<CodexLimits | undefined> {
+  const stream = $.process.spawn({ argv: codexLimitsArgv(bin), cwd, input: CODEX_LIMITS_REQUEST })
+  const timer = $.clock.after(CODEX_LIMITS_TIMEOUT_MS, () => void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined))
+  let out = ''
+  let limits: CodexLimits | undefined
+  try {
+    for await (const chunk of stream) {
+      if (chunk.stream !== 'stdout') continue
+      out = (out + chunk.text).slice(-65536)
+      limits = codexLimitsFrom(out, Date.now())
+      if (limits) break // leaving the loop ends the child
+    }
+  } catch {
+    // codex missing or app-server refused: the stored read stands
+  } finally {
+    timer.cancel()
+  }
+  if (limits) await $.store.set(CODEX_LIMITS_KEY, limits).catch(() => undefined)
+  return limits
+}
+
+async function storedCodexOut($: EngineInterface): Promise<CodexOut> {
+  const stored = await $.store.get(CODEX_OUT_KEY).catch(() => undefined)
+  return stored !== null && typeof stored === 'object' ? (stored as CodexOut) : {}
+}
+
+/** A quota hit: the model is out until codex's reset time (an hour when it named none). */
+async function markCodexOut($: EngineInterface, model: string, errorText: string): Promise<void> {
+  const now = Date.now()
+  const until = codexResetAt(errorText, now) ?? now + CODEX_OUT_FALLBACK_MS
+  const kept = Object.fromEntries(Object.entries(await storedCodexOut($)).filter(([, o]) => o.until > now))
+  await $.store.set(CODEX_OUT_KEY, { ...kept, [model]: { until, note: lastLine(errorText) } }).catch(() => undefined)
+}
+
+/** The budget guard before a Codex job: a live read of the limits, else the last one kept. */
+async function codexGuard($: EngineInterface, bin: string, cwd: string, model: string, isForced: boolean): Promise<CodexVerdict> {
+  const out = await storedCodexOut($)
+  const limits =
+    (await readCodexLimits($, bin, cwd)) ??
+    ((await $.store.get(CODEX_LIMITS_KEY).catch(() => undefined)) as CodexLimits | undefined)
+  return codexGuardVerdict(model, Date.now(), { limits: Array.isArray(limits?.buckets) ? limits : undefined, out }, isForced)
+}
+
+function refusedText(verdict: { reason: string }, ask: CodexAsk): string {
+  return `${verdict.reason} ${ask === BY_AGENT_CODEX ? 'Only the person can override, with /codex-review --force.' : '/codex-review --force overrides.'}`
 }
 
 async function failedJob($: EngineInterface, job: Job, why: string): Promise<Started> {
@@ -992,14 +1123,18 @@ async function startCodexReview(
   instructions: string | undefined,
   cwdArg: string | undefined,
   deep: boolean,
+  ask: CodexAsk,
 ): Promise<Started> {
   const full = await capacityError($, options)
   if (full) return { ok: false, text: full }
   const cwd = await resolveCwd($, cwdArg)
   const bin = opt(options, 'codexPath', 'codex')
-  const tier: CodexTier = deep
+  const base: CodexTier = deep
     ? { model: opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model), effort: CODEX_DEFAULTS.deep.effort }
     : { model: opt(options, 'codexReviewModel', CODEX_DEFAULTS.review.model), effort: CODEX_DEFAULTS.review.effort }
+  const tier: CodexTier = ask.model !== undefined ? { ...base, model: ask.model } : base
+  const verdict = await codexGuard($, bin, cwd, tier.model, ask.isForced)
+  if (!verdict.isAllowed) return { ok: false, text: refusedText(verdict, ask) }
   const now = Date.now()
   let target: ReviewTarget | undefined = parseReviewTarget(targetArg)
   if (targetArg && !target) return { ok: false, text: `Unknown review target "${targetArg}".` }
@@ -1040,7 +1175,7 @@ async function startCodexReview(
   $.clock.after(0, () => void runJob($, options, job, plan))
   return {
     ok: true,
-    text: `Started Codex review job ${job.id} (${target.label}) in ${cwd}. It runs in the background; the review is appended to this conversation when it finishes. /jobs shows progress.`,
+    text: `Started Codex review job ${job.id} (${target.label}, ${tier.model}) in ${cwd}. It runs in the background; the review is appended to this conversation when it finishes. /jobs shows progress.${verdict.warning ? ` Budget: ${verdict.warning}` : ''}`,
   }
 }
 
@@ -1055,6 +1190,9 @@ async function startCodexExec(
   const cwd = await resolveCwd($, cwdArg)
   const bin = opt(options, 'codexPath', 'codex')
   const tier: CodexTier = { model: opt(options, 'codexExecModel', CODEX_DEFAULTS.exec.model), effort: CODEX_DEFAULTS.exec.effort }
+  // codex_exec is only ever an agent's call: the guard holds, with no override.
+  const verdict = await codexGuard($, bin, cwd, tier.model, false)
+  if (!verdict.isAllowed) return { ok: false, text: refusedText(verdict, BY_AGENT_CODEX) }
   const now = Date.now()
   const job: Job = {
     id: newJobId(now),
@@ -1083,7 +1221,7 @@ async function startCodexExec(
   $.clock.after(0, () => void runJob($, options, job, plan))
   return {
     ok: true,
-    text: `Started Codex job ${job.id} (read-only sandbox) in ${cwd}. Its answer is appended to this conversation when it finishes. /jobs shows progress.`,
+    text: `Started Codex job ${job.id} (read-only sandbox) in ${cwd}. Its answer is appended to this conversation when it finishes. /jobs shows progress.${verdict.warning ? ` Budget: ${verdict.warning}` : ''}`,
   }
 }
 
@@ -1108,14 +1246,6 @@ function budgetCaps(options: PluginOptions): BudgetCaps {
     softSevenDayPct: num(options, 'budgetSoftSevenDayPct', DEFAULT_CAPS.softSevenDayPct),
     hardPct: num(options, 'budgetHardPct', DEFAULT_CAPS.hardPct),
   }
-}
-
-/** The tier a full model id belongs to, for sizing a model the caller named; unknown ids count as large. */
-function tierOfModelId(modelId: string): ModelTier {
-  if (modelId.includes('haiku')) return 'haiku'
-  if (modelId.includes('sonnet')) return 'sonnet'
-  if (modelId.includes('fable')) return 'fable'
-  return 'opus'
 }
 
 async function startWorker(
@@ -1238,6 +1368,81 @@ async function startWorker(
     ok: true,
     text: `Started headless worker job ${job.id} on ${how} ${where} Its result is appended to this conversation when it finishes; /jobs shows progress.`,
   }
+}
+
+// ── the Agent tool in manager sessions ($ halves; the rules are in agentguard.ts) ──
+
+/** What the agent.spawn hook does: refuse, set the model, and the route to log; {} leaves the spawn alone. */
+type AgentPlan = { deny?: string; model?: string; routed?: RouteDecision }
+
+function debugLog($: EngineInterface, text: string): void {
+  try {
+    $.ui.log(text, { to: 'debug' })
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * Only a session that manages a project now, and never an office worker. Budget first: past the
+ * hard line every agent is refused before anything else is read or routed.
+ */
+async function planAgent($: EngineInterface, options: PluginOptions, e: AgentSpawnInput): Promise<AgentPlan> {
+  if ((await $.env.get('OFFICE_WORKER')) !== undefined) return {}
+  if (!isManagerSession(await $.store.get(MANAGERS_KEY), await $.session.id())) return {}
+  const windows = await rateWindows($)
+  const caps = budgetCaps(options)
+  const hard = hardDeny(windows, caps)
+  if (hard !== undefined) return { deny: hard }
+  const pin = await agentPin($, e)
+  const routed = needsRoute(windows, caps, pin, e.parentModel)
+    ? await route($, options, agentRouteText(e.description, e.prompt))
+    : undefined
+  const verdict = agentGuard(windows, caps, pin, e.parentModel, routed)
+  if ('deny' in verdict) return { deny: verdict.deny }
+  if (verdict.size === undefined || routed === undefined) return {}
+  return { model: modelIdFor(verdict.size, Date.now()), routed }
+}
+
+/** What pins this spawn's model; a definition that cannot be read leaves it unknown, so never overridden. */
+async function agentPin($: EngineInterface, e: AgentSpawnInput): Promise<AgentPin> {
+  const base = { callModel: e.model, isFork: e.fork, type: e.subagentType, offeredAs: OFFERED.get(e.subagentType) }
+  try {
+    const envModel = str(await $.env.get('CLAUDE_CODE_SUBAGENT_MODEL'))
+    return pinOf({ ...base, ...(await agentDefs($)), envModel })
+  } catch (err) {
+    debugLog($, `office: agent definitions not read: ${String(err)}`)
+    return pinOf({ ...base, defs: [], isComplete: false })
+  }
+}
+
+/**
+ * The agent files the engine reads, nearest first: .claude/agents in the session's folder and
+ * each folder above it, then the user's. isComplete is false when any of them could not be read.
+ */
+async function agentDefs($: EngineInterface): Promise<{ defs: AgentDef[]; isComplete: boolean }> {
+  const dirs: string[] = []
+  let dir = (await $.session.cwd()).replace(/\/+$/, '')
+  while (dir !== '') {
+    dirs.push(`${dir}/.claude/agents`)
+    dir = dir.slice(0, dir.lastIndexOf('/'))
+  }
+  dirs.push(`${(await configDirOf($)).replace(/\/+$/, '')}/agents`)
+  const defs: AgentDef[] = []
+  let isComplete = true
+  for (const d of [...new Set(dirs)]) {
+    try {
+      if (!(await $.fs.exists(d))) continue
+      for (const entry of await $.fs.list(d)) {
+        if (entry.kind === 'dir' || !entry.name.endsWith('.md')) continue
+        const def = parseAgentFile(await $.fs.read(`${d}/${entry.name}`))
+        if (def !== undefined) defs.push(def)
+      }
+    } catch {
+      isComplete = false
+    }
+  }
+  return { defs, isComplete }
 }
 
 // ── worker worktrees ($ halves; the argv and texts are in worktree.ts) ───
