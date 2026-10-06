@@ -143,6 +143,34 @@ export const WORKER_ENV_NAME = 'OFFICE_WORKER'
 export const WORKER_ENV_VALUE = '1'
 export const WORKER_SETTINGS = JSON.stringify({ env: { [WORKER_ENV_NAME]: WORKER_ENV_VALUE } })
 
+// Seen with claude 2.1.289 (2026-10-05): a worker that finished and wrote its
+// report may end at 'blocked', 'working'/'idle' or 'done', so the state alone
+// cannot tell "finished" from "waiting on a person". Every worker is told to
+// end a finished task's reply with this line; its presence is the contract.
+export const DONE_MARKER = '[office: done]'
+export const DONE_RULE =
+  `When the task is complete, end your final reply with the line ${DONE_MARKER}\n` +
+  'If you need an answer from a person, ask it and do not write that line.'
+
+/** The task as a worker gets it: the done rule follows it. */
+export function withDoneRule(task: string): string {
+  return `${task}\n\n${DONE_RULE}`
+}
+
+const isMarkerLine = (line: string) => line.trim().replace(/^[`*_]+|[`*_]+$/g, '') === DONE_MARKER
+
+/** True when the reply's last non-blank line is the done marker. */
+export function hasDoneMarker(text: string | undefined): boolean {
+  const lines = (text ?? '').split('\n').filter(l => l.trim() !== '')
+  const last = lines[lines.length - 1]
+  return last !== undefined && isMarkerLine(last)
+}
+
+/** The reply without its marker line(s), for delivery. */
+export function withoutDoneMarker(text: string): string {
+  return text.split('\n').filter(l => !isMarkerLine(l)).join('\n').trimEnd()
+}
+
 /** `claude agents --json` states: done ends a job well; these end it badly. */
 export const BG_FAILED_STATES: readonly string[] = ['failed', 'stopped', 'error', 'errored', 'killed']
 // Seen with claude 2.1.289 (2026-10-05): a worker whose turn ended can stay at

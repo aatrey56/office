@@ -7,7 +7,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 
 // A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
 // (or `bg`), `claude agents` lists what `agents()` says.
-function fakeRepo(on: On, fake: { bg?: string; agents?: () => string } = {}) {
+function fakeRepo(on: On, fake: { bg?: string; agents?: () => string; transcript?: () => string } = {}) {
   const runs: { argv: string[]; cwd?: string }[] = []
   mock.store(on)
   mock.env(on, { HOME: '/home/me', CLAUDE_CONFIG_DIR: '/cfg' })
@@ -24,6 +24,7 @@ function fakeRepo(on: On, fake: { bg?: string; agents?: () => string } = {}) {
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
     if (argv.includes('--bg')) return out(fake.bg ?? 'backgrounded · 5ac0f0df\n')
     if (argv.includes('agents')) return out(fake.agents?.() ?? '[]')
+    if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
     return out('') // worktree add / remove, status: clean
   })
   return runs
@@ -43,7 +44,8 @@ describe('worker worktrees', () => {
     const bg = runs.find(run => run.argv.includes('--bg'))
     expect(bg?.cwd).toBe(dir)
     expect(bg?.argv.at(-1)).toContain(`branch ${branch}`)
-    expect(bg?.argv.at(-1)).toMatch(/rename x to y$/)
+    expect(bg?.argv.at(-1)).toContain('Task:\nrename x to y')
+    expect(bg?.argv.at(-1)).toContain('end your final reply with the line [office: done]')
     expect(JSON.stringify(r.result)).toContain(branch)
   })
 
@@ -108,6 +110,68 @@ describe('worker worktrees', () => {
     await clock.advance(70_000) // the next poll resumes the timeout, a full minute from then
     expect(runs.some(run => run.argv.includes('stop'))).toBe(true)
     expect(delivered.join('\n')).toContain('timed out')
+  })
+})
+
+describe('--bg worker finish: the [office: done] marker', () => {
+  const reply = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } })
+  const agent = (state: string, status = 'idle') =>
+    `[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"${state}","status":"${status}"}]`
+
+  // What the session start needs; the start arms the 5 s poll of `claude agents`.
+  function stubStart(on: On) {
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+  }
+  const START = { cwd: '/r', surface: 'terminal', isInteractive: true } as const
+
+  test('a finished worker left at state blocked is done and frees its slot (regression, 2026-10-05)', { options: { maxWorkers: 1 } }, async ($, on) => {
+    let state = 'blocked'
+    const runs = fakeRepo(on, { agents: () => agent(state), transcript: () => reply('Renamed it.\n\n[office: done]') })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000)
+    const text = delivered.join('\n')
+    expect(text).toContain('Worker finished: rename x to y')
+    expect(text).toContain('Renamed it.')
+    expect(text).not.toContain('[office: done]')
+    expect(text).not.toContain('waiting for input')
+    expect(runs.some(run => run.argv.join(' ').endsWith('stop 5ac0f0df'))).toBe(true)
+    state = 'stopped' // what `claude stop` leaves: the slot is free for the next worker
+    const next = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'tidy it', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    expect(JSON.stringify(next)).toContain('Started background worker')
+  })
+
+  test('a finished worker stopped by hand is done, not failed (regression, 2026-10-05)', async ($, on) => {
+    fakeRepo(on, { agents: () => agent('stopped'), transcript: () => reply('Renamed it.\n[office: done]') })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000)
+    const text = delivered.join('\n')
+    expect(text).toContain('Worker finished: rename x to y')
+    expect(text).not.toContain('FAILED')
+  })
+
+  test('blocked without the marker still waits for input', async ($, on) => {
+    fakeRepo(on, { agents: () => agent('blocked'), transcript: () => reply('Rename x in tests too?') })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000)
+    const text = delivered.join('\n')
+    expect(text).toContain('is waiting for input')
+    expect(text).toContain('Rename x in tests too?')
+    expect(text).not.toContain('Worker finished')
   })
 })
 

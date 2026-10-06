@@ -39,6 +39,7 @@ import {
   capResult,
   deliveryText,
   formatElapsed,
+  hasDoneMarker,
   headlessArgv,
   lastLine,
   isLive,
@@ -60,6 +61,8 @@ import {
   WORKER_AGENT_SPECS,
   WORKER_ENV_NAME,
   WORKER_ENV_VALUE,
+  withDoneRule,
+  withoutDoneMarker,
   workerAgentName,
 } from './spawn'
 import type { WorkerMode } from './spawn'
@@ -578,7 +581,7 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   if (before === undefined || !isLive(before)) return
   if (before.agentId !== undefined) SUBAGENT_JOBS.delete(before.agentId)
   const endedAt = Date.now()
-  const capped = capResult(result)
+  const capped = capResult(withoutDoneMarker(result))
   const list = await update($, JOBS, jobs =>
     withJob(jobs, id, j => (isLive(j) ? { ...j, status, endedAt, result: capped } : j)),
   )
@@ -716,10 +719,11 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       const phase = bgPhase(agent.state, agent.status)
       const idlePolls = phase === 'idle' && seen.result !== undefined ? (BG_IDLE.get(jobId) ?? 0) + 1 : 0
       BG_IDLE.set(jobId, idlePolls)
-      if (phase === 'done' || idlePolls >= 2) {
+      // The marker says the task is complete whatever the state (blocked, idle, even stopped).
+      if (phase === 'done' || idlePolls >= 2 || hasDoneMarker(seen.result)) {
         await finishJob($, jobId, 'done', seen.result ?? '(the session ended without a reply)')
         // The conversation is kept; the idle ~300 MB process is not needed.
-        void $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
+        if (phase !== 'failed') void $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
         continue
       }
       if (phase === 'failed') {
@@ -1107,6 +1111,7 @@ async function startWorker(
     tail: '',
   })
   const job = placed.job
+  const workerTask = withDoneRule(placed.task)
   const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}${verdict.warning ? `. Budget: ${verdict.warning}` : ''}`
   const where = `in ${job.cwd}.${placed.note ? ` ${placed.note}` : ''}`
   // A start that failed gives back its fresh worktree and branch (both refuse to go if any work is there).
@@ -1115,7 +1120,7 @@ async function startWorker(
   if (mode === 'subagent') {
     const spawned = await $.agent
       .spawn({
-        prompt: placed.task,
+        prompt: workerTask,
         model: modelId,
         description: job.title.slice(0, 40),
         subagentType: `office:${workerAgentName(effort)}`,
@@ -1138,7 +1143,7 @@ async function startWorker(
   if (mode === 'bg') {
     const spawnedAt = Date.now() - 2000
     const r = await $.process
-      .run(bgArgv(claudeBin, modelId, effort, permissionMode, placed.task), { cwd: job.cwd, env: WORKER_ENV, timeoutMs: 60000 })
+      .run(bgArgv(claudeBin, modelId, effort, permissionMode, workerTask), { cwd: job.cwd, env: WORKER_ENV, timeoutMs: 60000 })
       .catch((err: unknown) => ({ exitCode: 1, stdout: '', stderr: String(err) }))
     let bgId = r.exitCode === 0 ? parseBgId(r.stdout) : undefined
     if (bgId === undefined && r.exitCode === 0) {
@@ -1167,7 +1172,7 @@ async function startWorker(
   const plan: RunPlan = {
     argv: headlessArgv(claudeBin, modelId, effort, permissionMode),
     cwd: job.cwd,
-    input: placed.task, // stdin, never argv: a task led by "-" would parse as a flag
+    input: workerTask, // stdin, never argv: a task led by "-" would parse as a flag
     label: 'Worker',
     parse: parseStreamJsonLine,
   }
