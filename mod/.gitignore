@@ -2,3 +2,4 @@
 evals/results/
 node_modules/
 evals/routing.local.jsonl
+evals/routing.inbox.jsonl

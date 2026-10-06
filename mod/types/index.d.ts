@@ -53,6 +53,7 @@ export type Job = {
   worktree?: string // worker: its own git worktree dir, while that exists
   branch?: string // worker: the branch its worktree is on (kept after the worktree goes)
   baseRef?: string // worker: the commit its branch started from
+  costUsd?: number // headless worker: total_cost_usd from its stream-json result
 }
 
 // ── manga (manga.tsx) ────────────────────────────────────────────────────
