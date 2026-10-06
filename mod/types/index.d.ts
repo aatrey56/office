@@ -49,6 +49,10 @@ export type Job = {
   bgId?: string // bg-mode worker: the short id `claude --bg` printed (attach/logs/stop take it)
   sessionId?: string // bg-mode worker: its session id (names its transcript)
   isSelected?: boolean // the /jobs pane's selection (at most one job)
+  project?: string // worker: the main repo root it works for (a worktree's cwd is not it)
+  worktree?: string // worker: its own git worktree dir, while that exists
+  branch?: string // worker: the branch its worktree is on (kept after the worktree goes)
+  baseRef?: string // worker: the commit its branch started from
 }
 
 // ── manga (manga.tsx) ────────────────────────────────────────────────────

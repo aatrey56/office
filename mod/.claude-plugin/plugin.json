@@ -65,6 +65,16 @@
       "description": "The claude CLI used for headless workers.",
       "default": "claude"
     },
+    "workerWorktree": {
+      "type": "string",
+      "title": "Worker worktrees",
+      "description": "auto: a worker started in a git repo runs on its own branch in its own git worktree; off: workers run in the given folder.",
+      "options": [
+        "auto",
+        "off"
+      ],
+      "default": "auto"
+    },
     "workerPermissionMode": {
       "type": "string",
       "title": "Headless worker permission mode",
