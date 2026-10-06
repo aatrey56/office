@@ -3,9 +3,9 @@ import { blank, load, save, scale, type Img } from './png'
 import { draw, pieces, PALETTES, rgb8, type Piece } from './art'
 
 // The office: 12 x 10 cells of 16 px (192 x 160), laid out like a Pokémon Center: small one-cell
-// pieces and open floor. Back wall on rows 0-1 with the door (col 6) and the whiteboard (cols 8-9);
-// a bank of five PCs against the wall top-left, the meeting table top-right, four small review desks
-// mid-left, the manager's desk in the bottom-left corner and a small break room bottom-right.
+// pieces and open floor. Back wall on rows 0-1 with the bookshelf, the door (col 6) and the whiteboard
+// (cols 8-9); the manager's desk top-left, the meeting table top-right, four small review desks mid-left,
+// a bank of five PCs along the bottom and a small break room bottom-right.
 export const COLS = 12, ROWS = 10, T = 16
 const P = pieces()
 
@@ -19,11 +19,16 @@ const P = pieces()
 export type Layer = 'wall' | 'floor' | 'sorted'
 type Place = { piece: keyof typeof P; x: number; y: number; blocks: boolean; tall?: true; layer?: Layer; props?: [keyof typeof P, number, number][] }
 export const PLACEMENTS: Place[] = [
-  // on the back wall: the door with its light spilling in, the whiteboard
+  // on the back wall: bookshelf, the door with its light spilling in, the whiteboard
+  { piece: 'bookshelf', x: 0, y: 8, blocks: false, layer: 'wall' },
   { piece: 'doorLight', x: 96, y: 2, blocks: false, layer: 'wall' },
   { piece: 'tvBig', x: 127, y: 4, blocks: false, layer: 'wall' },
-  // coding: five PCs in a row against the back wall, each one cell, the sitter in the cell below
-  ...[0, 1, 2, 3, 4].map(c => ({ piece: 'pcDesk' as const, x: c * T, y: 35, blocks: true, props: [['monitor', 2, -11]] as [keyof typeof P, number, number][] })),
+  // manager's corner: the big desk, a chair behind it, a tree
+  { piece: 'chairSmall', x: 25, y: 32, blocks: true, tall: true },
+  { piece: 'desk', x: 16, y: 48, blocks: true, props: [['paper', 1, 3], ['mug', 24, 2]] },
+  { piece: 'tree', x: 56, y: 32, blocks: true, tall: true },
+  // coding: five PCs in a row along the bottom, each one cell, the sitter in the cell below
+  ...[1, 2, 3, 4, 5].map(c => ({ piece: 'pcDesk' as const, x: c * T, y: 131, blocks: true, props: [['monitor', 2, -11]] as [keyof typeof P, number, number][] })),
   // meeting: the big table, two chairs either side, two stools in front, a cabinet in the corner
   { piece: 'bigTable', x: 126, y: 64, blocks: true },
   { piece: 'cabinetTall', x: 176, y: 32, blocks: true, tall: true },
@@ -38,10 +43,6 @@ export const PLACEMENTS: Place[] = [
   { piece: 'deskSmall', x: 16, y: 99, blocks: true, props: [['mug', 8, 1]] },
   { piece: 'deskSmall', x: 48, y: 99, blocks: true, props: [['paper', 2, 1]] },
   { piece: 'deskSmall', x: 64, y: 99, blocks: true, props: [['pencilCup', 9, -1]] },
-  // manager's corner: the big desk, a chair, a tree
-  { piece: 'tree', x: 0, y: 128, blocks: true, tall: true },
-  { piece: 'chairSmall', x: 25, y: 128, blocks: true, tall: true },
-  { piece: 'desk', x: 16, y: 144, blocks: true, props: [['paper', 1, 3], ['mug', 24, 2]] },
   // break room: a couch, a bench facing it, the fridge
   { piece: 'benchSmall', x: 128, y: 128, blocks: false },
   { piece: 'sofaA', x: 144, y: 130, blocks: true },

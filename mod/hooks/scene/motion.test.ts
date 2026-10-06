@@ -141,6 +141,6 @@ describe('the real office, drawn', () => {
     const frame = paintFrame(officeMap(), officeArt(), [], [], 0, null, 1)
     let hash = 0x811c9dc5
     for (const p of frame.pixels) hash = Math.imul(hash ^ p, 0x01000193) >>> 0
-    expect(`${frame.width}x${frame.height} 0x${hash.toString(16)}`).toBe('192x160 0x3a6a6105')
+    expect(`${frame.width}x${frame.height} 0x${hash.toString(16)}`).toBe('192x160 0xc095bce9')
   })
 })
