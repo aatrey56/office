@@ -45,7 +45,7 @@
       "type": "string",
       "title": "Codex review model",
       "description": "Model for /codex-review and codex_review (run at reasoning effort high).",
-      "default": "gpt-6-sol"
+      "default": "gpt-6.1-sol"
     },
     "codexExecModel": {
       "type": "string",

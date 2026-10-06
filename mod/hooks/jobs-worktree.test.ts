@@ -5,8 +5,9 @@ const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isS
 const BASE = 'abc1234def5678abc1234def5678abc1234def56'
 const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }
 
-// A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id.
-function fakeRepo(on: On) {
+// A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
+// (or `bg`), `claude agents` lists what `agents()` says.
+function fakeRepo(on: On, fake: { bg?: string; agents?: () => string } = {}) {
   const runs: { argv: string[]; cwd?: string }[] = []
   mock.store(on)
   mock.env(on, { HOME: '/home/me', CLAUDE_CONFIG_DIR: '/cfg' })
@@ -21,7 +22,8 @@ function fakeRepo(on: On) {
     if (cmd.endsWith('rev-parse HEAD')) return out(`${BASE}\n`)
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
-    if (argv.includes('--bg')) return out('backgrounded · 5ac0f0df\n')
+    if (argv.includes('--bg')) return out(fake.bg ?? 'backgrounded · 5ac0f0df\n')
+    if (argv.includes('agents')) return out(fake.agents?.() ?? '[]')
     return out('') // worktree add / remove, status: clean
   })
   return runs
@@ -48,20 +50,13 @@ describe('worker worktrees', () => {
   test('a clean finished worker gives its worktree back and reports its branch', async ($, on) => {
     const runs = fakeRepo(on)
     const clock = mock.clock(on)
-    const delivered: string[] = []
+    const delivered = collectDelivery(on)
     let spawnedCwd: string | undefined
     on('process.spawn', async function* (_$, e) {
       spawnedCwd = e.cwd
       yield { stream: 'stdout' as const, text: '{"type":"result","subtype":"success","result":"Renamed it."}\n' }
       return { value: { code: 0, signal: null } }
     })
-    // No session.append beneath the test: the result is delivered as the prompt.
-    on('prompt.submit', (_$, e) => {
-      delivered.push(e.text)
-      return { text: '' }
-    })
-    on('ui.toast', () => ({ value: undefined }))
-    on('ui.log', () => ({ value: undefined }))
     await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
     await clock.settle()
     expect(spawnedCwd).toMatch(/^\/cfg\/office\/worktrees\//)
@@ -74,4 +69,56 @@ describe('worker worktrees', () => {
     expect(text).toContain('1 file changed')
     expect(text).toContain('worktree removed, branch kept')
   })
+
+  test('a timed-out worker keeps its worktree: it may still be running (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => '[{"id":"5ac0f0df","state":"working","status":"busy"}]' })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(61_000)
+    expect(runs.some(run => run.argv.includes('stop'))).toBe(true)
+    expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+    const text = delivered.join('\n')
+    expect(text).toContain('timed out')
+    expect(text).toMatch(/Worktree kept at \/cfg\/office\/worktrees\//)
+  })
+
+  test('claude --bg exiting 0 with no findable id keeps the worktree (regression)', async ($, on) => {
+    const runs = fakeRepo(on, { bg: 'started\n' })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    expect(runs.some(run => run.argv.includes('remove') || run.argv.includes('branch'))).toBe(false)
+    expect(JSON.stringify(r)).toMatch(/worktree is kept at \/cfg\/office\/worktrees\//)
+  })
+
+  test('a blocked worker seen idle with no reply resumes its timeout (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    let state = 'blocked'
+    const runs = fakeRepo(on, { agents: () => `[{"id":"5ac0f0df","state":"${state}","status":"idle"}]` })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    // The session start arms the 5 s poll of `claude agents`.
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000) // blocked: the timeout pauses
+    expect(delivered.join('\n')).toContain('waiting for input')
+    state = 'working' // now idle, and no transcript to read a reply from
+    await clock.advance(70_000) // the next poll resumes the timeout, a full minute from then
+    expect(runs.some(run => run.argv.includes('stop'))).toBe(true)
+    expect(delivered.join('\n')).toContain('timed out')
+  })
 })
+
+// No session.append beneath the test: each result is delivered as the prompt.
+function collectDelivery(on: On): string[] {
+  const delivered: string[] = []
+  on('prompt.submit', (_$, e) => {
+    delivered.push(e.text)
+    return { text: '' }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.log', () => ({ value: undefined }))
+  return delivered
+}

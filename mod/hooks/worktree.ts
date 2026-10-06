@@ -62,12 +62,13 @@ export type WorktreeOutcome = {
   isRemoved: boolean // the worktree was removed (the branch always stays)
 }
 
-/** Appended to a finished worker's result: branch, commits, diffstat, and where uncommitted work was left. */
+/** Appended to a finished worker's result: branch, commits, diffstat, and where a kept worktree is. */
 export function worktreeReport(o: WorktreeOutcome): string {
   const lines = [`Branch ${o.branch} (from ${o.base.slice(0, 7)})`]
   lines.push(o.commits.trim() || 'no commits')
   if (o.diffStat.trim()) lines.push(o.diffStat.trim())
   if (o.isDirty) lines.push(`Uncommitted changes left in ${o.dir}`)
+  else if (!o.isRemoved) lines.push(`Worktree kept at ${o.dir}`)
   if (o.isRemoved) lines.push('worktree removed, branch kept')
   return lines.join('\n')
 }

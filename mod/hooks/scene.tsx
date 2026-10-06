@@ -157,9 +157,16 @@ async function agentFilesOf($: EngineInterface, config: string, card: SessionCar
   const where = subagentsDir(config, card.cwd, card.sessionId)
   let dir = where.dir
   if (dir === undefined) {
-    const hit = (await $.fs.list(where.projects).catch(() => [])).find(e => e.kind === 'dir' && e.name.startsWith(where.prefix ?? '\u0000'))
-    if (!hit) return []
-    dir = `${where.projects}/${hit.name}/${card.sessionId}/subagents`
+    // A long slug is cut and hashed: of the dirs with its prefix, the one holding this session.
+    for (const e of await $.fs.list(where.projects).catch(() => [])) {
+      if (e.kind !== 'dir' || !e.name.startsWith(where.prefix ?? '\u0000')) continue
+      const candidate = `${where.projects}/${e.name}/${card.sessionId}/subagents`
+      if (await $.fs.exists(candidate).catch(() => false)) {
+        dir = candidate
+        break
+      }
+    }
+    if (dir === undefined) return []
   }
   const top = await $.fs.list(dir).catch(() => [])
   const files = freshAgentFiles(dir, top, now)

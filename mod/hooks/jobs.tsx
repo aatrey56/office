@@ -584,7 +584,8 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   )
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
-  await deliver($, finished.worktree !== undefined ? await settleWorktree($, finished) : finished)
+  // Only a 'done' worker has surely stopped: a killed or timed-out one may still write there.
+  await deliver($, finished.worktree !== undefined ? await settleWorktree($, finished, status === 'done') : finished)
 }
 
 /** Appends the result for the model; wakes an idle session with a short prompt. */
@@ -738,7 +739,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         await notifyModel($, jobId, text, `Worker ${jobId} is waiting for input: see above.`)
         continue
       }
-      if (phase === 'active' && job.status === 'blocked') {
+      if ((phase === 'active' || phase === 'idle') && job.status === 'blocked') {
         const since = BLOCKED_AT.get(jobId)
         BLOCKED_AT.delete(jobId)
         if (since !== undefined) PAUSED_MS.set(jobId, (PAUSED_MS.get(jobId) ?? 0) + Date.now() - since)
@@ -755,13 +756,17 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
   }
 }
 
-/** The transcript of a --bg session; a long (cut + hashed) slug is found by its prefix. */
+/** The transcript of a --bg session; a long (cut + hashed) slug is found by its prefix and the session's file. */
 async function bgTranscript($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<string | undefined> {
   const where = transcriptPath(configDir, cwd, sessionId)
   if (where.path !== undefined) return where.path
   const dirs = await $.fs.list(where.projects).catch(() => [])
-  const hit = dirs.find(entry => entry.kind === 'dir' && entry.name.startsWith(where.prefix ?? '\u0000'))
-  return hit ? `${where.projects}/${hit.name}/${sessionId}.jsonl` : undefined
+  for (const entry of dirs) {
+    if (entry.kind !== 'dir' || !entry.name.startsWith(where.prefix ?? '\u0000')) continue
+    const path = `${where.projects}/${entry.name}/${sessionId}.jsonl`
+    if (await $.fs.exists(path).catch(() => false)) return path
+  }
+  return undefined
 }
 
 /** After a (re)load: re-adopt live subagent and --bg jobs, fail the rest that "run". */
@@ -789,13 +794,17 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
   }
   if (dead.size === 0) return
   const at = Date.now()
-  await update($, JOBS, list =>
-    list.map(j =>
+  const list = await update($, JOBS, jobs =>
+    jobs.map(j =>
       dead.has(j.id) && isLive(j)
         ? { ...j, status: 'failed', endedAt: at, result: j.result ?? 'interrupted: the plugin reloaded' }
         : j,
     ),
   )
+  // Whether the worker still runs is unknown: its worktree is kept and reported.
+  for (const job of list) {
+    if (dead.has(job.id) && job.endedAt === at && job.worktree !== undefined) await settleWorktree($, job, false)
+  }
 }
 
 async function configDirOf($: EngineInterface): Promise<string> {
@@ -1139,7 +1148,10 @@ async function startWorker(
     }
     if (bgId === undefined) {
       const why = (r.stderr || r.stdout).trim() || `exit ${r.exitCode}`
-      return failed(`claude --bg did not start: ${why}`)
+      if (r.exitCode !== 0) return failed(`claude --bg did not start: ${why}`)
+      // It exited 0, so the worker may be running: its worktree stays.
+      const kept = job.worktree !== undefined ? ` Its worktree is kept at ${job.worktree} (branch ${job.branch}).` : ''
+      return failedJob($, job, `claude --bg gave no session id we could find, so this job is not tracked; it may still be running (\`claude agents\` lists it): ${why}.${kept}`)
     }
     const withBg = { ...job, bgId }
     await addJob($, withBg)
@@ -1200,7 +1212,11 @@ async function placeWorker(
   const dir = worktreeDir(await configDirOf($), root, job.id)
   const branch = branchName(job.id, job.title)
   const added = await git($, addWorktreeArgv(root, dir, branch, base))
-  if (!added.isOk) return fallback(`git worktree add: ${added.out}`)
+  if (!added.isOk) {
+    // `add -b` may have made the branch before failing; its name holds the new job id, so it is ours.
+    await git($, ['git', '-C', root, 'branch', '-d', branch])
+    return fallback(`git worktree add: ${added.out}`)
+  }
   const status = await git($, ['git', '-C', job.cwd, 'status', '--porcelain'])
   const dirty = status.isOk && status.out.trim() !== ''
     ? ' It starts from the last commit: the uncommitted changes in your checkout are not in its worktree.'
@@ -1223,10 +1239,10 @@ async function dropWorktree($: EngineInterface, job: Job): Promise<Job> {
 
 /**
  * A finished worker's branch, commits and diffstat, appended to its result;
- * a clean worktree is removed (its branch stays), a dirty one kept. Never
- * throws: the result is delivered whatever git says.
+ * with canRemove a clean worktree is removed (its branch stays), otherwise it
+ * is kept. Never throws: the result is delivered whatever git says.
  */
-async function settleWorktree($: EngineInterface, job: Job): Promise<Job> {
+async function settleWorktree($: EngineInterface, job: Job, canRemove: boolean): Promise<Job> {
   const { project: root, worktree: dir, branch, baseRef: base } = job
   if (root === undefined || dir === undefined || branch === undefined || base === undefined) return job
   try {
@@ -1237,7 +1253,7 @@ async function settleWorktree($: EngineInterface, job: Job): Promise<Job> {
       git($, ['git', '-C', dir, 'status', '--porcelain']),
     ])
     const isDirty = status.isOk && status.out.trim() !== ''
-    const isRemoved = status.isOk && !isDirty && (await git($, removeWorktreeArgv(root, dir))).isOk
+    const isRemoved = canRemove && status.isOk && !isDirty && (await git($, removeWorktreeArgv(root, dir))).isOk
     const report = worktreeReport({
       branch,
       base,
