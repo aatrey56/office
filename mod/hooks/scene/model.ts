@@ -1,4 +1,4 @@
-import type { Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId, Seat, SessionCard, Tile, TileMap, Activity } from '../../types'
+import type { AgentRecord, Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId, Seat, SessionCard, Tile, TileMap, Activity } from '../../types'
 import { LOOKS } from './art'
 import { clip } from '../sessions'
 
@@ -45,8 +45,10 @@ function workerTag(job: Job): string | undefined {
   return job.model || job.effort || undefined
 }
 
-// One crew member per lead session and per worker job that is running, blocked, or ended
-// within `lingerMs` of `now` (so a finished worker is seen reporting and leaving).
+// One crew member per lead session, per worker job that is running, blocked, or ended
+// within `lingerMs` of `now` (so a finished worker is seen reporting and leaving), and per
+// subagent of a session that runs or ended within `lingerMs` (a finished one walks out).
+// A `claude --bg` worker is also a registered session: it is drawn once, as the worker.
 // `managers` is project → manager; that session's role is 'manager'. Seats are not set here.
 export function deriveCrew(
   cards: SessionCard[],
@@ -55,10 +57,17 @@ export function deriveCrew(
   roots: Record<string, string | null>,
   now: number,
   lingerMs: number,
+  agents: AgentRecord[] = [],
 ): Crew[] {
   const crew: Crew[] = []
+  const workers = jobs.filter(j => j.kind === 'worker')
+  const workerProject = (job: Job) => job.project || projectOf(job.cwd, roots)
+  // Each session's project, which its subagents work in.
+  const projectBySession = new Map(cards.map(c => [c.sessionId, projectOf(c.cwd, roots)]))
+  for (const job of workers) if (job.sessionId) projectBySession.set(job.sessionId, workerProject(job))
 
   for (const card of cards) {
+    if (workers.some(j => j.sessionId === card.sessionId)) continue
     const project = projectOf(card.cwd, roots)
     const role: CrewRole = managers[project]?.sessionId === card.sessionId ? 'manager' : 'lead'
     const state = stateOf(card.status, role)
@@ -80,8 +89,7 @@ export function deriveCrew(
     })
   }
 
-  for (const job of jobs) {
-    if (job.kind !== 'worker') continue
+  for (const job of workers) {
     let state = stateOf(job.status, 'worker')
     if (job.endedAt !== undefined) {
       const since = now - job.endedAt
@@ -94,13 +102,35 @@ export function deriveCrew(
       id: job.id,
       name: job.title.slice(0, NAME_MAX),
       role: 'worker',
-      project: projectOf(job.cwd, roots),
+      project: workerProject(job),
       state,
       room: roomFor(state, 'worker'),
       seat: { x: 0, y: 0 },
       facing: 'down',
       look: lookOf(job.id, LOOKS),
       ...(tag ? { tag } : {}),
+      isSelectable: false,
+      isSelf: false,
+    })
+  }
+
+  // Subagents work like workers, in their parent's project; a subagent-mode worker job is
+  // already drawn above.
+  for (const agent of agents) {
+    if (workers.some(j => j.agentId === agent.id)) continue
+    if (agent.endedAt !== undefined && now - agent.endedAt > lingerMs) continue
+    const state: CrewState = agent.endedAt === undefined ? 'working' : 'leaving'
+    crew.push({
+      id: agent.id,
+      name: agent.name.slice(0, NAME_MAX),
+      role: 'worker',
+      project: projectBySession.get(agent.sessionId) ?? projectOf(agent.cwd, roots),
+      state,
+      room: roomFor(state, 'worker', agent.activity),
+      seat: { x: 0, y: 0 },
+      facing: 'down',
+      look: lookOf(agent.id, LOOKS),
+      ...(agent.activity ? { activity: agent.activity } : {}),
       isSelectable: false,
       isSelf: false,
     })

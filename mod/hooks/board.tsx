@@ -4,6 +4,7 @@ import type { EngineInterface, On, PluginOptions, RenderSurface, Timer } from 'c
 import type { Activity, MangaShelf, SessionCard } from '../types'
 import type { BoardMode, Registered } from './sessions'
 import { SLUG_MAX, ago, bandWindow, parseMode, clip, isRegistryFile, lastActivity, lastAssistantText, parseRegistry, projectSlug, resumeCommand, shortCwd } from './sessions'
+import { projectRootArgv, repoRootFromCommonDir } from './worktree'
 
 // Owner: board agent. Session board pane (/office) + tap-in.
 
@@ -157,9 +158,9 @@ async function sendTo($: EngineInterface, sessionId: string, text: string): Prom
 async function repoRoot($: EngineInterface, cwd: string): Promise<string | null> {
   const known = roots.get(cwd)
   if (known !== undefined) return known
-  const ran = await $.process.run(['git', '-C', cwd, 'rev-parse', '--show-toplevel']).catch(() => undefined)
+  const ran = await $.process.run(projectRootArgv(cwd)).catch(() => undefined)
   if (!ran) return null // could not run: decide again next time
-  const root = ran.exitCode === 0 ? ran.stdout.trim() || null : null
+  const root = ran.exitCode === 0 ? repoRootFromCommonDir(ran.stdout) : null
   roots.set(cwd, root)
   return root
 }

@@ -19,7 +19,7 @@ function fakeWorld(on: On, opts: { sessionId?: string; store?: Record<string, un
   })
   on('session.id', () => ({ value: opts.sessionId ?? 'sess-A' }))
   on('session.cwd', () => ({ value: `${ROOT}/src` }))
-  on('process.run', () => ({ value: { ...RUN, stdout: `${ROOT}\n` } }))
+  on('process.run', () => ({ value: { ...RUN, stdout: `${ROOT}/.git\n` } }))
   on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/me' : e.name === 'OFFICE_WORKER' && opts.isWorker ? '1' : undefined }))
   on('fs.read', (_$, e) => {
     const text = files.get(e.path)

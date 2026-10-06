@@ -3,7 +3,7 @@ import type { On } from 'claude-code'
 
 import { CODEX_DEFAULTS, codexQuotaMessage, codexReviewArgv, codexReviewPrompt, parseReviewTarget } from './codex'
 import { HAIKU_RETIRES_AT, MODEL_IDS, modelIdFor, parseClaudeRoute, parseJevResponse, rulesRoute } from './router'
-import { bgArgv, headlessArgv, parseAgentsJson, parseBgId, readTranscript, transcriptPath } from './spawn'
+import { bgArgv, bgPhase, headlessArgv, parseAgentsJson, parseBgId, readTranscript, transcriptPath } from './spawn'
 
 const BEFORE = Date.UTC(2026, 9, 3) // haiku still available
 const AFTER = HAIKU_RETIRES_AT + 1 // haiku retired
@@ -187,6 +187,11 @@ describe('--bg workers', () => {
       '{"type":"system","subtype":"turn_duration"}',
     ].join('\n')
     expect(readTranscript(jsonl)).toEqual({ result: 'OK', tail: '[tool Read]\nOK' })
+  })
+  test('a finished worker left at state working, status idle reads as idle (regression, 2026-10-05)', () => {
+    expect(bgPhase('working', 'idle')).toBe('idle')
+    expect(bgPhase('working', 'busy')).toBe('active')
+    expect(bgPhase('blocked', 'idle')).toBe('blocked')
   })
 })
 

@@ -63,9 +63,19 @@ import {
   workerAgentName,
 } from './spawn'
 import type { WorkerMode } from './spawn'
+import {
+  addWorktreeArgv,
+  branchName,
+  projectRootArgv,
+  removeWorktreeArgv,
+  repoRootFromCommonDir,
+  workerPreamble,
+  worktreeDir,
+  worktreeReport,
+} from './worktree'
 
 // Owner: jobs agent. Codex handoff, router, worker spawner, jobs pane.
-// codex.ts, router.ts and spawn.ts hold the pure halves; every hook and
+// codex.ts, router.ts, spawn.ts and worktree.ts hold the pure halves; every hook and
 // every `$`-taking helper is here, since the engine follows `$` only into
 // functions declared in the same file.
 //
@@ -108,6 +118,7 @@ type RunPlan = {
   codexModel?: string // set for codex runs: names the model in a quota failure
 }
 type Started = { ok: boolean; text: string }
+type GitRun = { isOk: boolean; out: string } // out: stdout, or why it failed
 
 /** Subagent workers awaiting their turn.complete: agentId → job id. */
 const SUBAGENT_JOBS = new Map<string, string>()
@@ -116,6 +127,8 @@ const BG_JOBS = new Map<string, string>()
 let bgPolling = false
 /** --bg jobs absent from one `claude agents` listing: one miss is forgiven. */
 const BG_MISSES = new Map<string, number>()
+/** --bg jobs seen idle with a reply on consecutive polls: two in a row end the job. */
+const BG_IDLE = new Map<string, number>()
 /** Time a job spent blocked (its timeout is paused meanwhile), and when its current block began. */
 const PAUSED_MS = new Map<string, number>()
 const BLOCKED_AT = new Map<string, number>()
@@ -558,6 +571,7 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   RUNNING.delete(id)
   BG_JOBS.delete(id)
   BG_MISSES.delete(id)
+  BG_IDLE.delete(id)
   PAUSED_MS.delete(id)
   BLOCKED_AT.delete(id)
   const before = (await read($, JOBS)).find(j => j.id === id)
@@ -570,7 +584,7 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   )
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
-  await deliver($, finished)
+  await deliver($, finished.worktree !== undefined ? await settleWorktree($, finished) : finished)
 }
 
 /** Appends the result for the model; wakes an idle session with a short prompt. */
@@ -675,7 +689,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
     if (listed === undefined || listed.exitCode !== 0) return
     const agents = parseAgentsJson(listed.stdout)
     const jobs = await read($, JOBS)
-    const configDir = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
+    const configDir = await configDirOf($)
     for (const [jobId, bgId] of [...BG_JOBS]) {
       const job = jobs.find(j => j.id === jobId)
       if (job === undefined || !isLive(job)) {
@@ -698,8 +712,10 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
           : undefined
         if (t !== undefined && t.exitCode === 0) seen = readTranscript(t.stdout)
       }
-      const phase = bgPhase(agent.state)
-      if (phase === 'done') {
+      const phase = bgPhase(agent.state, agent.status)
+      const idlePolls = phase === 'idle' && seen.result !== undefined ? (BG_IDLE.get(jobId) ?? 0) + 1 : 0
+      BG_IDLE.set(jobId, idlePolls)
+      if (phase === 'done' || idlePolls >= 2) {
         await finishJob($, jobId, 'done', seen.result ?? '(the session ended without a reply)')
         // The conversation is kept; the idle ~300 MB process is not needed.
         void $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
@@ -780,6 +796,10 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
         : j,
     ),
   )
+}
+
+async function configDirOf($: EngineInterface): Promise<string> {
+  return (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${(await $.env.get('HOME')) ?? ''}/.claude`
 }
 
 async function resolveCwd($: EngineInterface, cwd: string | undefined): Promise<string> {
@@ -1064,7 +1084,7 @@ async function startWorker(
   if (!verdict.isAllowed) {
     return { ok: false, text: `${verdict.reason}. This task was sized as ${modelId} at ${effort} effort; only small tasks (sonnet at low or medium) start in the soft zone.` }
   }
-  const job: Job = {
+  const placed = await placeWorker($, options, task, {
     id: newJobId(now),
     kind: 'worker',
     title: task.replace(/\s+/g, ' ').slice(0, 60),
@@ -1076,27 +1096,31 @@ async function startWorker(
     route: routed,
     mode,
     tail: '',
-  }
+  })
+  const job = placed.job
   const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}${verdict.warning ? `. Budget: ${verdict.warning}` : ''}`
+  const where = `in ${job.cwd}.${placed.note ? ` ${placed.note}` : ''}`
+  // A start that failed gives back its fresh worktree and branch (both refuse to go if any work is there).
+  const failed = async (why: string) => failedJob($, await dropWorktree($, job), why)
 
   if (mode === 'subagent') {
     const spawned = await $.agent
       .spawn({
-        prompt: task,
+        prompt: placed.task,
         model: modelId,
         description: job.title.slice(0, 40),
         subagentType: `office:${workerAgentName(effort)}`,
-        cwd,
+        cwd: job.cwd,
       })
       .catch((err: unknown) => ({ deny: String(err) }))
     if (spawned.deny !== undefined || spawned.agentId === undefined) {
-      return failedJob($, job, `Subagent not started: ${spawned.deny ?? 'no agent id'}`)
+      return failed(`Subagent not started: ${spawned.deny ?? 'no agent id'}`)
     }
     const agentId = spawned.agentId
     const withAgent = { ...job, agentId }
     await addJob($, withAgent)
     adoptSubagent($, options, withAgent, agentId)
-    return { ok: true, text: `Started subagent worker job ${job.id} (agent ${agentId}) on ${how}. /jobs shows it.` }
+    return { ok: true, text: `Started subagent worker job ${job.id} (agent ${agentId}) on ${how} ${where} /jobs shows it.` }
   }
 
   const permissionMode = opt(options, 'workerPermissionMode', 'acceptEdits')
@@ -1105,17 +1129,17 @@ async function startWorker(
   if (mode === 'bg') {
     const spawnedAt = Date.now() - 2000
     const r = await $.process
-      .run(bgArgv(claudeBin, modelId, effort, permissionMode, task), { cwd, env: WORKER_ENV, timeoutMs: 60000 })
+      .run(bgArgv(claudeBin, modelId, effort, permissionMode, placed.task), { cwd: job.cwd, env: WORKER_ENV, timeoutMs: 60000 })
       .catch((err: unknown) => ({ exitCode: 1, stdout: '', stderr: String(err) }))
     let bgId = r.exitCode === 0 ? parseBgId(r.stdout) : undefined
     if (bgId === undefined && r.exitCode === 0) {
       // Started but printed no id we could read: the newest background session here.
       const listed = await $.process.run([claudeBin, 'agents', '--json', '--all'], { timeoutMs: 20000 }).catch(() => undefined)
-      bgId = listed?.exitCode === 0 ? newestBgSince(parseAgentsJson(listed.stdout), cwd, spawnedAt)?.id : undefined
+      bgId = listed?.exitCode === 0 ? newestBgSince(parseAgentsJson(listed.stdout), job.cwd, spawnedAt)?.id : undefined
     }
     if (bgId === undefined) {
       const why = (r.stderr || r.stdout).trim() || `exit ${r.exitCode}`
-      return failedJob($, job, `claude --bg did not start: ${why}`)
+      return failed(`claude --bg did not start: ${why}`)
     }
     const withBg = { ...job, bgId }
     await addJob($, withBg)
@@ -1123,21 +1147,116 @@ async function startWorker(
     adoptBg($, options, withBg, bgId)
     return {
       ok: true,
-      text: `Started background worker job ${job.id} (claude --bg ${bgId}) on ${how} in ${cwd}. Its result is appended to this conversation when it finishes; \`claude attach ${bgId}\` opens it.`,
+      text: `Started background worker job ${job.id} (claude --bg ${bgId}) on ${how} ${where} Its result is appended to this conversation when it finishes; \`claude attach ${bgId}\` opens it.`,
     }
   }
 
   await addJob($, job)
   const plan: RunPlan = {
     argv: headlessArgv(claudeBin, modelId, effort, permissionMode),
-    cwd,
-    input: task, // stdin, never argv: a task led by "-" would parse as a flag
+    cwd: job.cwd,
+    input: placed.task, // stdin, never argv: a task led by "-" would parse as a flag
     label: 'Worker',
     parse: parseStreamJsonLine,
   }
   $.clock.after(0, () => void runJob($, options, job, plan))
   return {
     ok: true,
-    text: `Started headless worker job ${job.id} on ${how} in ${cwd}. Its result is appended to this conversation when it finishes; /jobs shows progress.`,
+    text: `Started headless worker job ${job.id} on ${how} ${where} Its result is appended to this conversation when it finishes; /jobs shows progress.`,
+  }
+}
+
+// ── worker worktrees ($ halves; the argv and texts are in worktree.ts) ───
+
+async function git($: EngineInterface, argv: string[]): Promise<GitRun> {
+  const r = await $.process
+    .run(argv, { timeoutMs: 30000 })
+    .catch((err: unknown) => ({ exitCode: 1, stdout: '', stderr: String(err) }))
+  return r.exitCode === 0 ? { isOk: true, out: r.stdout } : { isOk: false, out: (r.stderr || r.stdout).trim() || `exit ${r.exitCode}` }
+}
+
+/**
+ * Gives a worker started in a git repo its own branch in its own worktree:
+ * the job then runs there and the task leads with the git rules. Outside a
+ * repo, with workerWorktree off, or when a git step fails, it runs in the
+ * cwd it was given; `note` says why for the start message.
+ */
+async function placeWorker(
+  $: EngineInterface,
+  options: PluginOptions,
+  task: string,
+  job: Job,
+): Promise<{ job: Job; task: string; note: string }> {
+  const here = { job, task, note: '' }
+  if (opt(options, 'workerWorktree', 'auto') === 'off') return here
+  const common = await git($, projectRootArgv(job.cwd))
+  const root = common.isOk ? repoRootFromCommonDir(common.out) : null
+  if (root === null) return here
+  const fallback = (why: string) => ({ ...here, note: `No worktree of its own (${why}): it shares this checkout.` })
+  // From the commit the caller is on: a manager in a linked worktree hands out its own branch.
+  const head = await git($, ['git', '-C', job.cwd, 'rev-parse', 'HEAD'])
+  if (!head.isOk) return fallback(`git rev-parse HEAD: ${head.out}`)
+  const base = head.out.trim()
+  const dir = worktreeDir(await configDirOf($), root, job.id)
+  const branch = branchName(job.id, job.title)
+  const added = await git($, addWorktreeArgv(root, dir, branch, base))
+  if (!added.isOk) return fallback(`git worktree add: ${added.out}`)
+  const status = await git($, ['git', '-C', job.cwd, 'status', '--porcelain'])
+  const dirty = status.isOk && status.out.trim() !== ''
+    ? ' It starts from the last commit: the uncommitted changes in your checkout are not in its worktree.'
+    : ''
+  return {
+    job: { ...job, cwd: dir, project: root, worktree: dir, branch, baseRef: base },
+    task: `${workerPreamble(dir, branch, base)}\n${task}`,
+    note: `Own branch ${branch} (from ${base.slice(0, 7)}) in its own worktree.${dirty}`,
+  }
+}
+
+/** A worktree whose worker never started: remove it and its branch, neither forced. */
+async function dropWorktree($: EngineInterface, job: Job): Promise<Job> {
+  const { project: root, worktree: dir, branch, ...rest } = job
+  if (root === undefined || dir === undefined || branch === undefined) return job
+  if (!(await git($, removeWorktreeArgv(root, dir))).isOk) return job
+  if (!(await git($, ['git', '-C', root, 'branch', '-d', branch])).isOk) return { ...rest, project: root, branch }
+  return { ...rest, project: root }
+}
+
+/**
+ * A finished worker's branch, commits and diffstat, appended to its result;
+ * a clean worktree is removed (its branch stays), a dirty one kept. Never
+ * throws: the result is delivered whatever git says.
+ */
+async function settleWorktree($: EngineInterface, job: Job): Promise<Job> {
+  const { project: root, worktree: dir, branch, baseRef: base } = job
+  if (root === undefined || dir === undefined || branch === undefined || base === undefined) return job
+  try {
+    const range = `${base}..${branch}`
+    const [log, stat, status] = await Promise.all([
+      git($, ['git', '-C', root, 'log', '--oneline', range]),
+      git($, ['git', '-C', root, 'diff', '--stat', range]),
+      git($, ['git', '-C', dir, 'status', '--porcelain']),
+    ])
+    const isDirty = status.isOk && status.out.trim() !== ''
+    const isRemoved = status.isOk && !isDirty && (await git($, removeWorktreeArgv(root, dir))).isOk
+    const report = worktreeReport({
+      branch,
+      base,
+      dir,
+      commits: log.isOk ? log.out : `(git log failed: ${log.out})`,
+      diffStat: stat.isOk ? stat.out : '',
+      isDirty,
+      isRemoved,
+    })
+    const list = await update($, JOBS, jobs =>
+      withJob(jobs, job.id, ({ worktree, ...j }) => ({
+        ...j,
+        ...(isRemoved ? {} : { worktree }),
+        result: `${j.result ?? ''}\n\n${report}`,
+      })),
+    )
+    return list.find(j => j.id === job.id) ?? job
+  } catch (err) {
+    $.ui.log(`office: worktree report for job ${job.id} failed: ${String(err)}`, { to: 'debug' })
+    return job
   }
 }

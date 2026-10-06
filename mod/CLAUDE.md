@@ -10,7 +10,8 @@ in pure files (`hooks/*.ts`, `hooks/scene/*.ts`). `hooks/scene/art-data.ts` is g
 - Button hotkeys: one digit or one lowercase letter.
 - Tests stay lean: main behaviour, safety rules, real regressions only.
 - After a visual change, render and look at the result before asking the owner.
-- Parallel workers share this folder: give each its own files.
+- Workers started by the office get their own git worktree (workerWorktree: auto); subagents and
+  workers with workerWorktree off still share this folder, so give each its own files.
 
 ## Checks before every commit
 `npx -y -p typescript tsc -p . --pretty false` (read the exit code) · `claude plugin validate .` ·

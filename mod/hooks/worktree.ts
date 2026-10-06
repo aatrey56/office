@@ -3,39 +3,53 @@
 // jobs.tsx runs the git commands; scene/board/manage use projectRootArgv so a
 // worktree counts as its main repo's project.
 
+import { projectSlug } from './sessions'
+
+const BRANCH_MAX = 40 // chars after `office/`
+
 /** Where a worker's worktree lives: <configDir>/office/worktrees/<projectSlug(projectRoot)>/<jobId>. */
 export function worktreeDir(configDir: string, projectRoot: string, jobId: string): string {
-  throw new Error('not built')
+  return `${configDir}/office/worktrees/${projectSlug(projectRoot)}/${jobId}`
 }
 
 /** `office/<jobId>-<first words of the title>`: lowercase ascii kebab-case, at most 40 chars after `office/`. */
 export function branchName(jobId: string, title: string): string {
-  throw new Error('not built')
+  const kebab = `${jobId}-${title}`.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '')
+  return `office/${kebab.slice(0, BRANCH_MAX).replace(/-+$/, '')}`
 }
 
 /** `git -C <projectRoot> worktree add -b <branch> <dir> <base>` */
 export function addWorktreeArgv(projectRoot: string, dir: string, branch: string, base: string): string[] {
-  throw new Error('not built')
+  return ['git', '-C', projectRoot, 'worktree', 'add', '-b', branch, dir, base]
 }
 
 /** `git -C <projectRoot> worktree remove <dir>`, never --force: a worktree with uncommitted work stays. */
 export function removeWorktreeArgv(projectRoot: string, dir: string): string[] {
-  throw new Error('not built')
+  return ['git', '-C', projectRoot, 'worktree', 'remove', dir]
 }
 
 /** `git -C <cwd> rev-parse --path-format=absolute --git-common-dir`: same answer from a repo and from its worktrees. */
 export function projectRootArgv(cwd: string): string[] {
-  throw new Error('not built')
+  return ['git', '-C', cwd, 'rev-parse', '--path-format=absolute', '--git-common-dir']
 }
 
 /** The main repo root from projectRootArgv's stdout ('/x/repo/.git\n' → '/x/repo'); null when it is not a `.git` dir. */
 export function repoRootFromCommonDir(stdout: string): string | null {
-  throw new Error('not built')
+  const dir = stdout.trim()
+  return dir.endsWith('/.git') ? dir.slice(0, -'/.git'.length) || null : null
 }
 
 /** Put before the worker's task: its worktree and branch, and the git rules (commit there, never push or switch branch). */
 export function workerPreamble(dir: string, branch: string, base: string): string {
-  throw new Error('not built')
+  return [
+    `You work in the git worktree ${dir} on branch ${branch}, started from ${base}.`,
+    'Commit your work on this branch with clear messages.',
+    'Never push, never switch branches, never touch other worktrees or the main checkout.',
+    'Dependencies (node_modules, venvs) may be missing in a fresh worktree: install them if a check needs them.',
+    'If a guard, hook or permission check blocks an action, stop and report it; never route around it another way.',
+    '',
+    'Task:',
+  ].join('\n')
 }
 
 export type WorktreeOutcome = {
@@ -50,5 +64,10 @@ export type WorktreeOutcome = {
 
 /** Appended to a finished worker's result: branch, commits, diffstat, and where uncommitted work was left. */
 export function worktreeReport(o: WorktreeOutcome): string {
-  throw new Error('not built')
+  const lines = [`Branch ${o.branch} (from ${o.base.slice(0, 7)})`]
+  lines.push(o.commits.trim() || 'no commits')
+  if (o.diffStat.trim()) lines.push(o.diffStat.trim())
+  if (o.isDirty) lines.push(`Uncommitted changes left in ${o.dir}`)
+  if (o.isRemoved) lines.push('worktree removed, branch kept')
+  return lines.join('\n')
 }

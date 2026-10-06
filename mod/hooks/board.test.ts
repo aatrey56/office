@@ -49,7 +49,7 @@ describe('pure helpers', () => {
 
 // The test environment has no disk or processes: answer them from memory, and
 // record every path read so the test can prove no .key file was touched.
-// `roots` answers `git rev-parse --show-toplevel` per cwd (absent: not a repo).
+// `roots` gives each cwd's repo root, answered as projectRootArgv's `<root>/.git` (absent: not a repo).
 // `other`: a second live session, in another project.
 type World = { roots?: Record<string, string>; selfCwd?: string; registered?: string[]; other?: boolean }
 
@@ -79,7 +79,7 @@ function fakeHost(on: On, reads: string[], world: World = {}) {
     if (cmd === 'tail') return out(0, TRANSCRIPT)
     if (cmd === 'git' && e.argv[1] === '-C') {
       const root = world.roots?.[e.argv[2] ?? '']
-      return root ? out(0, `${root}\n`) : out(128, '')
+      return root ? out(0, `${root}/.git\n`) : out(128, '')
     }
     return out(1, '')
   })

@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, Timer } from 'claude-code'
 
-import type { Actor, ChatLine, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
+import type { Actor, AgentRecord, ChatLine, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
+import { freshAgentFiles, parseAgent, subagentsDir } from './agents'
+import type { AgentFile } from './agents'
 import { budgetLine } from './budget'
 import { chatLines, projectSlug, SLUG_MAX } from './sessions'
 import { officeArt, officeMap } from './scene/art'
@@ -9,6 +11,7 @@ import { toCells, toPng } from './scene/encode'
 import { assignSeats, deriveCrew, distinctLooks, projectsOf } from './scene/model'
 import { isSettled, stepActors } from './scene/motion'
 import { paintFrame } from './scene/paint'
+import { projectRootArgv, repoRootFromCommonDir } from './worktree'
 
 // Owner: scene. The /office pane as a pixel office: every session is a crew member in the room
 // for its state, office-spawned workers walk in, report and leave. `t` swaps to the text board
@@ -18,6 +21,7 @@ const PANE = 'office'
 const FRAME_MS = 100 // 10 frames/s while anyone walks or a bubble blinks; nothing is sent when still
 const STEP_PX = 4 // a 16 px cell in 4 frames, about Gold's walking pace
 const LINGER_MS = 20_000 // a finished worker is seen reporting, then leaving, for this long
+const AGENT_SCAN_MS = 2000 // how often the live sessions' subagent folders are looked at
 const CELL_W = 9.35 // pixels per terminal cell, as measured in Ghostty; sizes the picture box
 const CELL_H = 20
 
@@ -120,13 +124,87 @@ async function canDrawPictures($: EngineInterface): Promise<boolean> {
   }
 }
 
-// Git toplevels, filled in the background: a cwd is its own project until git answers.
+// Project roots, filled in the background: a cwd is its own project until git answers. A
+// worktree counts as its main repo; the plain toplevel when that answer is missing.
 async function learnRoots($: EngineInterface, cwds: string[]): Promise<void> {
   for (const cwd of cwds) {
     if (cwd in roots) continue
     roots[cwd] = null
-    const ran = await $.process.run(['git', '-C', cwd, 'rev-parse', '--show-toplevel']).catch(() => undefined)
-    roots = { ...roots, [cwd]: ran && ran.exitCode === 0 ? ran.stdout.trim() || null : null }
+    let root: string | null = null
+    try {
+      const ran = await $.process.run(projectRootArgv(cwd))
+      if (ran.exitCode === 0) root = repoRootFromCommonDir(ran.stdout)
+    } catch {
+      // not answered: the toplevel below
+    }
+    if (root === null) {
+      const ran = await $.process.run(['git', '-C', cwd, 'rev-parse', '--show-toplevel']).catch(() => undefined)
+      root = ran && ran.exitCode === 0 ? ran.stdout.trim() || null : null
+    }
+    roots = { ...roots, [cwd]: root }
+  }
+}
+
+// The live sessions' subagents, looked at every AGENT_SCAN_MS in the background. Only transcripts
+// written lately are tailed, and each again only when its mtime moves; a meta is read once.
+let agents: AgentRecord[] = []
+let agentScanAt = 0
+let isScanning = false
+let agentTails = new Map<string, { mtimeMs: number; agent: AgentRecord }>()
+let agentMetas = new Map<string, string | undefined>()
+
+async function agentFilesOf($: EngineInterface, config: string, card: SessionCard, now: number): Promise<AgentFile[]> {
+  const where = subagentsDir(config, card.cwd, card.sessionId)
+  let dir = where.dir
+  if (dir === undefined) {
+    const hit = (await $.fs.list(where.projects).catch(() => [])).find(e => e.kind === 'dir' && e.name.startsWith(where.prefix ?? '\u0000'))
+    if (!hit) return []
+    dir = `${where.projects}/${hit.name}/${card.sessionId}/subagents`
+  }
+  const top = await $.fs.list(dir).catch(() => [])
+  const files = freshAgentFiles(dir, top, now)
+  // Workflow agents: subagents/workflows/<runId>/agent-<id>.jsonl
+  if (top.some(e => e.kind === 'dir' && e.name === 'workflows')) {
+    for (const run of await $.fs.list(`${dir}/workflows`).catch(() => [])) {
+      if (run.kind !== 'dir') continue
+      const runDir = `${dir}/workflows/${run.name}`
+      files.push(...freshAgentFiles(runDir, await $.fs.list(runDir).catch(() => []), now))
+    }
+  }
+  return files
+}
+
+async function scanAgents($: EngineInterface, cards: SessionCard[]): Promise<void> {
+  if (isScanning || Date.now() - agentScanAt < AGENT_SCAN_MS) return
+  isScanning = true
+  agentScanAt = Date.now()
+  try {
+    const config = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${(await $.env.get('HOME')) ?? ''}/.claude`
+    const now = Date.now()
+    const found: AgentRecord[] = []
+    const tails = new Map<string, { mtimeMs: number; agent: AgentRecord }>()
+    const metas = new Map<string, string | undefined>()
+    for (const card of cards) {
+      for (const file of await agentFilesOf($, config, card, now)) {
+        const meta = agentMetas.has(file.meta) ? agentMetas.get(file.meta) : await $.fs.read(file.meta).catch(() => undefined)
+        metas.set(file.meta, meta)
+        let hit = agentTails.get(file.path)
+        if (!hit || hit.mtimeMs !== file.mtimeMs) {
+          const ran = await $.process.run(['tail', '-n', '40', file.path]).catch(() => undefined)
+          if (!ran) continue
+          hit = { mtimeMs: file.mtimeMs, agent: parseAgent(file, ran.stdout, meta, card, now) }
+        }
+        tails.set(file.path, hit)
+        found.push(hit.agent)
+      }
+    }
+    agents = found
+    agentTails = tails
+    agentMetas = metas
+  } catch {
+    // keep the last answer; the next scan tries again
+  } finally {
+    isScanning = false
   }
 }
 
@@ -142,11 +220,15 @@ async function currentCrew($: EngineInterface): Promise<{ crew: Crew[]; project:
   const jobs = await read($, JOBS)
   const managers = await read($, MANAGERS)
   void learnRoots($, [...cards.map(c => c.cwd), ...jobs.map(j => j.cwd)])
-  const everyone = deriveCrew(cards, jobs, managers, roots, Date.now(), LINGER_MS)
+  void scanAgents($, cards)
+  const everyone = deriveCrew(cards, jobs, managers, roots, Date.now(), LINGER_MS, agents)
   const project = shownProject(everyone, await read($, PROJECT))
   if (project === null) return { crew: [], project, all: [] }
   seated = assignSeats(everyone, officeMap(), project, seated)
-  return { crew: distinctLooks(seated.filter(c => c.project === project), officeArt().sprites.length), project, all: projectsOf(everyone) }
+  // Someone leaving is drawn only while its walk to the door lasts: one never seen inside, or
+  // already out of the door, is not brought back to the doorway.
+  const here = seated.filter(c => c.project === project && (c.state !== 'leaving' || actors.some(a => a.id === c.id && !a.isGone)))
+  return { crew: distinctLooks(here, officeArt().sprites.length), project, all: projectsOf(everyone) }
 }
 
 function selectColor(): number {
@@ -299,6 +381,8 @@ export function installScene(on: On) {
 
     const cards = await read($, SESSIONS)
     const leads = crew.filter(c => c.isSelectable)
+    // Office-spawned workers only: subagents are drawn but never listed.
+    const workers = crew.filter(c => !c.isSelectable && !agents.some(a => a.id === c.id))
     const picked = leads.find(c => c.id === selectedId)
     const pickedCard = picked && cards.find(c => c.sessionId === picked.id)
     let usage = ''
@@ -378,9 +462,9 @@ export function installScene(on: On) {
             )
           })}
         </Box>
-        {crew.some(c => !c.isSelectable) && (
+        {workers.length > 0 && (
           <Text dimColor wrap="truncate-end">
-            {`workers: ${crew.filter(c => !c.isSelectable).map(c => `${c.name} (${STATE_WORDS[c.state]})`).join(', ')}`}
+            {`workers: ${workers.map(c => `${c.name} (${STATE_WORDS[c.state]})`).join(', ')}`}
           </Text>
         )}
         {picked && (

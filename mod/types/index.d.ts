@@ -110,6 +110,17 @@ export type Crew = {
   isSelf: boolean
 }
 
+// One subagent of a live session (a Task/Agent call or a workflow agent), from its transcript
+// under <config>/projects/<slug>/<sessionId>/subagents/. Drawn as a worker of its parent's project.
+export type AgentRecord = {
+  id: string // the transcript's agentId
+  sessionId: string // the parent session
+  cwd: string
+  name: string // the meta's description, else its agentType; never drawn
+  activity?: Activity
+  endedAt?: number // finished: its transcript's last write (ms); absent while it runs
+}
+
 // A crew member on screen: pixel position, the tiles still to walk, and its animation step.
 export type Actor = {
   id: string
