@@ -4,9 +4,9 @@ import type { BudgetCaps, BudgetVerdict, Effort, ModelTier, RateWindow } from '.
 
 export const DEFAULT_CAPS: BudgetCaps = { softFiveHourPct: 80, softSevenDayPct: 85, hardPct: 95 }
 
-// Small enough to start inside the soft zone: sonnet (or haiku while it exists) at low or medium.
+// Small enough to start inside the soft zone: haiku at any routed effort, or sonnet at low or medium.
 export function isSmallRoute(model: ModelTier, effort: Effort): boolean {
-  return (model === 'sonnet' || model === 'haiku') && (effort === 'low' || effort === 'medium')
+  return model === 'haiku' || (model === 'sonnet' && (effort === 'low' || effort === 'medium'))
 }
 
 /** The tier a model alias or full id belongs to, for sizing a model the caller named; unknown ids count as large. */

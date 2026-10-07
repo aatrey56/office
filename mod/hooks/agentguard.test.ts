@@ -4,7 +4,7 @@ import type { AgentSpawnInput, On } from 'claude-code'
 import { pinOf } from './agentguard'
 import { MODEL_IDS } from './router'
 
-const RULES = { options: { routerBackend: 'rules' } } // rules: "rename x to y" is sonnet/low, "debug the crash" opus/high
+const RULES = { options: { routerBackend: 'rules' } } // rules: "rename x to y" is haiku/low, "debug the crash" opus/high
 const MANAGERS = { '/r': { sessionId: 'sess-A', name: 'lead-a', since: 1 } }
 const PARENT = 'claude-opus-5-5'
 const ENGINE = { plugin: 'engine', tier: 'core' } as const
@@ -75,7 +75,7 @@ describe("a manager's Agent calls", () => {
     expect(big.deny).toContain('resets 2026-10-06T05:00:00.000Z')
     const small = await $.agent.spawn(spawnOf('rename x to y'))
     expect(small.deny).toBeUndefined()
-    expect(reached.map(e => e.model)).toEqual([MODEL_IDS.sonnet])
+    expect(reached.map(e => e.model)).toEqual([MODEL_IDS.haiku])
   })
 
   test('below the soft line the router sizes it and the inbox logs its start and finish', RULES, async ($, on) => {

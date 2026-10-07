@@ -113,7 +113,7 @@ export function agentGuard(
   if (!v.isAllowed) {
     const sized = tier !== undefined ? `runs on ${tier}` : routed !== undefined ? `was routed to ${routed.model} at ${routed.effort} effort` : 'could not be sized'
     return {
-      deny: `${v.reason}. This agent ${sized}; only small work (sonnet or haiku; a routed task at low or medium effort) starts in the soft zone. Do not retry or work around it; tell the person.`,
+      deny: `${v.reason}. This agent ${sized}; only small work (a haiku or sonnet model; a task routed to haiku, or to sonnet at low or medium effort) starts in the soft zone. Do not retry or work around it; tell the person.`,
     }
   }
   return pin.by === 'none' && routed !== undefined ? { size: routed.model } : {}
