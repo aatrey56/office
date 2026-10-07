@@ -125,7 +125,7 @@ existing `maxWorkers` check:
 | Between soft and hard | The router sizes the task. **Small** tasks start; larger ones are refused with the reason and the reset time |
 | At the hard line (95% of either window) | Nothing new starts. A `/spawn --force` typed by you is the only override |
 
-- **Small** in v1 = the router picked Sonnet (or Haiku until 2026-10-15) at low or medium effort.
+- **Small** = the router picked Haiku (any effort) or Sonnet at low or medium effort.
 - Jev makes this call once your key exists. It runs outside your Claude limits, so sizing
   a task near the cap costs you nothing. Until then the Claude → rules fallback decides.
 - Each finished job records how far the 5-hour figure moved, by model and effort. A later
@@ -140,7 +140,7 @@ existing `maxWorkers` check:
 
 **Today (exists):** `auto` tries Jev (skipped, no key) → Claude (`routerModel`, a small
 low-effort call) → rules (regex, instant). Effort from the router never exceeds high.
-The Haiku tier switches itself off on 2026-10-15.
+Routed tiers (since 2026-10-07): Haiku 5.5 (basic), Sonnet 5.5 (medium), Opus 5.5 (high-level). Fable runs only when named.
 
 **New: the routing test.**
 
@@ -155,10 +155,10 @@ would pick if you were choosing by hand. The router's pick is compared against i
 
 | Example task | Example label | Why |
 | --- | --- | --- |
-| Rename `user_id` to `account_id` across three files | Sonnet · low | Mechanical |
-| Summarize this 200-line error log | Sonnet · low (Haiku until Oct 15) | Reading, no judgment |
+| Rename `user_id` to `account_id` across three files | Haiku · low | Mechanical |
+| Summarize this 200-line error log | Haiku · low | Reading, no judgment |
 | Find why the incremental dbt model double-counts late-arriving rows | Opus · high | Real debugging |
-| Design the schema and migration plan for multi-tenant billing | Fable · high | Architecture; expensive if wrong |
+| Design the schema and migration plan for multi-tenant billing | Opus · high | Architecture; expensive if wrong |
 
 About 30 of these, spread across easy, medium and hard, is enough to tell a router that
 agrees with you 60% of the time from one that agrees 90%. The soft budget zone (§3.4)

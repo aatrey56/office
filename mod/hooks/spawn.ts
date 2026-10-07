@@ -337,7 +337,7 @@ export const SPAWN_TOOL = {
     properties: {
       task: { type: 'string', description: 'The whole task, self-contained: the worker has none of this context.' },
       mode: { type: 'string', enum: ['bg', 'headless', 'subagent'], description: 'Default bg.' },
-      model: { type: 'string', description: 'haiku | sonnet | opus | fable, or a full model id. Omit to route.' },
+      model: { type: 'string', description: 'haiku | sonnet | opus | fable, or a full model id. Omit to route (the router picks haiku, sonnet or opus; fable only when named).' },
       effort: {
         type: 'string',
         enum: [...EFFORTS],
@@ -352,7 +352,7 @@ export const SPAWN_TOOL = {
 export const ROUTE_TOOL = {
   name: 'route_task',
   description:
-    'Dry run of the office router: which model tier (haiku/sonnet/opus/fable) and effort a task should get, with confidence, reason and which backend decided. Starts nothing.',
+    'Dry run of the office router: which model tier (haiku/sonnet/opus) and effort a task should get, with confidence, reason and which backend decided. Starts nothing.',
   inputSchema: {
     type: 'object',
     properties: { task: { type: 'string' } },
