@@ -225,18 +225,54 @@ export function newestBgSince(agents: readonly BgAgent[], cwd: string, since: nu
     .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))[0]
 }
 
-/** A --bg session this plugin started, and the model it runs (none for ids stored before models were kept). */
-export type BgEntry = { id: string; model?: string }
+/** The stored --bg ids: a list of strings, as every version of this plugin keeps it. */
+export function parseBgIds(stored: unknown): string[] {
+  return Array.isArray(stored) ? stored.filter((x): x is string => typeof x === 'string') : []
+}
 
-/** The stored --bg entries; the old format, a list of bare ids, reads as entries with no model. */
-export function parseBgStore(stored: unknown): BgEntry[] {
-  if (!Array.isArray(stored)) return []
-  return stored.flatMap((x): BgEntry[] => {
-    if (typeof x === 'string') return [{ id: x }]
-    if (typeof x !== 'object' || x === null || typeof (x as BgEntry).id !== 'string') return []
-    const model = (x as BgEntry).model
-    return [typeof model === 'string' ? { id: (x as BgEntry).id, model } : { id: (x as BgEntry).id }]
+/** The stored models of --bg ids, kept apart from the ids so older versions reading those are unaffected. */
+export function parseBgModels(stored: unknown): Record<string, string> {
+  if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) return {}
+  return Object.fromEntries(Object.entries(stored).filter((kv): kv is [string, string] => typeof kv[1] === 'string'))
+}
+
+/**
+ * The --bg ids to keep after a `claude agents` listing: only an id in the snapshot read before
+ * the listing and absent from it is dead; one registered since (not in the snapshot) is kept.
+ * The models map keeps the kept ids alone.
+ */
+export function prunedBg(
+  ids: readonly string[],
+  models: Readonly<Record<string, string>>,
+  before: readonly string[],
+  agents: readonly BgAgent[],
+): { ids: string[]; models: Record<string, string> } {
+  const kept = ids.filter(id => !before.includes(id) || agents.some(a => a.id === id))
+  return { ids: kept, models: Object.fromEntries(Object.entries(models).filter(([id]) => kept.includes(id))) }
+}
+
+/** The --bg ids still running: listed active or blocked, or registered since the listing's snapshot. */
+export function liveBgIds(ids: readonly string[], before: readonly string[], agents: readonly BgAgent[]): string[] {
+  return ids.filter(id => {
+    if (!before.includes(id)) return true
+    const p = bgPhase(agents.find(a => a.id === id)?.state)
+    return p === 'active' || p === 'blocked'
   })
+}
+
+/** A worker slot held between the capacity check and the worker's registration; void after `until`. */
+export type Reservation = { id: string; isOpus: boolean; until: number }
+
+/** How long a reservation holds: longer than any start (a --bg start alone may take 60 s plus a listing). */
+export const RESERVATION_MS = 3 * 60_000
+
+/** The stored reservations not yet expired. */
+export function liveReservations(stored: unknown, now: number): Reservation[] {
+  if (!Array.isArray(stored)) return []
+  return stored.filter((x): x is Reservation => {
+    const r = x as Reservation
+    return typeof x === 'object' && x !== null && typeof r.id === 'string' && typeof r.until === 'number' && r.until > now
+  }).map(r => ({ id: r.id, isOpus: r.isOpus === true, until: r.until }))
 }
 
 export function parseAgentsJson(text: string): BgAgent[] {

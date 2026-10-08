@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { CODEX_DEFAULTS, codexQuotaMessage, codexReviewArgv, codexReviewPrompt, parseReviewTarget } from './codex'
@@ -260,9 +260,10 @@ describe('budget guard on worker starts', () => {
   const routeReply = (model: string, effort: string) => ({
     value: { isAnswered: true as const, text: `{"model":"${model}","effort":"${effort}","confidence":0.9,"reason":"test"}`, usage: USAGE },
   })
-  // What a start touches beneath the plugin: the bg id list, the cwd, and `claude --bg` itself.
+  // What a start touches beneath the plugin: the bg id list, the cwd, the config dir (its capacity lock) and `claude --bg` itself.
   function fakeStart(on: On) {
     const ran: string[][] = []
+    mock.env(on, { HOME: '/home/me' })
     on('store.get', () => ({ value: undefined }))
     on('store.set', () => ({ value: undefined }))
     on('session.cwd', () => ({ value: '/r' }))
