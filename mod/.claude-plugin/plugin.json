@@ -98,6 +98,12 @@
       "description": "Codex reviews and workers running at once; more are refused.",
       "default": 4
     },
+    "maxOpusWorkers": {
+      "type": "number",
+      "title": "Max concurrent Opus jobs",
+      "description": "Workers on Opus-tier models (opus, fable or their full ids) running at once; more are refused. Codex reviews don't count. 0 sets no limit beyond Max concurrent jobs.",
+      "default": 0
+    },
     "jobTimeoutMin": {
       "type": "number",
       "title": "Job timeout (minutes)",

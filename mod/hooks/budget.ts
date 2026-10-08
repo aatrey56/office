@@ -17,6 +17,11 @@ export function tierOfModelId(modelId: string): ModelTier {
   return 'opus'
 }
 
+/** Counts against maxOpusWorkers: opus, fable, or a full id naming opus, fable or mythos. */
+export function isOpusTier(model: string | undefined): boolean {
+  return model !== undefined && /opus|fable|mythos/i.test(model)
+}
+
 // Kinds without a soft line (a gateway's spend_limit) only ever hit the hard one.
 function softLine(w: RateWindow, caps: BudgetCaps): number | undefined {
   if (w.kind === 'five_hour') return caps.softFiveHourPct

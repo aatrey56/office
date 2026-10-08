@@ -4,7 +4,7 @@ import type { AgentSpawnInput, EngineInterface, On, PluginOptions, Timer } from 
 import type { BudgetCaps, Effort, EvalReport, Job, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
 import type { AgentDef, AgentPin } from './agentguard'
 import { agentGuard, agentRouteText, hardDeny, isManagerSession, needsRoute, parseAgentFile, pinOf } from './agentguard'
-import { budgetVerdict, DEFAULT_CAPS, isSmallRoute, tierOfModelId } from './budget'
+import { budgetVerdict, DEFAULT_CAPS, isOpusTier, isSmallRoute, tierOfModelId } from './budget'
 import { formatSets, parseCases, scoreRoutes } from './evals'
 import { endLine, finishedLine, foldInbox, formatInbox, INBOX_FILE, routeLine, routedLine } from './inbox'
 import {
@@ -59,6 +59,7 @@ import {
   newestBgSince,
   newJobId,
   parseAgentsJson,
+  parseBgStore,
   parseBgId,
   parseSpawnArgs,
   parseStreamJsonLine,
@@ -118,7 +119,7 @@ const KEY_RETRY_MS = 60_000
 /** The Jev key once resolved, for the module's life; a miss is re-tried at most once a minute. Never logged or stored. */
 let jevKeyCache: { key?: string; at: number } | undefined
 const WORKER_ENV = { [WORKER_ENV_NAME]: WORKER_ENV_VALUE }
-/** $.store key: the --bg ids this plugin started (counted against maxWorkers across sessions). */
+/** $.store key: the --bg ids this plugin started and their models (counted against maxWorkers and maxOpusWorkers across sessions). */
 const BG_STORE_KEY = 'bgIds'
 /** $.store keys: Codex's last read rate limits, and the models out of quota until their reset. */
 const CODEX_LIMITS_KEY = 'codexLimits'
@@ -718,37 +719,67 @@ function logInbox($: EngineInterface, line: string | undefined): void {
   })
 }
 
+/** Jobs running now, and how many of them are workers on Opus-tier models. */
+type Load = { used: number; opus: number }
+
 /**
  * maxWorkers counts this process's own jobs (codex, headless, subagent) plus
- * every live --bg session this plugin started, from any session (ids in $.store).
+ * every live --bg session this plugin started, from any session (ids in $.store);
+ * maxOpusWorkers counts the workers among them on Opus-tier models.
  */
-async function capacityError($: EngineInterface, options: PluginOptions): Promise<string | undefined> {
-  const max = num(options, 'maxWorkers', 4)
-  const local = [...RUNNING.keys()].filter(id => !BG_JOBS.has(id)).length
-  let bg = 0
+async function runningLoad($: EngineInterface, options: PluginOptions): Promise<Load> {
+  const jobs = await read($, JOBS)
+  const isOpusWorker = (job: Job | undefined) => job?.kind === 'worker' && isOpusTier(job.model)
+  const local = [...RUNNING.keys()].filter(id => !BG_JOBS.has(id))
+  let used = local.length
+  let opus = local.filter(id => isOpusWorker(jobs.find(j => j.id === id))).length
   const stored = await $.store.get(BG_STORE_KEY).catch(() => undefined)
-  const ids = Array.isArray(stored) ? stored.filter((x): x is string => typeof x === 'string') : []
-  if (ids.length > 0) {
+  const entries = parseBgStore(stored)
+  if (entries.length > 0) {
     const listed = await $.process
       .run([opt(options, 'claudePath', 'claude'), 'agents', '--json', '--all'], { timeoutMs: 20000 })
       .catch(() => undefined)
     if (listed !== undefined && listed.exitCode === 0) {
-      const agents = parseAgentsJson(listed.stdout).filter(a => ids.includes(a.id))
-      bg = agents.filter(a => { const p = bgPhase(a.state); return p === 'active' || p === 'blocked' }).length
-      const kept = agents.map(a => a.id)
-      if (kept.length !== ids.length) await $.store.set(BG_STORE_KEY, kept).catch(() => undefined)
+      const agents = parseAgentsJson(listed.stdout)
+      const kept = entries.filter(e => agents.some(a => a.id === e.id))
+      const live = kept.filter(e => {
+        const p = bgPhase(agents.find(a => a.id === e.id)?.state)
+        return p === 'active' || p === 'blocked'
+      })
+      used += live.length
+      // An id stored before models were kept: this process may still know its job.
+      opus += live.filter(e => isOpusTier(e.model ?? jobs.find(j => j.bgId === e.id)?.model)).length
+      // Also rewrites the old format (bare ids) as entries.
+      if (JSON.stringify(kept) !== JSON.stringify(stored)) await $.store.set(BG_STORE_KEY, kept).catch(() => undefined)
     } else {
-      bg = BG_JOBS.size // cannot list: count what this process knows
+      // Cannot list: count what this process knows.
+      used += BG_JOBS.size
+      opus += [...BG_JOBS.keys()].filter(id => isOpusWorker(jobs.find(j => j.id === id))).length
     }
   }
-  const used = local + bg
-  return used >= max ? `${used} jobs already running (maxWorkers ${max}); wait for one or kill it in /jobs.` : undefined
+  return { used, opus }
 }
 
-async function rememberBgId($: EngineInterface, bgId: string): Promise<void> {
-  const stored = await $.store.get(BG_STORE_KEY).catch(() => undefined)
-  const ids = Array.isArray(stored) ? stored.filter((x): x is string => typeof x === 'string') : []
-  if (!ids.includes(bgId)) await $.store.set(BG_STORE_KEY, [...ids, bgId].slice(-200)).catch(() => undefined)
+function totalError(load: Load, options: PluginOptions): string | undefined {
+  const max = num(options, 'maxWorkers', 4)
+  return load.used >= max ? `${load.used} jobs already running (maxWorkers ${max}); wait for one or kill it in /jobs.` : undefined
+}
+
+async function capacityError($: EngineInterface, options: PluginOptions): Promise<string | undefined> {
+  return totalError(await runningLoad($, options), options)
+}
+
+/** maxOpusWorkers 0 (the default) sets no limit beyond maxWorkers. */
+function opusError(load: Load, options: PluginOptions, modelId: string): string | undefined {
+  const max = num(options, 'maxOpusWorkers', 0)
+  if (max === 0 || !isOpusTier(modelId) || load.opus < max) return undefined
+  return `${load.opus} Opus jobs already running (maxOpusWorkers ${max}); wait for one, pick a cheaper model, or kill one in /jobs.`
+}
+
+async function rememberBgId($: EngineInterface, bgId: string, model: string): Promise<void> {
+  const entries = parseBgStore(await $.store.get(BG_STORE_KEY).catch(() => undefined))
+  if (entries.some(e => e.id === bgId)) return
+  await $.store.set(BG_STORE_KEY, [...entries, { id: bgId, model }].slice(-200)).catch(() => undefined)
 }
 
 /** Kill (or timeout): stop the work and mark the job failed right away. */
@@ -1289,7 +1320,8 @@ async function startWorker(
   cwdArg: string | undefined,
   by: SpawnedBy,
 ): Promise<Started> {
-  const full = await capacityError($, options)
+  const load = await runningLoad($, options)
+  const full = totalError(load, options)
   if (full) return { ok: false, text: full }
   // The budget guard, in two looks: past the hard limit nothing starts, so no routing call
   // is spent finding out the task's size; in the soft zone the route decides.
@@ -1303,6 +1335,9 @@ async function startWorker(
   const routed = modelArg === undefined ? await route($, options, task) : undefined
   const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet')
   const effort: Effort = isEffort(effortArg) ? effortArg : (routed?.effort ?? 'medium')
+  // Refused, never quietly moved to a cheaper model.
+  const opusFull = opusError(load, options, modelId)
+  if (opusFull) return { ok: false, text: opusFull }
   const verdict = budgetVerdict(windows, caps, {
     isSmall: isSmallRoute(routed?.model ?? tierOfModelId(modelId), effort),
     // Only a model the person typed counts as their explicit choice; an agent's does not.
@@ -1377,7 +1412,7 @@ async function startWorker(
     const withBg = { ...job, bgId }
     await addJob($, withBg)
     logInbox($, routedLine(job, task, now))
-    await rememberBgId($, bgId)
+    await rememberBgId($, bgId, modelId)
     adoptBg($, options, withBg, bgId)
     return {
       ok: true,

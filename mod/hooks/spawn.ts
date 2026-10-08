@@ -225,6 +225,20 @@ export function newestBgSince(agents: readonly BgAgent[], cwd: string, since: nu
     .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))[0]
 }
 
+/** A --bg session this plugin started, and the model it runs (none for ids stored before models were kept). */
+export type BgEntry = { id: string; model?: string }
+
+/** The stored --bg entries; the old format, a list of bare ids, reads as entries with no model. */
+export function parseBgStore(stored: unknown): BgEntry[] {
+  if (!Array.isArray(stored)) return []
+  return stored.flatMap((x): BgEntry[] => {
+    if (typeof x === 'string') return [{ id: x }]
+    if (typeof x !== 'object' || x === null || typeof (x as BgEntry).id !== 'string') return []
+    const model = (x as BgEntry).model
+    return [typeof model === 'string' ? { id: (x as BgEntry).id, model } : { id: (x as BgEntry).id }]
+  })
+}
+
 export function parseAgentsJson(text: string): BgAgent[] {
   try {
     const raw = JSON.parse(text) as unknown

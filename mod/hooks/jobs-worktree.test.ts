@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
@@ -6,10 +7,16 @@ const BASE = 'abc1234def5678abc1234def5678abc1234def56'
 const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }
 
 // A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
-// (or `bg`), `claude agents` lists what `agents()` says.
-function fakeRepo(on: On, fake: { bg?: string; agents?: () => string; transcript?: () => string } = {}) {
-  const runs: { argv: string[]; cwd?: string }[] = []
-  mock.store(on)
+// (or `bg`), `claude agents` lists what `agents()` says; `store` seeds $.store (`runs.store` holds it).
+function fakeRepo(on: On, fake: { bg?: string; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> } = {}) {
+  const runs: { argv: string[]; cwd?: string }[] & { store?: Map<string, unknown> } = []
+  const store = new Map(Object.entries(fake.store ?? {}))
+  runs.store = store
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => {
+    store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
   mock.env(on, { HOME: '/home/me', CLAUDE_CONFIG_DIR: '/cfg' })
   on('session.usage', () => NO_LIMITS)
   on('session.cwd', () => ({ value: '/r/src' }))
@@ -25,6 +32,7 @@ function fakeRepo(on: On, fake: { bg?: string; agents?: () => string; transcript
     if (argv.includes('--bg')) return out(fake.bg ?? 'backgrounded · 5ac0f0df\n')
     if (argv.includes('agents')) return out(fake.agents?.() ?? '[]')
     if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
+    if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
     return out('') // worktree add / remove, status: clean
   })
   return runs
@@ -191,6 +199,64 @@ describe('--bg worker finish: the [office: done] marker', () => {
     expect(text).toContain('is waiting for input')
     expect(text).toContain('Rename x in tests too?')
     expect(text).not.toContain('Worker finished')
+  })
+})
+
+describe('maxOpusWorkers', () => {
+  const working = (...ids: string[]) => JSON.stringify(ids.map(id => ({ id, kind: 'background', state: 'working', status: 'busy' })))
+  const spawn = ($: Engine, model: string | undefined, task = 'rename x to y') =>
+    $.tool.call({ tool: 'mcp__office__spawn_worker', task, ...(model ? { model } : {}), effort: 'low', cwd: '/r/src' })
+      .then(r => JSON.stringify(r))
+
+  test('an Opus or Fable worker is refused at the cap; a Sonnet one still starts', { options: { maxWorkers: 8, maxOpusWorkers: 2 } }, async ($, on) => {
+    const runs = fakeRepo(on, {
+      agents: () => working('a1', 'b2', '5ac0f0df'),
+      store: { bgIds: [{ id: 'a1', model: 'claude-opus-5-5' }, { id: 'b2', model: 'claude-fable-5-1' }] },
+    })
+    for (const model of ['opus', 'fable', 'claude-mythos-1']) {
+      const r = await spawn($, model)
+      expect(r).toContain('2 Opus jobs already running (maxOpusWorkers 2); wait for one, pick a cheaper model, or kill one in /jobs.')
+    }
+    expect(runs.some(run => run.argv.includes('--bg'))).toBe(false) // refused, never downgraded
+    expect(await spawn($, 'sonnet')).toContain('Started background worker')
+  })
+
+  test('a router-chosen Opus worker counts toward the cap', { options: { maxWorkers: 8, maxOpusWorkers: 1, routerBackend: 'rules' } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => working('5ac0f0df') })
+    const first = await spawn($, undefined, 'debug the flaky login test')
+    expect(first).toContain('claude-opus-5-5')
+    expect(first).toContain('Started background worker')
+    expect(runs.store?.get('bgIds')).toEqual([{ id: '5ac0f0df', model: 'claude-opus-5-5' }])
+    expect(await spawn($, undefined, 'debug the race condition in the queue')).toContain('1 Opus jobs already running (maxOpusWorkers 1)')
+  })
+
+  test('a running Codex review does not count toward the Opus cap', { options: { maxWorkers: 8, maxOpusWorkers: 1, workerWorktree: 'off' } }, async ($, on) => {
+    fakeRepo(on)
+    const clock = mock.clock(on)
+    on('process.spawn', async function* (_$, e) {
+      if (e.argv[0] !== 'sh') await new Promise(() => {}) // the review keeps running; the limits read ends at once
+      return { value: { code: 0, signal: null } }
+    })
+    const review = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(JSON.stringify(review)).toContain('Started Codex review')
+    await clock.advance(0)
+    expect(await spawn($, 'opus')).toContain('Started background worker')
+  })
+
+  test('maxOpusWorkers 0 (the default) sets no separate limit', { options: { maxWorkers: 8 } }, async ($, on) => {
+    const opus = ['a1', 'b2', 'c3'].map(id => ({ id, model: 'claude-opus-5-5' }))
+    fakeRepo(on, { agents: () => working('a1', 'b2', 'c3'), store: { bgIds: opus } })
+    expect(await spawn($, 'opus')).toContain('Started background worker')
+  })
+
+  test('the old store format (bare ids) still counts toward maxWorkers and is rewritten as entries', { options: { maxWorkers: 2, maxOpusWorkers: 1 } }, async ($, on) => {
+    const agents = { list: working('a1') } // b2 has gone
+    const runs = fakeRepo(on, { agents: () => agents.list, store: { bgIds: ['a1', 'b2'] } })
+    // a1 counts as a job; its model is unknown, so it is not counted as Opus.
+    expect(await spawn($, 'opus')).toContain('Started background worker')
+    expect(runs.store?.get('bgIds')).toEqual([{ id: 'a1' }, { id: '5ac0f0df', model: 'claude-opus-5-5' }])
+    agents.list = working('a1', '5ac0f0df')
+    expect(await spawn($, 'sonnet')).toContain('2 jobs already running (maxWorkers 2)')
   })
 })
 
