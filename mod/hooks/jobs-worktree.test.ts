@@ -9,22 +9,35 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 
 // A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
-// `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). mkdir, rmdir and mv
-// act on `runs.dirs` (path → mtime) as the capacity lock needs: a second mkdir of one path fails.
-type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; dirs: Map<string, number> }
-type Fake = { bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
+// `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
+// holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
+// the lock dropped when the holder's stream ends; `flock.take()` is another session's hold.
+type Flock = { holders: number; most: number; take: () => Promise<() => void>; queued: () => Promise<void> }
+type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
+type Fake = { spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
-  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], dirs: new Map<string, number>() }) as Runs
-  const { store, dirs } = runs
+  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
+  const { store, flock } = runs
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
     runs.sets.push(e.key)
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined }
   })
-  on('fs.stat', (_$, e, next) => {
-    const at = dirs.get(e.path)
-    return at === undefined ? next(e) : { value: { kind: 'dir' as const, size: 0, mtimeMs: at, isLink: false } }
+  on('process.spawn', async function* (_$, e, next) {
+    if (e.argv[0] !== 'perl') {
+      if (fake.spawn === undefined) return yield* next(e)
+      yield* fake.spawn(e)
+      return { value: { code: 0, signal: null } }
+    }
+    const drop = await flock.take()
+    try {
+      yield { stream: 'stdout' as const, text: 'held\n' }
+      await new Promise(() => {}) // held until the stream is ended
+      return { value: { code: 0, signal: null } }
+    } finally {
+      drop()
+    }
   })
   mock.env(on, { HOME: '/home/me', CLAUDE_CONFIG_DIR: '/cfg' })
   on('session.usage', () => NO_LIMITS)
@@ -34,17 +47,6 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     runs.push({ argv, cwd: e.init?.cwd })
     const cmd = argv.join(' ')
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
-    if (argv[0] === 'mkdir' && argv[1] !== '-p') {
-      if (dirs.has(argv[1] ?? '')) return out('', 1)
-      dirs.set(argv[1] ?? '', Date.now())
-      return out('')
-    }
-    if (argv[0] === 'rmdir') return out('', dirs.delete(argv[1] ?? '') ? 0 : 1)
-    if (argv[0] === 'mv' && dirs.has(argv[1] ?? '')) {
-      dirs.set(argv[2] ?? '', dirs.get(argv[1] ?? '') ?? 0)
-      dirs.delete(argv[1] ?? '')
-      return out('')
-    }
     if (cmd.includes('--git-common-dir')) return out('/r/.git\n')
     if (cmd.endsWith('rev-parse HEAD')) return out(`${BASE}\n`)
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
@@ -59,6 +61,34 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     return out('') // worktree add / remove, status: clean
   })
   return runs
+}
+
+function fakeFlock(): Flock {
+  const waiting: (() => void)[] = []
+  let onQueued: (() => void)[] = []
+  const flock: Flock = {
+    holders: 0,
+    most: 0,
+    queued: () => new Promise<void>(r => onQueued.push(r)), // resolves once a taker waits
+    take: async () => {
+      while (flock.holders > 0) {
+        const waited = new Promise<void>(r => waiting.push(r))
+        for (const r of onQueued) r()
+        onQueued = []
+        await waited
+      }
+      flock.holders++
+      flock.most = Math.max(flock.most, flock.holders)
+      let isDropped = false
+      return () => {
+        if (isDropped) return
+        isDropped = true
+        flock.holders--
+        waiting.shift()?.()
+      }
+    },
+  }
+  return flock
 }
 
 describe('worker worktrees', () => {
@@ -81,15 +111,15 @@ describe('worker worktrees', () => {
   })
 
   test('a clean finished worker gives its worktree back and reports its branch', async ($, on) => {
-    const runs = fakeRepo(on)
+    let spawnedCwd: string | undefined
+    const runs = fakeRepo(on, {
+      async *spawn(e) {
+        spawnedCwd = e.cwd
+        yield { stream: 'stdout', text: '{"type":"result","subtype":"success","result":"Renamed it."}\n' }
+      },
+    })
     const clock = mock.clock(on)
     const delivered = collectDelivery(on)
-    let spawnedCwd: string | undefined
-    on('process.spawn', async function* (_$, e) {
-      spawnedCwd = e.cwd
-      yield { stream: 'stdout' as const, text: '{"type":"result","subtype":"success","result":"Renamed it."}\n' }
-      return { value: { code: 0, signal: null } }
-    })
     await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
     await clock.settle()
     expect(spawnedCwd).toMatch(/^\/cfg\/office\/worktrees\//)
@@ -256,12 +286,12 @@ describe('maxOpusWorkers', () => {
   })
 
   test('a running Codex review does not count toward the Opus cap', { options: { maxWorkers: 8, maxOpusWorkers: 1, workerWorktree: 'off' } }, async ($, on) => {
-    fakeRepo(on)
-    const clock = mock.clock(on)
-    on('process.spawn', async function* (_$, e) {
-      if (e.argv[0] !== 'sh') await new Promise(() => {}) // the review keeps running; the limits read ends at once
-      return { value: { code: 0, signal: null } }
+    fakeRepo(on, {
+      async *spawn(e) {
+        if (e.argv[0] !== 'sh') await new Promise(() => {}) // the review keeps running; the limits read ends at once
+      },
     })
+    const clock = mock.clock(on)
     const review = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
     expect(JSON.stringify(review)).toContain('Started Codex review')
     await clock.advance(0)
@@ -347,21 +377,70 @@ describe('maxOpusWorkers', () => {
     expect(runs.store.get('bgModels')).toEqual({ a1: OPUS, c3: 'claude-sonnet-5-5', '5ac0f0df': 'claude-sonnet-5-5' })
   })
 
-  test('the capacity lock: one another session holds is waited for, one a crash left is taken over', { options: { maxOpusWorkers: 1 } }, async ($, on) => {
+  test('the capacity lock is the kernel\'s: a live holder is waited for however long it holds, never taken over (regression)', { options: { maxOpusWorkers: 1 } }, async ($, on) => {
     const runs = fakeRepo(on)
     const clock = mock.clock(on)
-    const LOCK = '/cfg/office/locks/capacity'
-    runs.dirs.set(LOCK, Date.now())
-    const started = spawn($, 'opus')
-    await clock.advance(500)
+    const drop = await runs.flock.take() // another session holds it, and is slow
+    const first = spawn($, 'opus')
+    const second = spawn($, 'sonnet', 'tidy it')
+    await clock.advance(60_000) // far past the old takeover age
     expect(bgStarts(runs)).toBe(0)
-    runs.dirs.delete(LOCK) // the other session is done
-    await clock.advance(50)
+    expect(runs.some(run => ['mv', 'rm', 'rmdir'].includes(run.argv[0] ?? ''))).toBe(false)
+    drop()
+    expect(await first).toContain('Started background worker')
+    expect(await second).toContain('Started background worker')
+    expect(runs.flock.most).toBe(1) // one holder at a time
+    expect(runs.flock.holders).toBe(0) // each hold ended with its holder
+  })
+
+  test('a slow start keeps its slot past one reservation\'s life (regression)', { options: { maxWorkers: 8, maxOpusWorkers: 1 } }, async ($, on) => {
+    let openBg = () => {}
+    const runs = fakeRepo(on, { agents: () => working('5ac0f0df'), bgGate: new Promise<void>(r => { openBg = r }) })
+    const clock = mock.clock(on)
+    const slow = spawn($, 'opus')
+    await clock.settle()
+    expect(bgStarts(runs)).toBe(1)
+    await clock.advance(4 * 60_000) // --bg still starting, past RESERVATION_MS and the old 3 min
+    expect(await spawn($, 'opus', 'tidy it')).toContain('1 Opus jobs already running (maxOpusWorkers 1)')
+    openBg()
+    expect(await slow).toContain('Started background worker')
+    expect(runs.store.get('reservedSlots')).toEqual([])
+  })
+
+  test('a worker another session is registering counts once (regression)', { options: { maxWorkers: 2 } }, async ($, on) => {
+    // Mid-registration, under its lock: the other session's worker is in bgIds and still holds its reservation.
+    const runs = fakeRepo(on, {
+      agents: () => working('x1', '5ac0f0df'),
+      store: { bgIds: ['x1'], reservedSlots: [{ id: 'j1.ab12cd', isOpus: false, until: Number.MAX_SAFE_INTEGER }] },
+    })
+    const drop = await runs.flock.take()
+    const queued = runs.flock.queued()
+    const started = spawn($, 'sonnet')
+    await queued
+    runs.store.set('reservedSlots', []) // its registration done,
+    drop() // it lets go of the lock
     expect(await started).toContain('Started background worker')
-    expect(runs.dirs.has(LOCK)).toBe(false)
-    runs.dirs.set(LOCK, Date.now() - 60_000)
-    expect(await spawn($, 'sonnet')).toContain('Started background worker')
-    expect(runs.some(run => run.argv[0] === 'mv' && run.argv[1] === LOCK)).toBe(true)
+  })
+
+  test('a headless worker mid-handoff counts once (regression)', { options: { maxWorkers: 2, workerWorktree: 'off' } }, async ($, on) => {
+    const runs = fakeRepo(on, {
+      async *spawn() {
+        await new Promise(() => {}) // the worker runs on
+      },
+    })
+    const clock = mock.clock(on)
+    const start = (task: string, mode: string) =>
+      $.tool.call({ tool: 'mcp__office__spawn_worker', task, mode, model: 'sonnet', effort: 'low', cwd: '/r/src' }).then(r => JSON.stringify(r))
+    expect(await start('rename x to y', 'headless')).toContain('Started headless worker')
+    // The next start waits on the lock (another session holds it)...
+    const drop = await runs.flock.take()
+    const queued = runs.flock.queued()
+    const next = start('tidy it', 'bg')
+    await queued
+    // ...while the first worker joins RUNNING and its slot's release queues behind that start.
+    await clock.settle()
+    drop()
+    expect(await next).toContain('Started background worker')
   })
 })
 

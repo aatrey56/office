@@ -263,8 +263,12 @@ export function liveBgIds(ids: readonly string[], before: readonly string[], age
 /** A worker slot held between the capacity check and the worker's registration; void after `until`. */
 export type Reservation = { id: string; isOpus: boolean; until: number }
 
-/** How long a reservation holds: longer than any start (a --bg start alone may take 60 s plus a listing). */
-export const RESERVATION_MS = 3 * 60_000
+/**
+ * How long a reservation holds unless renewed: its start renews it every RESERVATION_RENEW_MS
+ * however long it takes, so only a crashed start's slot runs out, within a minute.
+ */
+export const RESERVATION_MS = 60_000
+export const RESERVATION_RENEW_MS = 20_000
 
 /** The stored reservations not yet expired. */
 export function liveReservations(stored: unknown, now: number): Reservation[] {
@@ -273,6 +277,26 @@ export function liveReservations(stored: unknown, now: number): Reservation[] {
     const r = x as Reservation
     return typeof x === 'object' && x !== null && typeof r.id === 'string' && typeof r.until === 'number' && r.until > now
   }).map(r => ({ id: r.id, isOpus: r.isOpus === true, until: r.until }))
+}
+
+/** What the capacity lock's holder prints once it has the lock. */
+export const CAP_LOCK_HELD = 'held'
+
+/**
+ * The capacity lock's holder: perl takes an exclusive flock on `path` (made with its folder if
+ * missing), trying for up to `waitMs`, prints CAP_LOCK_HELD and holds it until it is killed or
+ * the process that started it is gone. The kernel drops the lock with the holder, however it
+ * ends; given up, it exits 1 having printed nothing.
+ */
+export function capLockArgv(path: string, waitMs: number): string[] {
+  const script = [
+    "use Fcntl ':flock'; use File::Path 'make_path'; use File::Basename 'dirname'; use Time::HiRes 'time';",
+    'my ($path, $wait) = @ARGV; my $parent = getppid(); eval { make_path(dirname($path)) };',
+    "open(my $f, '>>', $path) or exit 2; my $until = time + $wait;",
+    'until (flock($f, LOCK_EX | LOCK_NB)) { exit 1 if time >= $until; select(undef, undef, undef, 0.05) }',
+    `$| = 1; print "${CAP_LOCK_HELD}\\n"; sleep 1 while getppid() == $parent;`,
+  ].join(' ')
+  return ['perl', '-e', script, path, String(waitMs / 1000)]
 }
 
 export function parseAgentsJson(text: string): BgAgent[] {
