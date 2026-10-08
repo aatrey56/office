@@ -132,8 +132,14 @@ const BG_STORE_KEY = 'bgIds'
 /** $.store keys: those ids' models, { id: model }, for maxOpusWorkers (older versions ignore it); the slots held by starts under way. */
 const BG_MODELS_KEY = 'bgModels'
 const RESERVED_KEY = 'reservedSlots'
-/** How long a wait for the capacity lock lasts before going on without it. */
+/** How long a wait for the capacity lock lasts before the start is refused (a holder never gets taken over). */
 const LOCK_WAIT_MS = 15_000
+/** What a refused start says when the capacity lock stayed held past LOCK_WAIT_MS. */
+const CAP_BUSY_TEXT = 'office capacity lock busy; try again in a moment.'
+/** How many times a started worker's registration waits out a busy capacity lock. */
+const REGISTER_ATTEMPTS = 3
+/** perl's exit code when it gave up waiting for the flock (capLockArgv). */
+const CAP_LOCK_TIMEOUT_CODE = 1
 /** $.store keys: Codex's last read rate limits, and the models out of quota until their reset. */
 const CODEX_LIMITS_KEY = 'codexLimits'
 const CODEX_OUT_KEY = 'codexOut'
@@ -756,7 +762,17 @@ async function clockNow($: EngineInterface): Promise<number> {
 /** Serializes this process's capacity updates; the lock file serializes them across sessions. */
 let capChain: Promise<unknown> = Promise.resolve()
 
-/** Runs `fn` holding the capacity lock: every read of the --bg ids, models and reservations that counts, and every write. */
+/** The capacity lock stayed held by another session past LOCK_WAIT_MS: the transaction was not run. */
+class CapLockBusy extends Error {
+  constructor() {
+    super(CAP_BUSY_TEXT)
+  }
+}
+
+/**
+ * Runs `fn` holding the capacity lock: every read of the --bg ids, models and reservations that counts, and every write.
+ * Throws CapLockBusy, never running `fn`, when another session holds the lock past LOCK_WAIT_MS.
+ */
 async function withCapLock<T>($: EngineInterface, fn: () => Promise<T>): Promise<T> {
   const run = capChain.then(async () => {
     const release = await takeCapLock($)
@@ -770,32 +786,63 @@ async function withCapLock<T>($: EngineInterface, fn: () => Promise<T>): Promise
   return run
 }
 
+/** Like withCapLock, but a busy lock is `undefined` for a caller whose work can wait or lapse (a renewal, a release). */
+async function withCapLockIfFree<T>($: EngineInterface, what: string, fn: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await withCapLock($, fn)
+  } catch (err) {
+    if (!(err instanceof CapLockBusy)) throw err
+    debugLog($, `office: capacity lock busy; ${what} skipped`)
+    return undefined
+  }
+}
+
+/** Whether the loud "no cross-session lock" line has been logged: once per process. */
+let hasWarnedNoCapLock = false
+
 /**
  * The capacity lock every session sharing this store takes: the kernel's flock on a file beside
  * it, held by a perl child (capLockArgv) until `release` ends it. Only the process holding an
  * flock can drop it, and its death always does, so a crashed holder needs no takeover and no
- * session can ever remove another's lock. Undefined, and the caller goes on unlocked rather than
- * refusing every start, when perl cannot run or the lock stays held past LOCK_WAIT_MS.
+ * session can ever remove another's lock.
+ *
+ * Held past LOCK_WAIT_MS it throws CapLockBusy: the caller must not run its transaction, which
+ * could overwrite what the holder is mid-way through. The holder this wait spawned is ended
+ * first, so it cannot take the lock later and keep it. Returns undefined, and the caller goes on
+ * with only this process's chain to serialize it (logged loudly once), when no lock is possible
+ * at all: no config dir, or perl missing or unable to open the lock file.
  */
 async function takeCapLock($: EngineInterface): Promise<(() => Promise<void>) | undefined> {
   let holder: ReturnType<EngineInterface['process']['spawn']> | undefined
   const release = async () => {
     await holder?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
   }
+  let isTimedOut = false
   try {
     const path = `${(await configDirOf($)).replace(/\/+$/, '')}/office/locks/capacity.lock`
     holder = $.process.spawn({ argv: capLockArgv(path, LOCK_WAIT_MS) })
     void holder.result.catch(() => undefined)
     let out = ''
-    for (let piece = await holder.next(); !piece.done; piece = await holder.next()) {
+    for (let piece = await holder.next(); ; piece = await holder.next()) {
+      if (piece.done) {
+        isTimedOut = out === '' && piece.value?.code === CAP_LOCK_TIMEOUT_CODE
+        break
+      }
       if (piece.value.stream === 'stdout') out += piece.value.text
       if (out.startsWith(CAP_LOCK_HELD)) return release
     }
   } catch {
-    // no config dir, or perl missing or refused: go on unlocked
+    // no config dir, or perl missing or refused: degraded, below
   }
   await release()
-  debugLog($, `office: capacity lock not taken (held past ${LOCK_WAIT_MS} ms, or perl did not run); going on without it`)
+  if (isTimedOut) {
+    debugLog($, `office: capacity lock held past ${LOCK_WAIT_MS} ms; start refused`)
+    throw new CapLockBusy()
+  }
+  if (!hasWarnedNoCapLock) {
+    hasWarnedNoCapLock = true
+    debugLog($, 'office: WARNING no cross-session capacity lock (perl did not run); maxWorkers and maxOpusWorkers can be exceeded by sessions starting at the same moment')
+  }
   return undefined
 }
 
@@ -855,6 +902,7 @@ async function lockedLoad($: EngineInterface, view: BgView): Promise<{ load: Loa
   return { load: { used, opus }, held, now }
 }
 
+/** The load as a precheck sees it; throws CapLockBusy when the lock stayed held, so no start goes on unchecked. */
 async function runningLoad($: EngineInterface, options: PluginOptions): Promise<{ load: Load; view: BgView }> {
   const view = await bgView($, options)
   return { load: (await withCapLock($, () => lockedLoad($, view))).load, view }
@@ -866,7 +914,12 @@ function totalError(load: Load, options: PluginOptions): string | undefined {
 }
 
 async function capacityError($: EngineInterface, options: PluginOptions): Promise<string | undefined> {
-  return totalError((await runningLoad($, options)).load, options)
+  try {
+    return totalError((await runningLoad($, options)).load, options)
+  } catch (err) {
+    if (err instanceof CapLockBusy) return err.message
+    throw err
+  }
 }
 
 /** maxOpusWorkers 0 (the default) sets no limit beyond maxWorkers. */
@@ -881,22 +934,28 @@ function opusError(load: Load, options: PluginOptions, modelId: string): string 
  * slot: a start racing this one, here or in another session, sees it. A refusal is the text.
  */
 async function reserveSlot($: EngineInterface, options: PluginOptions, view: BgView, jobId: string, modelId: string): Promise<Slot | string> {
-  return withCapLock($, async () => {
-    const { load, held, now } = await lockedLoad($, view)
-    const refused = totalError(load, options) ?? opusError(load, options, modelId)
-    if (refused !== undefined) return refused
-    // A job id alone may repeat across sessions; the suffix keeps one session's release off another's slot.
-    const slot = { id: `${jobId}.${Math.random().toString(36).slice(2, 8)}`, jobId, isOpus: isOpusTier(modelId), isSettled: false }
-    await $.store.set(RESERVED_KEY, [...held, { id: slot.id, isOpus: slot.isOpus, until: now + RESERVATION_MS }]).catch(() => undefined)
-    OWN_SLOTS.set(slot.id, jobId)
-    return slot
-  })
+  try {
+    return await withCapLock($, async () => {
+      const { load, held, now } = await lockedLoad($, view)
+      const refused = totalError(load, options) ?? opusError(load, options, modelId)
+      if (refused !== undefined) return refused
+      // A job id alone may repeat across sessions; the suffix keeps one session's release off another's slot.
+      const slot = { id: `${jobId}.${Math.random().toString(36).slice(2, 8)}`, jobId, isOpus: isOpusTier(modelId), isSettled: false }
+      await $.store.set(RESERVED_KEY, [...held, { id: slot.id, isOpus: slot.isOpus, until: now + RESERVATION_MS }]).catch(() => undefined)
+      OWN_SLOTS.set(slot.id, jobId)
+      return slot
+    })
+  } catch (err) {
+    // The lock stayed held: no worker starts on a count nobody checked.
+    if (err instanceof CapLockBusy) return err.message
+    throw err
+  }
 }
 
 /** Keeps a slot reserved while its start runs on: every RESERVATION_RENEW_MS it holds RESERVATION_MS more. */
 function renewSlot($: EngineInterface, slot: Slot): Timer {
   return $.clock.every(RESERVATION_RENEW_MS, () =>
-    void withCapLock($, async () => {
+    void withCapLockIfFree($, 'a reservation renewal', async () => {
       if (slot.isSettled) return
       const now = await clockNow($)
       const others = liveReservations(await storeGet($, RESERVED_KEY), now).filter(r => r.id !== slot.id)
@@ -909,17 +968,35 @@ function renewSlot($: EngineInterface, slot: Slot): Timer {
 async function releaseSlot($: EngineInterface, slot: Slot): Promise<void> {
   if (slot.isSettled) return
   slot.isSettled = true
-  await withCapLock($, async () => {
-    const stored = await storeGet($, RESERVED_KEY)
-    const left = liveReservations(stored, await clockNow($)).filter(r => r.id !== slot.id)
-    if (JSON.stringify(left) !== JSON.stringify(stored)) await $.store.set(RESERVED_KEY, left).catch(() => undefined)
+  try {
+    // Held past the wait: the reservation lapses by itself within RESERVATION_MS.
+    await withCapLockIfFree($, 'a reservation release', async () => {
+      const stored = await storeGet($, RESERVED_KEY)
+      const left = liveReservations(stored, await clockNow($)).filter(r => r.id !== slot.id)
+      if (JSON.stringify(left) !== JSON.stringify(stored)) await $.store.set(RESERVED_KEY, left).catch(() => undefined)
+    })
+  } finally {
     OWN_SLOTS.delete(slot.id)
-  })
+  }
 }
 
 /** Turns a slot into the --bg registration in one hold of the lock: the worker is never counted twice, nor missed. */
 async function registerBg($: EngineInterface, slot: Slot, bgId: string, model: string): Promise<void> {
   slot.isSettled = true
+  // The worker already runs, so a busy lock is waited for again rather than written around.
+  for (let attempt = 1; attempt <= REGISTER_ATTEMPTS; attempt++) {
+    try {
+      await registerBgLocked($, slot, bgId, model)
+      return
+    } catch (err) {
+      if (!(err instanceof CapLockBusy)) throw err
+    }
+  }
+  OWN_SLOTS.delete(slot.id)
+  debugLog($, `office: WARNING capacity lock busy; worker ${bgId} not recorded, so it does not count toward maxWorkers`)
+}
+
+async function registerBgLocked($: EngineInterface, slot: Slot, bgId: string, model: string): Promise<void> {
   await withCapLock($, async () => {
     const stored = parseBgIds(await storeGet($, BG_STORE_KEY))
     const ids = stored.includes(bgId) ? stored : [...stored, bgId].slice(-200)
@@ -1472,7 +1549,14 @@ async function startWorker(
   cwdArg: string | undefined,
   by: SpawnedBy,
 ): Promise<Started> {
-  const { load, view } = await runningLoad($, options)
+  let ran: { load: Load; view: BgView }
+  try {
+    ran = await runningLoad($, options)
+  } catch (err) {
+    if (err instanceof CapLockBusy) return { ok: false, text: err.message }
+    throw err
+  }
+  const { load, view } = ran
   const full = totalError(load, options)
   if (full) return { ok: false, text: full }
   // The budget guard, in two looks: past the hard limit nothing starts, so no routing call

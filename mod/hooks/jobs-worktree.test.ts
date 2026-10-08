@@ -11,10 +11,12 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
-// the lock dropped when the holder's stream ends; `flock.take()` is another session's hold.
-type Flock = { holders: number; most: number; take: () => Promise<() => void>; queued: () => Promise<void> }
+// the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
+// is perl's wait running out: every holder still waiting exits 1, printing nothing, and never takes the lock.
+// `fake.perl: 'missing'` makes the holder fail to run at all.
+type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -30,7 +32,9 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
       yield* fake.spawn(e)
       return { value: { code: 0, signal: null } }
     }
-    const drop = await flock.take()
+    if (fake.perl === 'missing') throw new Error('spawn perl ENOENT')
+    const drop = await flock.take(flock.expired)
+    if (drop === undefined) return { value: { code: 1, signal: null } }
     try {
       yield { stream: 'stdout' as const, text: 'held\n' }
       await new Promise(() => {}) // held until the stream is ended
@@ -66,16 +70,26 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
 function fakeFlock(): Flock {
   const waiting: (() => void)[] = []
   let onQueued: (() => void)[] = []
+  let expire = () => {}
   const flock: Flock = {
+    expired: new Promise<void>(r => { expire = r }),
+    expire: () => expire(),
     holders: 0,
     most: 0,
     queued: () => new Promise<void>(r => onQueued.push(r)), // resolves once a taker waits
-    take: async () => {
+    take: (async (until?: Promise<void>) => {
+      let isExpired = false
+      void until?.then(() => { isExpired = true })
       while (flock.holders > 0) {
-        const waited = new Promise<void>(r => waiting.push(r))
+        let wake = () => {}
+        const waited = new Promise<void>(r => { wake = r; waiting.push(r) })
         for (const r of onQueued) r()
         onQueued = []
-        await waited
+        await Promise.race([waited, until ?? waited])
+        if (isExpired) {
+          waiting.splice(waiting.indexOf(wake) >>> 0, 1) // gone from the queue, so a drop wakes a live waiter
+          return undefined
+        }
       }
       flock.holders++
       flock.most = Math.max(flock.most, flock.holders)
@@ -86,7 +100,7 @@ function fakeFlock(): Flock {
         flock.holders--
         waiting.shift()?.()
       }
-    },
+    }) as Flock['take'],
   }
   return flock
 }
@@ -377,13 +391,13 @@ describe('maxOpusWorkers', () => {
     expect(runs.store.get('bgModels')).toEqual({ a1: OPUS, c3: 'claude-sonnet-5-5', '5ac0f0df': 'claude-sonnet-5-5' })
   })
 
-  test('the capacity lock is the kernel\'s: a live holder is waited for however long it holds, never taken over (regression)', { options: { maxOpusWorkers: 1 } }, async ($, on) => {
+  test('the capacity lock is the kernel\'s: a live holder is waited for within the wait, never taken over (regression)', { options: { maxOpusWorkers: 1 } }, async ($, on) => {
     const runs = fakeRepo(on)
     const clock = mock.clock(on)
     const drop = await runs.flock.take() // another session holds it, and is slow
     const first = spawn($, 'opus')
     const second = spawn($, 'sonnet', 'tidy it')
-    await clock.advance(60_000) // far past the old takeover age
+    await clock.advance(10_000) // far past the old takeover age, short of the 15 s wait
     expect(bgStarts(runs)).toBe(0)
     expect(runs.some(run => ['mv', 'rm', 'rmdir'].includes(run.argv[0] ?? ''))).toBe(false)
     drop()
@@ -391,6 +405,34 @@ describe('maxOpusWorkers', () => {
     expect(await second).toContain('Started background worker')
     expect(runs.flock.most).toBe(1) // one holder at a time
     expect(runs.flock.holders).toBe(0) // each hold ended with its holder
+  })
+
+  test('a lock held past the wait refuses the start: no worker, no reservation, no orphaned holder (regression)', { options: { maxOpusWorkers: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on)
+    const clock = mock.clock(on)
+    const drop = (await runs.flock.take()) // another session holds it, and stays slow
+    const starting = spawn($, 'opus')
+    await clock.advance(10_000)
+    runs.flock.expire() // perl's 15 s wait runs out
+    expect(await starting).toContain('office capacity lock busy; try again in a moment')
+    drop() // the slow holder lets go: the waiter's holder must not take the lock now
+    await clock.settle()
+    expect(bgStarts(runs)).toBe(0)
+    expect(runs.sets).not.toContain('reservedSlots')
+    expect(runs.flock.holders).toBe(0)
+  })
+
+  test('with perl unavailable there is no cross-session lock: the start goes on, logged loudly once', { options: { maxOpusWorkers: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { perl: 'missing' })
+    const logged: string[] = []
+    on('ui.log', (_$, e) => {
+      logged.push(e.text)
+      return { value: undefined }
+    })
+    expect(await spawn($, 'opus')).toContain('Started background worker')
+    expect(await spawn($, 'sonnet', 'tidy it')).toContain('Started background worker')
+    expect(bgStarts(runs)).toBe(2)
+    expect(logged.filter(line => line.includes('no cross-session capacity lock'))).toHaveLength(1)
   })
 
   test('a slow start keeps its slot past one reservation\'s life (regression)', { options: { maxWorkers: 8, maxOpusWorkers: 1 } }, async ($, on) => {
