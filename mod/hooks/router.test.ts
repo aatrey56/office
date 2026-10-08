@@ -2,11 +2,9 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { CODEX_DEFAULTS, codexQuotaMessage, codexReviewArgv, codexReviewPrompt, parseReviewTarget } from './codex'
-import { HAIKU_RETIRES_AT, MODEL_IDS, modelIdFor, parseClaudeRoute, parseJevResponse, rulesRoute } from './router'
+import { MODEL_IDS, modelIdFor, parseClaudeRoute, parseJevResponse, rulesRoute } from './router'
 import { bgArgv, bgPhase, headlessArgv, parseAgentsJson, parseBgId, readTranscript, transcriptPath } from './spawn'
 
-const BEFORE = Date.UTC(2026, 9, 3) // haiku still available
-const AFTER = HAIKU_RETIRES_AT + 1 // haiku retired
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 // The reply shape docs.aimlapi.com/api-references/decision-models/typesafe/jev shows, verbatim in form.
@@ -18,15 +16,19 @@ const DOCS_REPLY =
 
 describe('rules backend', () => {
   test('review / refactor / debug go to opus/high', () => {
-    expect(rulesRoute('review this PR for correctness', BEFORE)).toMatchObject({ model: 'opus', effort: 'high' })
-    expect(rulesRoute('refactor the parser module', BEFORE)).toMatchObject({ model: 'opus', effort: 'high' })
-    expect(rulesRoute('debug why the upload hangs', BEFORE)).toMatchObject({ model: 'opus', effort: 'high' })
+    expect(rulesRoute('review this PR for correctness')).toMatchObject({ model: 'opus', effort: 'high' })
+    expect(rulesRoute('refactor the parser module')).toMatchObject({ model: 'opus', effort: 'high' })
+    expect(rulesRoute('debug why the upload hangs')).toMatchObject({ model: 'opus', effort: 'high' })
+  })
+  test('a mechanical rename goes to haiku, architecture to opus', () => {
+    expect(rulesRoute('rename get_usr to get_user in utils.py')).toMatchObject({ model: 'haiku', effort: 'low' })
+    expect(rulesRoute('design the event-sourcing architecture for orders')).toMatchObject({ model: 'opus', effort: 'high' })
   })
 })
 
 describe('jev backend', () => {
   test('the literal documented reply', () => {
-    expect(parseJevResponse(DOCS_REPLY, BEFORE)).toEqual({
+    expect(parseJevResponse(DOCS_REPLY)).toEqual({
       model: 'opus',
       effort: 'high',
       confidence: 0.88,
@@ -53,7 +55,7 @@ describe('route through the plugin', () => {
     on('model.complete', () => ({ value: { isAnswered: true, text: 'opus, probably', usage: USAGE } }))
     const r = await $.tool.call({ tool: 'mcp__office__route_task', task: 'rename x to y' })
     const text = JSON.stringify(r.result)
-    expect(text).toContain('sonnet')
+    expect(text).toContain('haiku')
     expect(text).toContain('rules in')
     expect(text).toContain('claude: unparseable reply')
   })
@@ -93,12 +95,13 @@ describe('codex handoff', () => {
 })
 
 describe('model ids', () => {
-  test('haiku maps to sonnet once retired, explicit ids included', () => {
-    expect(modelIdFor('haiku', BEFORE)).toBe(MODEL_IDS.haiku)
-    expect(modelIdFor('haiku', AFTER)).toBe(MODEL_IDS.sonnet)
-    expect(modelIdFor('claude-haiku-4-5', AFTER)).toBe(MODEL_IDS.sonnet)
-    expect(modelIdFor('opus', AFTER)).toBe(MODEL_IDS.opus)
-    expect(modelIdFor('claude-opus-5-5', AFTER)).toBe('claude-opus-5-5')
+  test('fable is never routed, but an explicit fable is honoured', () => {
+    expect(parseClaudeRoute('{"model":"fable","effort":"high"}')?.model).toBe('opus')
+    const jev = JSON.stringify({ answers: { model: { choice: 'fable', confidence: 0.9 }, effort: { choice: 'high', confidence: 0.9 } } })
+    expect(parseJevResponse(jev)?.model).toBe('opus')
+    expect(modelIdFor('fable')).toBe(MODEL_IDS.fable)
+    expect(modelIdFor('haiku')).toBe('claude-haiku-5-5')
+    expect(modelIdFor('claude-opus-5-5')).toBe('claude-opus-5-5')
   })
 })
 
@@ -145,13 +148,13 @@ describe('codex tiers', () => {
 
 describe('effort cap', () => {
   test('routers never pick above high', () => {
-    expect(rulesRoute('design multi-region billing architecture', BEFORE)).toMatchObject({ model: 'fable', effort: 'high' })
-    expect(parseClaudeRoute('{"model":"fable","effort":"xhigh"}', BEFORE)?.effort).toBe('high')
-    expect(parseClaudeRoute('{"model":"fable","effort":"max"}', BEFORE)?.effort).toBe('high')
+    expect(rulesRoute('design multi-region billing architecture')).toMatchObject({ model: 'opus', effort: 'high' })
+    expect(parseClaudeRoute('{"model":"fable","effort":"xhigh"}')?.effort).toBe('high')
+    expect(parseClaudeRoute('{"model":"fable","effort":"max"}')?.effort).toBe('high')
     const jev = JSON.stringify({
       answers: { model: { choice: 'fable', confidence: 0.9 }, effort: { choice: 'max', confidence: 0.9 } },
     })
-    expect(parseJevResponse(jev, BEFORE)?.effort).toBe('high')
+    expect(parseJevResponse(jev)?.effort).toBe('high')
   })
 })
 
@@ -198,8 +201,8 @@ describe('--bg workers', () => {
 describe('/route-eval', () => {
   const ASK = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
   const CASES = [
-    '{"id":"a","task":"rename fooBar to foo_bar across utils.py","model":"sonnet","effort":"low","why":"mechanical"}',
-    '{"id":"b","task":"rename fooBar to foo_bar across utils.py","model":"fable","effort":"high","why":"deliberately wrong label"}',
+    '{"id":"a","task":"rename fooBar to foo_bar across utils.py","model":"haiku","effort":"low","why":"mechanical"}',
+    '{"id":"b","task":"rename fooBar to foo_bar across utils.py","model":"opus","effort":"high","why":"deliberately wrong label"}',
   ].join('\n')
 
   test('rules: scores the labeled file, saves a dated record, and never calls a model', async ($, on) => {
@@ -222,7 +225,7 @@ describe('/route-eval', () => {
     const ran = await $.command.run({ command: 'route-eval', args: 'rules', ...ASK })
     expect(ran.text).toContain('rules')
     expect(ran.text).toContain('2/2')
-    expect(ran.text).toContain('b: want fable/high, got sonnet/low')
+    expect(ran.text).toContain('b: want opus/high, got haiku/low')
     expect(modelCalls).toBe(0)
     expect(written).toHaveLength(1)
     expect(written[0]?.path).toMatch(/^\/fake\/config\/office\/evals\/results\/.*-rules\.json$/)
@@ -244,7 +247,7 @@ describe('/route-eval', () => {
     expect(pub).toContain('public: evals/routing.jsonl (2 tasks)')
     expect(pub).toContain('2/2')
     expect(local).toContain('1/1')
-    expect(local).toContain('l01: want opus/high, got sonnet/low')
+    expect(local).toContain('l01: want opus/high, got haiku/low')
     expect(written.map(p => p.replace(/.*\//, '').replace(/^.*Z-/, ''))).toEqual(['rules.json', 'local-rules.json'])
   })
 })

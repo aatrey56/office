@@ -118,7 +118,7 @@
     "budgetSoftFiveHourPct": {
       "type": "number",
       "title": "Budget: 5-hour soft line (%)",
-      "description": "From this share of the 5-hour limit, only small routed tasks (sonnet at low or medium effort) start as workers.",
+      "description": "From this share of the 5-hour limit, only small routed tasks (haiku, or sonnet at low or medium effort) start as workers.",
       "default": 80
     },
     "budgetSoftSevenDayPct": {

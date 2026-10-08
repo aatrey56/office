@@ -194,9 +194,16 @@ describe('--bg worker finish: the [office: done] marker', () => {
   })
 })
 
-// No session.append beneath the test: each result is delivered as the prompt.
+// A result reaches the model as an appended user row (the full text) plus, when the main loop is idle, a
+// submitted nudge. Both are collected; a refused append would fall back to submitting the full text.
 function collectDelivery(on: On): string[] {
   const delivered: string[] = []
+  on('session.append', (_$, e, next) => {
+    for (const block of e.message.content) {
+      if (block.type === 'text' && typeof block.text === 'string') delivered.push(block.text)
+    }
+    return next(e)
+  })
   on('prompt.submit', (_$, e) => {
     delivered.push(e.text)
     return { text: '' }

@@ -359,7 +359,7 @@ export function installJobs(on: On, options: PluginOptions) {
     const stamp = new Date(now).toISOString().replace(/[:.]/g, '-')
     for (const backend of backends as RouteDecision['backend'][]) {
       for (const set of sets) {
-        const outcomes = await evalBackend($, options, backend, set.cases, jevKey, now)
+        const outcomes = await evalBackend($, options, backend, set.cases, jevKey)
         const report = scoreRoutes(set.cases, outcomes, backend)
         set.reports.push(report)
         // A dated record, so a later run (a new rubric, Jev) has something to compare against.
@@ -509,18 +509,17 @@ async function evalBackend(
   backend: RouteDecision['backend'],
   cases: RouteCase[],
   jevKey: string | undefined,
-  now: number,
 ): Promise<RouteOutcome[]> {
   const one = async (c: RouteCase): Promise<RouteOutcome> => {
     const t0 = Date.now()
     const got =
       backend === 'rules'
-        ? rulesRoute(c.task, now)
+        ? rulesRoute(c.task)
         : backend === 'jev'
           ? jevKey
-            ? await routeJev($, options, jevKey, c.task, now)
+            ? await routeJev($, options, jevKey, c.task)
             : 'no key'
-          : await routeClaude($, options, c.task, now)
+          : await routeClaude($, options, c.task)
     if (typeof got === 'string') return { id: c.id, error: got }
     return { id: c.id, model: got.model, effort: got.effort, latencyMs: Date.now() - t0 }
   }
@@ -532,7 +531,6 @@ async function evalBackend(
 }
 
 async function route($: EngineInterface, options: PluginOptions, task: string): Promise<RouteDecision> {
-  const now = Date.now()
   const forced = opt(options, 'routerBackend', 'auto')
   const wantsJev = forced === 'auto' || forced === 'jev'
   const jevKey = wantsJev ? await resolveJevKey($, options) : undefined
@@ -546,9 +544,9 @@ async function route($: EngineInterface, options: PluginOptions, task: string): 
     const got =
       backend === 'jev'
         ? jevKey
-          ? await routeJev($, options, jevKey, task, now)
+          ? await routeJev($, options, jevKey, task)
           : 'no key (Keychain service aimlapi, jevApiKey, or AIMLAPI_KEY)'
-        : await routeClaude($, options, task, now)
+        : await routeClaude($, options, task)
     if (typeof got === 'string') {
       misses.push(`${backend}: ${got}`)
       continue
@@ -558,7 +556,7 @@ async function route($: EngineInterface, options: PluginOptions, task: string): 
   }
   if (decision === undefined) {
     const t0 = Date.now()
-    const r = rulesRoute(task, now)
+    const r = rulesRoute(task)
     const reason = misses.length === 0 ? r.reason : `${r.reason} [${misses.join('; ')}]`
     decision = { ...r, reason, backend: 'rules', latencyMs: Date.now() - t0 }
   }
@@ -595,13 +593,12 @@ async function routeJev(
   options: PluginOptions,
   key: string,
   task: string,
-  now: number,
 ): Promise<Routed | string> {
   const url = opt(options, 'jevEndpoint', 'https://api.aimlapi.com/v1/decisions')
   const fetching = $.http.fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-    body: jevRequestBody(task, now),
+    body: jevRequestBody(task),
   })
   fetching.catch(() => undefined) // a late failure after the timeout is nobody's
   let timer: Timer | undefined
@@ -612,7 +609,7 @@ async function routeJev(
     const res = await Promise.race([fetching, timeout])
     if (res === 'timeout') return `timed out after ${JEV_TIMEOUT_MS / 1000}s`
     if (!res.ok) return `HTTP ${res.status}`
-    return parseJevResponse(res.text, now) ?? 'unparseable reply'
+    return parseJevResponse(res.text) ?? 'unparseable reply'
   } catch {
     return 'request failed'
   } finally {
@@ -620,19 +617,19 @@ async function routeJev(
   }
 }
 
-async function routeClaude($: EngineInterface, options: PluginOptions, task: string, now: number): Promise<Routed | string> {
+async function routeClaude($: EngineInterface, options: PluginOptions, task: string): Promise<Routed | string> {
   const model = opt(options, 'routerModel', MODEL_IDS.sonnet)
   try {
     const r = await $.model.complete({
       model,
       system: CLAUDE_SYSTEM,
-      prompt: claudePrompt(task, now),
+      prompt: claudePrompt(task),
       maxTokens: 300,
       effort: 'low',
       timeoutMs: 20000,
     })
     if (!r.isAnswered) return r.reason === 'api-error' ? `api-error ${r.error}` : r.reason
-    return parseClaudeRoute(r.text, now) ?? 'unparseable reply'
+    return parseClaudeRoute(r.text) ?? 'unparseable reply'
   } catch (err) {
     return `refused: ${String(err).slice(0, 120)}`
   }
@@ -1304,7 +1301,7 @@ async function startWorker(
   const cwd = await resolveCwd($, cwdArg)
   const now = Date.now()
   const routed = modelArg === undefined ? await route($, options, task) : undefined
-  const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet', now)
+  const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet')
   const effort: Effort = isEffort(effortArg) ? effortArg : (routed?.effort ?? 'medium')
   const verdict = budgetVerdict(windows, caps, {
     isSmall: isSmallRoute(routed?.model ?? tierOfModelId(modelId), effort),
@@ -1435,7 +1432,7 @@ async function planAgent($: EngineInterface, options: PluginOptions, e: AgentSpa
   const verdict = agentGuard(windows, caps, pin, e.parentModel, routed)
   if ('deny' in verdict) return { deny: verdict.deny }
   if (verdict.size === undefined || routed === undefined) return {}
-  return { model: modelIdFor(verdict.size, Date.now()), routed }
+  return { model: modelIdFor(verdict.size), routed }
 }
 
 /** What pins this spawn's model; a definition that cannot be read leaves it unknown, so never overridden. */
