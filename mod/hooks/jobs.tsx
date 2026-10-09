@@ -62,7 +62,6 @@ import {
   liveReservations,
   newestBgSince,
   newJobId,
-  parseAgentsJson,
   parseAgentsListing,
   parseBgId,
   parseBgIds,
@@ -879,6 +878,10 @@ async function takeCapLock($: EngineInterface): Promise<(() => Promise<void>) | 
   return undefined
 }
 
+/** Consecutive unreadable `claude agents` listings in bgView; a good one resets it. */
+let unreadableListings = 0
+const UNREADABLE_WARN_AT = 3
+
 /** Reads the stored --bg ids, then lists `claude agents`; ids it shows gone are pruned under the lock, when counting. */
 async function bgView($: EngineInterface, options: PluginOptions): Promise<BgView> {
   const before = parseBgIds(await storeGet($, BG_STORE_KEY))
@@ -887,7 +890,16 @@ async function bgView($: EngineInterface, options: PluginOptions): Promise<BgVie
     .run([opt(options, 'claudePath', 'claude'), 'agents', '--json', '--all'], { timeoutMs: 20000 })
     .catch(() => undefined)
   if (listed === undefined || listed.exitCode !== 0) return { before }
-  return { before, agents: parseAgentsJson(listed.stdout) }
+  // A cut or malformed listing proves nothing: reading it as empty would prune every stored id.
+  const agents = listed.isStdoutTruncated ? undefined : parseAgentsListing(listed.stdout)
+  if (agents !== undefined) {
+    unreadableListings = 0
+    return { before, agents }
+  }
+  if (++unreadableListings % UNREADABLE_WARN_AT === 0) {
+    debugLog($, `office: WARNING ${UNREADABLE_WARN_AT} unreadable \`claude agents\` listings in a row; worker counts are not pruned and may be stale`)
+  }
+  return { before }
 }
 
 /**
@@ -1879,7 +1891,8 @@ async function launchWorker(
     if (bgId === undefined && r.exitCode === 0) {
       // Started but printed no id we could read: the newest background session here.
       const listed = await $.process.run([claudeBin, 'agents', '--json', '--all'], { timeoutMs: 20000 }).catch(() => undefined)
-      bgId = listed?.exitCode === 0 ? newestBgSince(parseAgentsJson(listed.stdout), job.cwd, spawnedAt)?.id : undefined
+      const agents = listed?.exitCode === 0 && !listed.isStdoutTruncated ? parseAgentsListing(listed.stdout) : undefined
+      bgId = agents !== undefined ? newestBgSince(agents, job.cwd, spawnedAt)?.id : undefined
     }
     if (bgId === undefined) {
       const why = (r.stderr || r.stdout).trim() || `exit ${r.exitCode}`

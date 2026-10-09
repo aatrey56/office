@@ -22,7 +22,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -80,6 +80,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
       return out('', 124)
     }
     if (argv.includes('agents') && isStopAsked && fake.afterStop !== undefined && fake.afterStop !== 'slow') return out(fake.afterStop)
+    if (argv.includes('agents') && fake.rawAgents !== undefined) return { value: { ...RUN, ...fake.rawAgents } }
     if (argv.includes('agents')) {
       const listed = JSON.parse(fake.agents?.() ?? '[]') as { id: string; state?: string }[]
       return out(JSON.stringify(listed.map(a => (stopped.has(a.id) ? { ...a, state: 'stopped' } : a))))
@@ -623,6 +624,20 @@ describe('maxOpusWorkers', () => {
     // One still in time holds its slot. (5ac0f0df is not listed, so it is pruned and does not count.)
     runs.store.set('reservedSlots', [{ id: 'held.2', isOpus: true, until: Date.now() + 60_000 }])
     expect(await spawn($, 'opus')).toContain('1 Opus jobs already running (maxOpusWorkers 1)')
+  })
+
+  for (const [what, rawAgents] of [['malformed', { stdout: '[{"id":"a1","kind":"back' }], ['truncated', { stdout: '[]', isStdoutTruncated: true }]] as const) {
+    test(`a ${what} listing proves nothing: no stored id is pruned, the caps still count them (regression)`, { options: { maxWorkers: 2 } }, async ($, on) => {
+      const runs = fakeRepo(on, { rawAgents, store: { bgIds: ['a1', 'b2'], bgModels: { a1: OPUS, b2: OPUS } } })
+      expect(await spawn($, 'sonnet')).toContain('Started background worker')
+      expect(runs.store.get('bgIds')).toEqual(['a1', 'b2', '5ac0f0df'])
+    })
+  }
+
+  test('a truncated listing is not searched for a worker whose --bg printed no id (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const startedAt = Date.now() + 60000
+    fakeRepo(on, { bg: 'started\n', rawAgents: { stdout: JSON.stringify([{ id: 'c3', kind: 'background', cwd: '/r/src', startedAt }]), isStdoutTruncated: true } })
+    expect(await spawn($, 'sonnet')).toContain('gave no session id')
   })
 
   test('pruning keeps an id another session registered during the listing; gone ids lose their models (regression)', { options: { maxWorkers: 8 } }, async ($, on) => {
