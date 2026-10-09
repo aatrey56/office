@@ -157,6 +157,7 @@ const SETTLE_BACKOFF_MS = 2000
 /** How many times a booking measures the diff again when another session added a round meanwhile. */
 const MEASURE_ATTEMPTS = 3
 const ROUNDS_BUSY_TEXT = 'office review ledger lock busy; try again in a moment.'
+const ROUNDS_UNRECORDED_TEXT = 'office could not record the review round; try again in a moment.'
 /** $.store key manage.tsx keeps: project root → its manager session. */
 const MANAGERS_KEY = 'managers'
 
@@ -1535,6 +1536,7 @@ async function startCodexReview(
     plan.note !== undefined ? `This is a ${plan.note}.` : '',
     isLast ? 'It is the last round an agent can start on this branch.' : '',
     verdict.warning ? `Budget: ${verdict.warning}` : '',
+    booked?.isUnrecorded ? 'The round was not recorded (the review ledger could not be written), so it does not count toward the cap.' : '',
   ].filter(Boolean)
   return {
     ok: true,
@@ -1565,7 +1567,7 @@ async function bookRound(
   policy: RoundPolicy,
   facts: Omit<RoundFacts, 'rounds' | 'head' | 'sinceLast'>,
   fallback: ReviewTarget,
-): Promise<RoundPlan | string | undefined> {
+): Promise<(RoundPlan & { isUnrecorded?: true }) | string | undefined> {
   const head = await gitOut($, cwd, ['rev-parse', 'HEAD'])
   const commonDir = await gitOut($, cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
   if (!head || !commonDir) return undefined
@@ -1599,8 +1601,10 @@ async function bookRound(
           isCovering: planCovers(plan, fallback),
           ...(facts.isPerson ? { isPerson: true } : {}),
         }
-        await saveLedgerLocked($, stored, { ...ledger, [key]: [...rounds, round] }, pending)
-        return plan
+        const isRecorded = await saveLedgerLocked($, stored, { ...ledger, [key]: [...rounds, round] }, pending)
+        if (isRecorded) return plan
+        // never recorded, so the cap could not count it: an agent waits, the person's review runs and says so
+        return facts.isPerson ? { ...plan, isUnrecorded: true as const } : ROUNDS_UNRECORDED_TEXT
       })
       if (booked !== undefined) return booked
       measured = await measureLast()
@@ -1611,7 +1615,7 @@ async function bookRound(
   }
 }
 
-/** The ledger as stored, with the pending settlements applied (call holding the rounds lock). */
+/** The ledger as stored, with the pending settlements applied. Only reads: safe with or without the rounds lock. */
 async function readLedgerLocked($: EngineInterface, now: number) {
   const stored = await storeGet($, ROUNDS_KEY)
   const pending: (PendingSettle & { key: string })[] = []
@@ -1625,19 +1629,27 @@ async function readLedgerLocked($: EngineInterface, now: number) {
 
 /**
  * Writes the ledger when it changed, then clears the pending settlements it applied (call holding
- * the rounds lock). A write that fails keeps them pending, for the next ledger access to apply.
+ * the rounds lock). A write that fails keeps them pending, for the next ledger access to apply, and
+ * returns false: the caller's own changes are then only in memory and it must park them.
  */
 async function saveLedgerLocked(
   $: EngineInterface,
   stored: unknown,
   ledger: RoundLedger,
   pending: readonly { key: string }[],
-): Promise<void> {
+): Promise<boolean> {
   if (JSON.stringify(ledger) !== JSON.stringify(stored)) {
     const isWritten = await $.store.set(ROUNDS_KEY, ledger).then(() => true, () => false)
-    if (!isWritten) return
+    if (!isWritten) return false
   }
   for (const p of pending) await $.store.delete(p.key).catch(() => undefined)
+  return true
+}
+
+/** Keeps a settlement under its own store key, for the next ledger access to apply (best effort). */
+async function parkSettlement($: EngineInterface, jobId: string, findings?: string): Promise<void> {
+  const record: PendingSettle = { jobId, at: Date.now(), ...(findings !== undefined ? { findings } : {}) }
+  await $.store.set(`${SETTLE_PREFIX}${jobId}`, record).catch(() => undefined)
 }
 
 /** Whether `sha` is still an ancestor of HEAD, and the lines changed since it (committed or not). */
@@ -1680,13 +1692,14 @@ async function settleRound($: EngineInterface, jobId: string, findings: string |
     if (attempt < SETTLE_ATTEMPTS) await new Promise<void>(resolve => void $.clock.after(SETTLE_BACKOFF_MS * attempt, resolve))
   }
   debugLog($, `office: review ledger lock busy; round of job ${jobId} settles on the next ledger access`)
-  const record: PendingSettle = { jobId, at: Date.now(), ...(findings !== undefined ? { findings } : {}) }
-  await $.store.set(`${SETTLE_PREFIX}${jobId}`, record).catch(() => undefined)
+  await parkSettlement($, jobId, findings)
 }
 
 async function settleLocked($: EngineInterface, jobId: string, findings: string | undefined): Promise<void> {
   const { stored, ledger, pending } = await readLedgerLocked($, Date.now())
-  await saveLedgerLocked($, stored, settledAll(ledger, [{ jobId, findings, at: Date.now() }]), pending)
+  if (!(await saveLedgerLocked($, stored, settledAll(ledger, [{ jobId, findings, at: Date.now() }]), pending))) {
+    await parkSettlement($, jobId, findings)
+  }
 }
 
 /** At load: applies the settlements a busy lock left pending, and drops the rounds of Codex reviews the reload interrupted. */
@@ -1695,12 +1708,14 @@ async function reconcileSettlements($: EngineInterface, interruptedJobIds: reado
     await withLock($, ROUNDS_LOCK, async () => {
       const { stored, ledger, pending } = await readLedgerLocked($, Date.now())
       const dropped = interruptedJobIds.map(jobId => ({ jobId, at: Date.now() }))
-      await saveLedgerLocked($, stored, settledAll(ledger, dropped), pending)
+      if (!(await saveLedgerLocked($, stored, settledAll(ledger, dropped), pending))) {
+        for (const { jobId } of dropped) await parkSettlement($, jobId)
+      }
     })
   } catch (err) {
     if (!(err instanceof CapLockBusy)) throw err
     // an interrupted job's round has no findings to keep: park its drop where the next access finds it
-    for (const jobId of interruptedJobIds) await $.store.set(`${SETTLE_PREFIX}${jobId}`, { jobId, at: Date.now() }).catch(() => undefined)
+    for (const jobId of interruptedJobIds) await parkSettlement($, jobId)
   }
 }
 

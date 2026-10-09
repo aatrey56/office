@@ -502,17 +502,18 @@ describe('codex review rounds', () => {
   const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings, isCovering: true })
   const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }, failSet?: string) => {
     const reviews: { argv: readonly string[]; input?: string }[] = []
-    const runs = fakeRepo(on, {
+    const fake: Fake = {
       store,
       failSet,
       untracked: untracked && `${untracked.path}\0`,
       async *spawn(e) {
         if (e.argv[0] === 'codex') reviews.push(e)
       },
-    })
+    }
+    const runs = fakeRepo(on, fake)
     on('fs.read', (_$, e) => ({ value: untracked && e.path.endsWith(untracked.path) ? 'x\n'.repeat(untracked.lines) : 'No P1/P2 left.' }))
     collectDelivery(on)
-    return { runs, reviews }
+    return { runs, reviews, fake }
   }
 
   test('round 2 from the tool re-reviews vs the last sha on luna with its findings; its own are kept', { options: { workerWorktree: 'off' } }, async ($, on) => {
@@ -611,6 +612,30 @@ describe('codex review rounds', () => {
     mock.clock(on)
     await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
     expect(runs.store.get('codexSettle:j-old')).toMatchObject({ findings: '[P1] kept' })
+  })
+
+  test('a settlement whose own ledger write fails is parked, so its findings are not lost (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, fake } = reviewRuns(on, {})
+    const clock = mock.clock(on)
+    const id = /job (\S+),/.exec(String((await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })).result))![1]!
+    fake.failSet = 'codexRounds' // the booking was written; the settlement's write now fails
+    await clock.advance(0)
+    await clock.settle()
+    expect(runs.store.get(`codexSettle:${id}`)).toMatchObject({ jobId: id, findings: 'No P1/P2 left.' })
+  })
+
+  test('a round whose ledger write fails is refused for the agent; the person\'s review runs and says it was not recorded (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { reviews } = reviewRuns(on, {}, undefined, 'codexRounds')
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(r.deny ?? String(r.result)).toContain('could not record the review round')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(0)
+    const typed = await $.command.run({ command: 'codex-review', args: '', ...TYPED })
+    expect(JSON.stringify(typed)).toContain('round was not recorded')
+    await clock.advance(0)
+    await clock.settle()
+    expect(reviews).toHaveLength(1)
   })
 
   test('a drop pending for the newest of two covering rounds leaves the other as the baseline of an incremental review (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
