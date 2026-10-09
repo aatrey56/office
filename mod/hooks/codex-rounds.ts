@@ -12,6 +12,7 @@ export type ReviewRound = {
   at: number
   findings?: string
   isPerson?: boolean // the person's own /codex-review
+  isCovering?: boolean // reviewed the whole branch through `sha`: only such a round can be the next re-review's baseline
 }
 /** Branch key (git common dir + branch) → its rounds, oldest first. */
 export type RoundLedger = Record<string, ReviewRound[]>
@@ -83,6 +84,17 @@ export type RoundPlan =
   | { isAllowed: false; reason: string }
   | { isAllowed: true; round: number; isRereview: boolean; tier: CodexTier; target?: ReviewTarget; instructions?: string; note?: string }
 
+/** Whether a target reviews the whole branch up to HEAD: a diff against a branch, not a commit, a bare sha or the working tree. */
+export function coversBranch(target: ReviewTarget): boolean {
+  const [flag, value = ''] = target.args
+  return flag === '--base' && !/^[0-9a-f]{7,40}$/i.test(value) && !/[~^@]/.test(value)
+}
+
+/** Whether the round `plan` starts covers the branch through HEAD: a re-review does (its baseline was valid), else its target decides. */
+export function planCovers(plan: { isRereview: boolean; target?: ReviewTarget }, fallback: ReviewTarget): boolean {
+  return plan.isRereview || coversBranch(plan.target ?? fallback)
+}
+
 const short = (sha: string) => sha.slice(0, 7)
 
 /**
@@ -104,7 +116,7 @@ export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPl
     isAllowed: true, round, isRereview: false, tier: policy.review, target: facts.target, instructions: facts.instructions, note,
   })
   if (facts.isPerson || last === undefined) return full()
-  if (last.sha === head && !isDirty) {
+  if (last.sha === head && !isDirty && last.isCovering === true) {
     return { isAllowed: false, reason: `Nothing new since round ${rounds.length} (${short(head)}, clean tree): no review started.` }
   }
   if (rounds.length >= policy.maxRounds) {
@@ -120,6 +132,9 @@ export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPl
   // An explicit target is not a way round the cheaper model: only full / deep earn the review model.
   if (facts.target !== undefined) {
     return { isAllowed: true, round, isRereview: false, tier: policy.rereview, target: facts.target, instructions: facts.instructions }
+  }
+  if (last.isCovering !== true) {
+    return full(`full review: round ${rounds.length} (${short(last.sha)}) did not review the whole branch, so it cannot be a baseline`)
   }
   const since = facts.sinceLast
   if (since === undefined || !since.isAncestor) {

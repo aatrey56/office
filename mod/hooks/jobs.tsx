@@ -32,7 +32,7 @@ import {
   parseCodexReviewArgs,
 } from './codex-budget'
 import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
-import { branchKey, parseLedger, planReviewRound, roundOf, roundTitle, settledLedger, shortstatLines } from './codex-rounds'
+import { branchKey, parseLedger, planCovers, planReviewRound, roundOf, roundTitle, settledLedger, shortstatLines } from './codex-rounds'
 import type { RoundFacts, RoundPlan, RoundPolicy } from './codex-rounds'
 import {
   CLAUDE_SYSTEM,
@@ -1569,7 +1569,11 @@ async function bookRound(
       if (!plan.isAllowed) return plan
       const target = plan.target ?? fallback
       const base = target.args[0] === '--base' ? target.args[1]! : target.label
-      const round = { sha: head, base, model: plan.tier.model, jobId, at: now, ...(facts.isPerson ? { isPerson: true } : {}) }
+      const round = {
+        sha: head, base, model: plan.tier.model, jobId, at: now,
+        isCovering: planCovers(plan, fallback),
+        ...(facts.isPerson ? { isPerson: true } : {}),
+      }
       await $.store.set(ROUNDS_KEY, { ...ledger, [key]: [...rounds, round] }).catch(() => undefined)
       return plan
     })

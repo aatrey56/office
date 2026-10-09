@@ -491,7 +491,7 @@ describe('codex review rounds', () => {
   const KEY = '/r/.git#feature'
   const OLD = 'f00d'.repeat(10)
   const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
-  const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings })
+  const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings, isCovering: true })
   const reviewRuns = (on: On, store: Record<string, unknown>) => {
     const reviews: { argv: readonly string[]; input?: string }[] = []
     const runs = fakeRepo(on, {
@@ -522,6 +522,19 @@ describe('codex review rounds', () => {
       [OLD, 'main', '[P1] x.ts:3 off by one'],
       [BASE, OLD, 'No P1/P2 left.'],
     ])
+  })
+
+  test('a --commit round is not a baseline: the next automatic round is a full review vs main (coverage)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [{ ...round(OLD, '[P2] y'), isCovering: false }] } })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6.1-sol)')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    const rounds = (runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!
+    expect(rounds.map(x => x.isCovering)).toEqual([false, true])
+    await $.command.run({ command: 'codex-review', args: '--commit abc1234', ...TYPED })
+    expect((runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!.map(x => x.isCovering)).toEqual([false, true, false])
   })
 
   test('at the cap the tool is refused; the person\'s /codex-review still runs, on sol, and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {

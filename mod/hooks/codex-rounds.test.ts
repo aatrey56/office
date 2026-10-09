@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CODEX_DEFAULTS } from './codex'
-import { FINDINGS_MAX, parseLedger, planReviewRound, ROUND_TTL_MS, roundTitle, settledLedger, shortstatLines } from './codex-rounds'
+import { coversBranch, FINDINGS_MAX, parseLedger, planCovers, planReviewRound, ROUND_TTL_MS, roundTitle, settledLedger, shortstatLines } from './codex-rounds'
 import type { ReviewRound, RoundFacts } from './codex-rounds'
 
 const A = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
 const B = 'b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3'
 const policy = { maxRounds: 3, maxLines: 400, review: CODEX_DEFAULTS.review, rereview: CODEX_DEFAULTS.rereview }
-const round = (sha: string, findings?: string): ReviewRound => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: 0, findings })
+const round = (sha: string, findings?: string): ReviewRound => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: 0, findings, isCovering: true })
 const facts = (over: Partial<RoundFacts> = {}): RoundFacts => ({
   rounds: [round(A, '[P1] x.ts:3 off by one')],
   head: B,
@@ -52,6 +52,23 @@ describe('codex review rounds', () => {
     expect(planReviewRound(facts({ target }), policy)).toMatchObject({ isAllowed: true, round: 2, isRereview: false, tier: CODEX_DEFAULTS.rereview, target })
     expect(planReviewRound(facts({ target, isFull: true }), policy)).toMatchObject({ tier: CODEX_DEFAULTS.review, target })
     expect(planReviewRound(facts({ rounds: [], target }), policy)).toMatchObject({ round: 1, tier: CODEX_DEFAULTS.review })
+  })
+
+  test('only a round that covered the whole branch is a baseline; otherwise the next round is a full review (coverage)', () => {
+    const commit = { args: ['--commit', A], label: `commit ${A}` }
+    const uncommitted = { args: ['--uncommitted'], label: 'uncommitted changes' }
+    const vsMain = { args: ['--base', 'main'], label: 'vs main' }
+    expect(coversBranch(vsMain)).toBe(true)
+    expect([commit, uncommitted, { args: ['--base', A.slice(0, 9)], label: '' }, { args: ['--base', 'HEAD~2'], label: '' }].map(coversBranch)).toEqual([false, false, false, false])
+    expect(planCovers({ isRereview: true, target: { args: ['--base', A], label: '' } }, vsMain)).toBe(true)
+    expect(planCovers({ isRereview: false }, uncommitted)).toBe(false) // the default target of a dirty tree
+    expect(planCovers({ isRereview: false }, vsMain)).toBe(true)
+    // A --commit round at HEAD left the rest unreviewed: not a no-op, not a baseline.
+    const partial = [{ ...round(A, '[P2] y'), isCovering: false }]
+    expect(planReviewRound(facts({ rounds: partial, head: A }), policy)).toMatchObject({ isAllowed: true, isRereview: false, tier: CODEX_DEFAULTS.review })
+    const plan = planReviewRound(facts({ rounds: partial }), policy) as { isRereview: boolean; note: string }
+    expect(plan.isRereview).toBe(false)
+    expect(plan.note).toContain('did not review the whole branch')
   })
 
   test('at codexMaxRounds an agent is refused and told to ask the person; the person is not', () => {
