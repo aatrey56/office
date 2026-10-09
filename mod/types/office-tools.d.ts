@@ -23,6 +23,7 @@ declare module 'claude-code' {
     mcp__office__codex_review: {
       target?: string
       instructions?: string
+      full?: boolean
       deep?: boolean
       cwd?: string
     }

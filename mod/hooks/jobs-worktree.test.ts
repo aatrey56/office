@@ -16,7 +16,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -53,6 +53,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
     if (cmd.includes('--git-common-dir')) return out('/r/.git\n')
     if (cmd.endsWith('rev-parse HEAD')) return out(`${BASE}\n`)
+    if (cmd.includes('symbolic-ref')) return out('feature\n')
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
     if (argv.includes('--bg')) {
@@ -483,6 +484,58 @@ describe('maxOpusWorkers', () => {
     await clock.settle()
     drop()
     expect(await next).toContain('Started background worker')
+  })
+})
+
+describe('codex review rounds', () => {
+  const KEY = '/r/.git#feature'
+  const OLD = 'f00d'.repeat(10)
+  const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
+  const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings })
+  const reviewRuns = (on: On, store: Record<string, unknown>) => {
+    const reviews: { argv: readonly string[]; input?: string }[] = []
+    const runs = fakeRepo(on, {
+      store,
+      async *spawn(e) {
+        if (e.argv[0] === 'codex') reviews.push(e)
+      },
+    })
+    on('fs.read', () => ({ value: 'No P1/P2 left.' }))
+    collectDelivery(on)
+    return { runs, reviews }
+  }
+
+  test('round 2 from the tool re-reviews vs the last sha on luna with its findings; its own are kept', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x.ts:3 off by one')] } })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', instructions: 'focus on auth', cwd: '/r/src' })
+    expect(String(r.result)).toContain('Started Codex re-review job')
+    expect(String(r.result)).toContain('round 2/3 (vs f00df00, gpt-6-luna)')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    expect(reviews[0]!.argv).toContain('model_reasoning_effort="medium"')
+    expect(reviews[0]!.input).toContain(`git diff ${OLD}`)
+    expect(reviews[0]!.input).toContain('[P1] x.ts:3 off by one')
+    expect(reviews[0]!.input).toContain('focus on auth')
+    const rounds = (runs.store.get('codexRounds') as Record<string, { sha: string; base: string; findings?: string }[]>)[KEY]!
+    expect(rounds.map(x => [x.sha, x.base, x.findings])).toEqual([
+      [OLD, 'main', '[P1] x.ts:3 off by one'],
+      [BASE, OLD, 'No P1/P2 left.'],
+    ])
+  })
+
+  test('at the cap the tool is refused; the person\'s /codex-review still runs, on sol, and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round('a'.repeat(40)), round('b'.repeat(40)), round('c'.repeat(40))] } })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(r.deny ?? '').toContain('Codex review cap reached: 3 rounds')
+    const typed = await $.command.run({ command: 'codex-review', args: '', ...TYPED })
+    expect(JSON.stringify(typed)).toContain('round 4 (vs main, gpt-6.1-sol)')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    const rounds = (runs.store.get('codexRounds') as Record<string, { isPerson?: boolean }[]>)[KEY]!
+    expect(rounds).toHaveLength(4)
+    expect(rounds[3]!.isPerson).toBe(true)
   })
 })
 

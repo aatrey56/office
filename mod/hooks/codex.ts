@@ -159,7 +159,14 @@ export const CODEX_REVIEW_TOOL = {
   name: 'codex_review',
   description:
     'Hand the current repo\'s changes to OpenAI Codex for an independent code review (`codex exec review`). ' +
-    'Returns a job id at once; the review runs in the background (minutes) and its text is appended to this conversation when done.',
+    'Returns a job id at once; the review runs in the background (minutes) and its text is appended to this conversation when done. ' +
+    'Rounds per branch are enforced in code. Round 1 is a full review on the review model. ' +
+    'A later call with no target re-reviews only the changes since the last reviewed commit, on a cheaper model, ' +
+    'checking that the previous round\'s findings are fixed and that the fixes broke nothing; ' +
+    'it becomes a full review after a rebase, when the diff since then is large, or with full: true. ' +
+    'An explicit target runs as given on the review model and still counts as a round. ' +
+    'A call with nothing new since the last round is refused. At codexMaxRounds rounds (default 3) calls are refused: ' +
+    'then stop, summarise the remaining findings and ask the person.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -169,6 +176,11 @@ export const CODEX_REVIEW_TOOL = {
           '"--uncommitted", "--commit <sha>", "--base <branch>" or a branch name. Default: uncommitted if the tree is dirty, else vs main/master.',
       },
       instructions: { type: 'string', description: 'Custom review focus for Codex.' },
+      full: {
+        type: 'boolean',
+        description:
+          'A full review instead of a re-review of the new changes (still a round): after a large rework or a rebase, or when a finding was about the overall design.',
+      },
       deep: {
         type: 'boolean',
         description: 'Use the scarce deep-review model (gpt-6-astra). Only when the user explicitly asks for a deep review.',
