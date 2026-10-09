@@ -63,6 +63,7 @@ import {
   newestBgSince,
   newJobId,
   parseAgentsJson,
+  parseAgentsListing,
   parseBgId,
   parseBgIds,
   parseBgModels,
@@ -1095,11 +1096,15 @@ async function onDeadline($: EngineInterface, options: PluginOptions, id: string
  * is kept for recovery: finishJob never removes a failed job's.
  */
 async function endJob($: EngineInterface, id: string, why: string, minutes: number): Promise<void> {
-  const job = (await read($, JOBS)).find(j => j.id === id)
-  if (job === undefined || !isLive(job) || ENDING.has(id)) return
+  // Taken before the first await: pollBg starts it without waiting, and may come round again.
+  if (ENDING.has(id)) return
   ENDING.add(id)
   let saved = ''
+  let worktree: string | undefined
   try {
+    const job = (await read($, JOBS)).find(j => j.id === id)
+    if (job === undefined || !isLive(job)) return
+    worktree = job.worktree
     const isStopped = (await RUNNING.get(id)?.()) ?? true
     RUNNING.delete(id) // stopped (or given up on): it no longer counts toward maxWorkers
     if (!isStopped) {
@@ -1107,7 +1112,7 @@ async function endJob($: EngineInterface, id: string, why: string, minutes: numb
       saved = `Could not confirm the worker stopped${where}. It may still be running: check it before reusing its branch.`
     } else if (job.worktree !== undefined) saved = await commitWip($, job.worktree, minutes)
   } catch (err) {
-    saved = `Its work was not committed (${String(err).slice(0, 200)}); the worktree is kept at ${job.worktree}.`
+    saved = `Its work was not committed (${String(err).slice(0, 200)}); the worktree is kept at ${worktree}.`
   } finally {
     ENDING.delete(id)
   }
@@ -1146,12 +1151,19 @@ async function commitWip($: EngineInterface, dir: string, minutes: number): Prom
   return `Its uncommitted work was committed on its branch as "WIP: timed out at ${minutes} min (office)"; the worktree is kept for recovery.${left}`
 }
 
-/** Asks `isStopped` until it says yes, for at most STOP_CONFIRM_MS: whether a worker's stop is confirmed. */
-async function confirmStopped($: EngineInterface, isStopped: () => Promise<boolean>): Promise<boolean> {
-  for (let waited = 0; ; waited += STOP_POLL_MS) {
-    if (await isStopped().catch(() => false)) return true
-    if (waited >= STOP_CONFIRM_MS) return false
-    await $.clock.sleep(STOP_POLL_MS)
+/**
+ * Asks `isStopped` (given the time left, to bound its own query) until it says yes, for at most
+ * STOP_CONFIRM_MS on the clock, its queries included: whether a worker's stop is confirmed.
+ */
+async function confirmStopped($: EngineInterface, isStopped: (leftMs: number) => Promise<boolean>): Promise<boolean> {
+  const deadline = (await clockNow($)) + STOP_CONFIRM_MS
+  for (;;) {
+    const left = deadline - (await clockNow($))
+    if (left <= 0) return false
+    if (await isStopped(left).catch(() => false)) return true
+    const rest = deadline - (await clockNow($))
+    if (rest <= 0) return false
+    await $.clock.sleep(Math.min(STOP_POLL_MS, rest))
   }
 }
 
@@ -1177,9 +1189,11 @@ function adoptBg($: EngineInterface, options: PluginOptions, job: Job, bgId: str
     const bin = opt(options, 'claudePath', 'claude')
     // A failed stop may mean the session already ended: the listing decides.
     await $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
-    return confirmStopped($, async () => {
-      const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: 20000 })
-      return listed.exitCode === 0 && isBgStopped(parseAgentsJson(listed.stdout).find(a => a.id === bgId))
+    return confirmStopped($, async leftMs => {
+      const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: Math.min(20000, leftMs) })
+      // Only a whole listing is evidence: a cut or malformed one would read as "not listed", so stopped.
+      const agents = listed.exitCode === 0 && !listed.isStdoutTruncated ? parseAgentsListing(listed.stdout) : undefined
+      return agents !== undefined && isBgStopped(agents.find(a => a.id === bgId))
     })
   })
   // A blocked job's deadline waits for its unblock, which re-arms it (pollBg).
@@ -1192,8 +1206,10 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
   try {
     const bin = opt(options, 'claudePath', 'claude')
     const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: 20000 }).catch(() => undefined)
-    if (listed === undefined || listed.exitCode !== 0) return
-    const agents = parseAgentsJson(listed.stdout)
+    if (listed === undefined || listed.exitCode !== 0 || listed.isStdoutTruncated) return
+    // A malformed listing would count every worker as gone.
+    const agents = parseAgentsListing(listed.stdout)
+    if (agents === undefined) return
     const jobs = await read($, JOBS)
     const configDir = await configDirOf($)
     const now = await clockNow($)
@@ -1244,7 +1260,11 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       }
       const sinceStart = now - (CLOCK_START.get(jobId) ?? job.startedAt)
       // Kept on the job: a later tail read may hold no turn (a big tool result pushed it out).
-      const hasReplied = job.hasReplied === true || seen.hasTurn === true
+      let hasReplied = job.hasReplied === true || seen.hasTurn === true
+      // The tail may miss a turn a big tool result pushed out between polls: look at the whole transcript first.
+      if (isStalled(sinceStart, hasReplied, STALL_REPORTED.has(jobId)) && agent.sessionId !== undefined) {
+        hasReplied = await bgHasTurn($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
+      }
       if (hasReplied && job.hasReplied !== true) await patchJob($, jobId, j => ({ ...j, hasReplied: true }))
       if (isStalled(sinceStart, hasReplied, STALL_REPORTED.has(jobId))) {
         STALL_REPORTED.add(jobId)
@@ -1257,7 +1277,8 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         const blocked = blockedVerdict(now - since, blockedMin, BLOCK_REPORTED.has(jobId))
         if (blocked === 'end') {
           const why = `ended after ${formatElapsed(now - since)} waiting for approval or input (twice blockedTimeoutMin ${blockedMin})`
-          await endJob($, jobId, why, Math.round(sinceStart / 60_000))
+          // Not awaited: confirming the stop takes up to STOP_CONFIRM_MS, and the other workers' polls go on.
+          void endJob($, jobId, why, Math.round(sinceStart / 60_000))
           continue
         }
         if (blocked === 'report') {
@@ -1308,6 +1329,14 @@ async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessio
     ? await $.process.run(['tail', '-c', '262144', path], { timeoutMs: 10000 }).catch(() => undefined)
     : undefined
   return t !== undefined && t.exitCode === 0 ? { ...readTranscript(t.stdout), mark: t.stdout.slice(-512) } : { tail: '' }
+}
+
+/** Whether a --bg session's transcript holds an assistant turn anywhere (grep stops at the first). */
+async function bgHasTurn($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<boolean> {
+  const path = await bgTranscript($, configDir, cwd, sessionId)
+  if (path === undefined) return false
+  const found = await $.process.run(['grep', '-q', '-F', '"type":"assistant"', path], { timeoutMs: 10000 }).catch(() => undefined)
+  return found?.exitCode === 0
 }
 
 /** The transcript of a --bg session; a long (cut + hashed) slug is found by its prefix and the session's file. */

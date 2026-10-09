@@ -11,6 +11,8 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
 // `branches` exist (show-ref finds them), `worktrees` is `git worktree list --porcelain`; any `<x>^{commit}` is OTHER;
+// `afterStop` is what `claude agents` prints once a stop was asked (`'slow'`: its first runs out its timeout on `wait`, the mock clock's sleep, exiting 124);
+// `whole` is the whole transcript `grep` searches (default: `transcript()`);
 // `dirty` leaves src/x.ts and big.bin uncommitted until a commit (exiting `commitExit`) takes them;
 // `noHead`: a repo with no commits (rev-parse HEAD fails); `staged` lists what `diff --cached` shows while dirty; `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
@@ -20,12 +22,14 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
   let isDirty = fake.dirty === true
   const stopped = new Set<string>()
+  let isStopAsked = false
+  let isSlowDone = false
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
     runs.sets.push(e.key)
@@ -66,14 +70,22 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
     if (argv.includes('--bg')) {
       await fake.bgGate
-      return out(fake.bg ?? 'backgrounded · 5ac0f0df\n', fake.bgExit ?? 0)
+      return out((typeof fake.bg === 'function' ? fake.bg() : fake.bg) ?? 'backgrounded · 5ac0f0df\n', fake.bgExit ?? 0)
     }
+    if (argv[1] === 'stop') isStopAsked = true
     if (argv[1] === 'stop' && !fake.stopIgnored) stopped.add(argv[2] ?? '')
+    if (argv.includes('agents') && isStopAsked && fake.afterStop === 'slow' && !isSlowDone) {
+      isSlowDone = true
+      await fake.wait?.(e.init?.timeoutMs ?? 30000)
+      return out('', 124)
+    }
+    if (argv.includes('agents') && isStopAsked && fake.afterStop !== undefined && fake.afterStop !== 'slow') return out(fake.afterStop)
     if (argv.includes('agents')) {
       const listed = JSON.parse(fake.agents?.() ?? '[]') as { id: string; state?: string }[]
       return out(JSON.stringify(listed.map(a => (stopped.has(a.id) ? { ...a, state: 'stopped' } : a))))
     }
     if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
+    if (argv[0] === 'grep') return out('', (fake.whole ?? fake.transcript)?.().includes(argv.at(-2) ?? '') ? 0 : 1)
     if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
     if (cmd.endsWith('status --porcelain')) return out(isDirty ? ' M src/x.ts\n?? big.bin\n' : '')
     if (argv.includes('ls-files')) return out(isDirty ? 'src/x.ts\0big.bin\0' : '')
@@ -339,6 +351,35 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
   })
 
+  test('a malformed listing after a failed stop is no proof it stopped: nothing is committed (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, stopIgnored: true, afterStop: '[{"id":"5ac0f0df","st' })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(91_000)
+    expect(delivered.join('\n')).toContain('Could not confirm the worker stopped')
+    expect(runs.some(run => run.argv.includes('commit'))).toBe(false)
+  })
+
+  test('confirming a stop keeps to its time, a slow listing included, and never holds the other workers\' polls (regression)', { options: { blockedTimeoutMin: 1 } }, async ($, on) => {
+    const clock = mock.clock(on)
+    const ids = ['5ac0f0df', '7bd1e0aa']
+    // The first worker stays blocked; the second finishes at 128 s, while the first's stop is being confirmed.
+    const listing = () => `[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"blocked","status":"idle"},{"id":"7bd1e0aa","sessionId":"S2","cwd":"/r","kind":"background","state":"${clock.now() < 128_000 ? 'working' : 'done'}","status":"busy"}]`
+    fakeRepo(on, { bg: () => `backgrounded · ${ids.shift()}\n`, agents: listing, transcript: () => turn('May I run npm install?'), stopIgnored: true, afterStop: 'slow', wait: ms => clock.sleep(ms) })
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'add a test', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(125_000) // the first: blocked at 5 s, ended at twice blockedTimeoutMin; its first listing then takes 20 s
+    await clock.advance(10_000)
+    expect(delivered.join('\n')).toContain('Worker finished: add a test')
+    expect(delivered.join('\n')).not.toContain('Could not confirm')
+    await clock.advance(15_000)
+    expect(delivered.join('\n')).toContain('Could not confirm the worker stopped')
+  })
+
   test('blocked past blockedTimeoutMin: reported once; ended at twice it', { options: { blockedTimeoutMin: 1 } }, async ($, on) => {
     const runs = fakeRepo(on, { agents: () => agent('blocked', 'idle'), transcript: () => turn('May I run npm install?') })
     const clock = mock.clock(on)
@@ -368,6 +409,17 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     await spawn($)
     await clock.advance(7 * 60_000)
     expect(reads).toBeGreaterThan(1)
+    expect(delivered.join('\n')).not.toContain('may be stalled')
+  })
+
+  test('a turn the tail never saw, pushed out by a big tool result between polls, is found in the whole transcript (regression)', async ($, on) => {
+    const tool = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'x'.repeat(1000) }] } })
+    fakeRepo(on, { agents: () => agent('working'), transcript: () => tool, whole: () => `${turn('Reading the code.')}\n${tool}` })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(7 * 60_000)
     expect(delivered.join('\n')).not.toContain('may be stalled')
   })
 

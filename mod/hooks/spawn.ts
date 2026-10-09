@@ -300,12 +300,17 @@ export function capLockArgv(path: string, waitMs: number): string[] {
 }
 
 export function parseAgentsJson(text: string): BgAgent[] {
+  return parseAgentsListing(text) ?? []
+}
+
+/** `claude agents --json` output as a listing; undefined when it is not one (cut or malformed), so it proves nothing. */
+export function parseAgentsListing(text: string): BgAgent[] | undefined {
   try {
     const raw = JSON.parse(text) as unknown
-    if (!Array.isArray(raw)) return []
+    if (!Array.isArray(raw)) return undefined
     return raw.filter((a): a is BgAgent => typeof a === 'object' && a !== null && typeof (a as BgAgent).id === 'string')
   } catch {
-    return []
+    return undefined
   }
 }
 
