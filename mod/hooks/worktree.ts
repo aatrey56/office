@@ -81,6 +81,16 @@ export function wipCandidatesArgv(dir: string): string[] {
   return ['git', '-C', dir, 'ls-files', '-z', '--others', '--modified', '--exclude-standard']
 }
 
+/** `git -C <dir> diff --cached --name-only -z --no-renames`: what the worker already staged, which ls-files --modified misses. */
+export function wipStagedArgv(dir: string): string[] {
+  return ['git', '-C', dir, 'diff', '--cached', '--name-only', '-z', '--no-renames']
+}
+
+/** `git -C <dir> reset -q -- <paths>` (taken literally): out of the index, still in the worktree. */
+export function wipUnstageArgv(dir: string, paths: readonly string[]): string[] {
+  return ['git', '-C', dir, 'reset', '-q', '--', ...paths.map(p => `:(literal)${p}`)]
+}
+
 /** `git -C <dir> add -A` of the whole worktree but the `skipped` paths (relative to it, taken literally). */
 export function wipAddArgv(dir: string, skipped: readonly string[]): string[] {
   return ['git', '-C', dir, 'add', '-A', '--', '.', ...skipped.map(p => `:(exclude,literal)${p}`)]

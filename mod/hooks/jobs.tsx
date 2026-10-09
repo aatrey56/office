@@ -100,6 +100,8 @@ import {
   wipAddArgv,
   wipCandidatesArgv,
   wipCommitArgv,
+  wipStagedArgv,
+  wipUnstageArgv,
   workerPreamble,
   worktreeDir,
   worktreeReport,
@@ -1113,8 +1115,9 @@ async function endJob($: EngineInterface, id: string, why: string, minutes: numb
 
 /**
  * Commits a stopped worker's uncommitted work on its branch as "WIP: timed out at N min (office)":
- * all `add -A` takes but files over 5 MB, the repo's hooks run (never --no-verify). Says what
- * happened, for the job's result; '' when there was nothing to commit.
+ * all `add -A` takes but files over 5 MB (unstaged if the worker staged them: they stay in the
+ * worktree), the repo's hooks run (never --no-verify). Says what happened, for the job's result;
+ * '' when there was nothing to commit.
  */
 async function commitWip($: EngineInterface, dir: string, minutes: number): Promise<string> {
   const status = await git($, ['git', '-C', dir, 'status', '--porcelain'])
@@ -1122,13 +1125,19 @@ async function commitWip($: EngineInterface, dir: string, minutes: number): Prom
   if (status.out.trim() === '') return ''
   const listed = await git($, wipCandidatesArgv(dir))
   if (!listed.isOk) return `WIP commit not made (git ls-files: ${listed.out}); the uncommitted work is left in ${dir}.`
+  const staged = await git($, wipStagedArgv(dir))
+  if (!staged.isOk) return `WIP commit not made (git diff --cached: ${staged.out}); the uncommitted work is left in ${dir}.`
   const skipped: string[] = []
-  for (const path of new Set(listed.out.split('\0').filter(Boolean))) {
+  for (const path of new Set(`${listed.out}\0${staged.out}`.split('\0').filter(Boolean))) {
     // A link is committed as the link; a path gone (deleted) is committed as its deletion.
     const size = await $.fs.stat(`${dir}/${path}`).then(st => (st.isLink ? 0 : st.size), () => 0)
     if (size > WIP_MAX_BYTES) skipped.push(path)
   }
-  const left = skipped.length > 0 ? ` Left out, over 5 MB: ${skipped.join(', ')}.` : ''
+  const left = skipped.length > 0 ? ` Left out, over 5 MB (uncommitted in the worktree): ${skipped.join(', ')}.` : ''
+  if (skipped.length > 0) {
+    const unstaged = await git($, wipUnstageArgv(dir, skipped))
+    if (!unstaged.isOk) return `WIP commit not made (git reset: ${unstaged.out}); the uncommitted work is left in ${dir}.${left}`
+  }
   const added = await git($, wipAddArgv(dir, skipped))
   if (!added.isOk) return `WIP commit failed (git add: ${added.out}); the uncommitted work is left in ${dir}.`
   const committed = await git($, wipCommitArgv(dir, minutes), WIP_COMMIT_TIMEOUT_MS)

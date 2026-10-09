@@ -12,7 +12,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
 // `branches` exist (show-ref finds them), `worktrees` is `git worktree list --porcelain`; any `<x>^{commit}` is OTHER;
 // `dirty` leaves src/x.ts and big.bin uncommitted until a commit (exiting `commitExit`) takes them;
-// `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
+// `staged` lists what `diff --cached` shows while dirty; `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
 // the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
@@ -20,7 +20,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[] }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -77,6 +77,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
     if (cmd.endsWith('status --porcelain')) return out(isDirty ? ' M src/x.ts\n?? big.bin\n' : '')
     if (argv.includes('ls-files')) return out(isDirty ? 'src/x.ts\0big.bin\0' : '')
+    if (cmd.includes(' diff --cached ')) return out(isDirty ? (fake.staged ?? []).map(p => `${p}\0`).join('') : '')
     if (argv.includes('commit')) {
       isDirty = (fake.commitExit ?? 0) !== 0
       return out(isDirty ? '' : '[x 1234567] WIP', fake.commitExit ?? 0)
@@ -264,7 +265,7 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     const text = delivered.join('\n')
     expect(text).toContain('timed out after 2 min (jobTimeoutHardMin): extended once at 1 min')
     expect(text).toContain('committed on its branch as "WIP: timed out at 2 min (office)"')
-    expect(text).toContain('Left out, over 5 MB: big.bin')
+    expect(text).toContain('Left out, over 5 MB (uncommitted in the worktree): big.bin')
     expect(text).toMatch(/Worktree kept at \/cfg\/office\/worktrees\//)
   })
 
@@ -280,6 +281,21 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     expect(text).toContain('WIP commit failed')
     expect(text).toMatch(/Uncommitted changes left in \/cfg\/office\/worktrees\//)
     expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+  })
+
+  test('an oversized file the worker staged is unstaged and left out of the WIP commit', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, staged: ['out/staged-big.bin'] })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000)
+    const at = (pred: (a: string[]) => boolean) => runs.findIndex(run => pred(run.argv))
+    const reset = at(a => a.includes('reset'))
+    expect(runs[reset]?.argv.slice(-3)).toEqual(['--', ':(literal)big.bin', ':(literal)out/staged-big.bin'])
+    expect(reset).toBeLessThan(at(a => a.includes('commit')))
+    expect(runs[at(a => a.includes('add') && a.includes('-A'))]?.argv).toContain(':(exclude,literal)out/staged-big.bin')
+    expect(delivered.join('\n')).toContain('Left out, over 5 MB (uncommitted in the worktree): big.bin, out/staged-big.bin')
   })
 
   test('a worker not confirmed stopped: its work is left uncommitted and the worktree kept', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
