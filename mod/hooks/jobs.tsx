@@ -96,10 +96,16 @@ import {
   removeWorktreeArgv,
   repoRootFromCommonDir,
   resolveBaseArgv,
+  WIP_MAX_BYTES,
+  wipAddArgv,
+  wipCandidatesArgv,
+  wipCommitArgv,
   workerPreamble,
   worktreeDir,
   worktreeReport,
 } from './worktree'
+import { deadlineVerdict, nextGrowth, timeoutText } from './watchdog'
+import type { Growth } from './watchdog'
 
 // Owner: jobs agent. Codex handoff, router, worker spawner, jobs pane.
 // codex.ts, router.ts, spawn.ts and worktree.ts hold the pure halves; every hook and
@@ -173,11 +179,21 @@ let bgPolling = false
 const BG_MISSES = new Map<string, number>()
 /** --bg jobs seen idle with a reply on consecutive polls: two in a row end the job. */
 const BG_IDLE = new Map<string, number>()
-/** Time a job spent blocked (its timeout is paused meanwhile), and when its current block began. */
+/** Time a job spent blocked (its timeout is paused meanwhile), and when its current block began, on $.clock. */
 const PAUSED_MS = new Map<string, number>()
 const BLOCKED_AT = new Map<string, number>()
 /** Max-runtime timers of running jobs, by job id. */
 const TIMERS = new Map<string, Timer>()
+/** When each job started, on $.clock: the clock its deadlines, blocks and stall checks are read on. */
+const CLOCK_START = new Map<string, number>()
+/** What the watchdog last saw of each job's transcript or output: when it last grew. */
+const GROWTH = new Map<string, Growth>()
+/** Jobs whose one extension past jobTimeoutMin is spent. */
+const EXTENDED = new Set<string>()
+/** Jobs being ended past their time: stopped and their work committed before finishJob delivers them. */
+const ENDING = new Set<string>()
+/** A WIP commit runs the repo's hooks, which may run checks. */
+const WIP_COMMIT_TIMEOUT_MS = 120_000
 /** Whether the main loop is mid-turn (an appended row is then read at once). */
 let mainTurnRunning = false
 /** Agent calls the router sized in a manager session, awaiting their turn.complete: agentId → inbox id and start. */
@@ -671,6 +687,8 @@ async function patchJob($: EngineInterface, id: string, change: (job: Job) => Jo
 
 /** Ends a running job once (a later finish is a no-op) and delivers it. */
 async function finishJob($: EngineInterface, id: string, status: 'done' | 'failed', result: string): Promise<void> {
+  // A job being ended past its time is delivered by endJob, once its work is committed.
+  if (ENDING.has(id)) return
   TIMERS.get(id)?.cancel()
   TIMERS.delete(id)
   RUNNING.delete(id)
@@ -679,6 +697,9 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   BG_IDLE.delete(id)
   PAUSED_MS.delete(id)
   BLOCKED_AT.delete(id)
+  CLOCK_START.delete(id)
+  GROWTH.delete(id)
+  EXTENDED.delete(id)
   const before = (await read($, JOBS)).find(j => j.id === id)
   if (before === undefined || !isLive(before)) return
   if (before.agentId !== undefined) SUBAGENT_JOBS.delete(before.agentId)
@@ -1021,12 +1042,89 @@ async function killJob($: EngineInterface, id: string, why: string): Promise<voi
   await finishJob($, id, 'failed', why)
 }
 
-/** (Re)arms a job's max-runtime timer; time spent blocked does not count. */
-function startTimeout($: EngineInterface, options: PluginOptions, id: string, startedAt: number): void {
-  const minutes = num(options, 'jobTimeoutMin', 30)
-  const left = Math.max(1000, startedAt + (PAUSED_MS.get(id) ?? 0) + minutes * 60_000 - Date.now())
+/** jobTimeoutMin, and jobTimeoutHardMin (never below it): the deadline, and the one extension's. */
+function timeoutMins(options: PluginOptions): { softMin: number; hardMin: number } {
+  const softMin = num(options, 'jobTimeoutMin', 45)
+  return { softMin, hardMin: Math.max(softMin, num(options, 'jobTimeoutHardMin', 60)) }
+}
+
+/**
+ * (Re)arms a job's deadline: jobTimeoutMin of running time, jobTimeoutHardMin once extended; time
+ * spent blocked does not count. A job first armed here starts now (a reload sets CLOCK_START first).
+ */
+async function startTimeout($: EngineInterface, options: PluginOptions, id: string): Promise<void> {
+  const now = await clockNow($)
+  if (!CLOCK_START.has(id)) CLOCK_START.set(id, now)
+  const { softMin, hardMin } = timeoutMins(options)
+  const minutes = EXTENDED.has(id) ? hardMin : softMin
+  const left = Math.max(1000, (CLOCK_START.get(id) ?? now) + (PAUSED_MS.get(id) ?? 0) + minutes * 60_000 - now)
   TIMERS.get(id)?.cancel()
-  TIMERS.set(id, $.clock.after(left, () => void killJob($, id, `timed out after ${minutes} min (jobTimeoutMin)`)))
+  TIMERS.delete(id)
+  if (RUNNING.has(id)) TIMERS.set(id, $.clock.after(left, () => void onDeadline($, options, id)))
+}
+
+/** At a running job's deadline: extend it once while its transcript still grows; otherwise end it. */
+async function onDeadline($: EngineInterface, options: PluginOptions, id: string): Promise<void> {
+  TIMERS.delete(id)
+  const job = (await read($, JOBS)).find(j => j.id === id)
+  if (job?.status !== 'running') return // finished, or blocked (its unblock re-arms it)
+  const { softMin, hardMin } = timeoutMins(options)
+  const isExtended = EXTENDED.has(id)
+  const verdict = deadlineVerdict({ softMin, hardMin, isExtended, grewAt: GROWTH.get(id)?.at, now: await clockNow($) })
+  if (verdict === 'extend') {
+    EXTENDED.add(id)
+    $.ui.toast(`Job ${id} still active at ${softMin} min: extended to ${hardMin} min`)
+    await startTimeout($, options, id)
+    return
+  }
+  await endJob($, id, timeoutText(softMin, hardMin, isExtended), isExtended ? hardMin : softMin)
+}
+
+/**
+ * Ends a job past its time: stops its worker (waiting for `claude stop`), commits a dirty
+ * worktree's work on its branch as WIP, then fails it with `why` and what became of the work.
+ * The worktree is kept for recovery: finishJob never removes a failed job's.
+ */
+async function endJob($: EngineInterface, id: string, why: string, minutes: number): Promise<void> {
+  const job = (await read($, JOBS)).find(j => j.id === id)
+  if (job === undefined || !isLive(job) || ENDING.has(id)) return
+  ENDING.add(id)
+  let saved = ''
+  try {
+    await RUNNING.get(id)?.()
+    RUNNING.delete(id) // stopped: it no longer counts toward maxWorkers while its work is committed
+    if (job.worktree !== undefined) saved = await commitWip($, job.worktree, minutes)
+  } catch (err) {
+    saved = `Its work was not committed (${String(err).slice(0, 200)}); the worktree is kept at ${job.worktree}.`
+  } finally {
+    ENDING.delete(id)
+  }
+  await finishJob($, id, 'failed', saved ? `${why}\n${saved}` : why)
+}
+
+/**
+ * Commits a stopped worker's uncommitted work on its branch as "WIP: timed out at N min (office)":
+ * all `add -A` takes but files over 5 MB, the repo's hooks run (never --no-verify). Says what
+ * happened, for the job's result; '' when there was nothing to commit.
+ */
+async function commitWip($: EngineInterface, dir: string, minutes: number): Promise<string> {
+  const status = await git($, ['git', '-C', dir, 'status', '--porcelain'])
+  if (!status.isOk) return `Its work was not committed (git status: ${status.out}); the worktree is kept at ${dir}.`
+  if (status.out.trim() === '') return ''
+  const listed = await git($, wipCandidatesArgv(dir))
+  if (!listed.isOk) return `WIP commit not made (git ls-files: ${listed.out}); the uncommitted work is left in ${dir}.`
+  const skipped: string[] = []
+  for (const path of new Set(listed.out.split('\0').filter(Boolean))) {
+    // A link is committed as the link; a path gone (deleted) is committed as its deletion.
+    const size = await $.fs.stat(`${dir}/${path}`).then(st => (st.isLink ? 0 : st.size), () => 0)
+    if (size > WIP_MAX_BYTES) skipped.push(path)
+  }
+  const left = skipped.length > 0 ? ` Left out, over 5 MB: ${skipped.join(', ')}.` : ''
+  const added = await git($, wipAddArgv(dir, skipped))
+  if (!added.isOk) return `WIP commit failed (git add: ${added.out}); the uncommitted work is left in ${dir}.`
+  const committed = await git($, wipCommitArgv(dir, minutes), WIP_COMMIT_TIMEOUT_MS)
+  if (!committed.isOk) return `WIP commit failed (git commit: ${committed.out.slice(0, 500)}); the uncommitted work is left in ${dir}.${left}`
+  return `Its uncommitted work was committed on its branch as "WIP: timed out at ${minutes} min (office)"; the worktree is kept for recovery.${left}`
 }
 
 /** Registers a subagent job's kill handle, its answer route and its timeout. */
@@ -1036,17 +1134,18 @@ function adoptSubagent($: EngineInterface, options: PluginOptions, job: Job, age
     SUBAGENT_JOBS.delete(agentId)
     void $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(() => undefined)
   })
-  startTimeout($, options, job.id, job.startedAt)
+  void startTimeout($, options, job.id)
 }
 
-/** Registers a --bg job's kill handle (`claude stop`), its polling and its timeout. */
+/** Registers a --bg job's kill handle (`claude stop`, awaited by endJob), its polling and its timeout. */
 function adoptBg($: EngineInterface, options: PluginOptions, job: Job, bgId: string): void {
   BG_JOBS.set(job.id, bgId)
-  RUNNING.set(job.id, () => {
+  RUNNING.set(job.id, async () => {
     BG_JOBS.delete(job.id)
-    void $.process.run([opt(options, 'claudePath', 'claude'), 'stop', bgId]).catch(() => undefined)
+    await $.process.run([opt(options, 'claudePath', 'claude'), 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
   })
-  startTimeout($, options, job.id, job.startedAt)
+  // A blocked job's deadline waits for its unblock, which re-arms it (pollBg).
+  if (job.status !== 'blocked') void startTimeout($, options, job.id)
 }
 
 /** One poll of every --bg job: state from `claude agents`, result from the transcript. */
@@ -1059,12 +1158,14 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
     const agents = parseAgentsJson(listed.stdout)
     const jobs = await read($, JOBS)
     const configDir = await configDirOf($)
+    const now = await clockNow($)
     for (const [jobId, bgId] of [...BG_JOBS]) {
       const job = jobs.find(j => j.id === jobId)
       if (job === undefined || !isLive(job)) {
         BG_JOBS.delete(jobId)
         continue
       }
+      if (ENDING.has(jobId)) continue
       const agent = agents.find(a => a.id === bgId)
       if (agent === undefined) {
         const misses = (BG_MISSES.get(jobId) ?? 0) + 1
@@ -1086,6 +1187,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       const seen = agent.sessionId !== undefined
         ? await bgSeen($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
         : { tail: '' }
+      GROWTH.set(jobId, nextGrowth(GROWTH.get(jobId), seen.mark ?? '', now))
       const phase = bgPhase(agent.state, agent.status)
       const idlePolls = phase === 'idle' && seen.result !== undefined ? (BG_IDLE.get(jobId) ?? 0) + 1 : 0
       BG_IDLE.set(jobId, idlePolls)
@@ -1105,7 +1207,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         // Pause the timeout and tell the model once per block.
         TIMERS.get(jobId)?.cancel()
         TIMERS.delete(jobId)
-        BLOCKED_AT.set(jobId, Date.now())
+        BLOCKED_AT.set(jobId, now)
         await patchJob($, jobId, j => ({ ...j, status: 'blocked', tail: seen.tail || j.tail, sessionId: agent.sessionId ?? j.sessionId }))
         const latest = seen.result ? `\n\nLatest reply:\n${seen.result}` : ''
         const text = `Worker ${jobId} (${job.title}) is waiting for input: \`claude attach ${bgId}\`${latest}`
@@ -1116,9 +1218,9 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       if ((phase === 'active' || phase === 'idle') && job.status === 'blocked') {
         const since = BLOCKED_AT.get(jobId)
         BLOCKED_AT.delete(jobId)
-        if (since !== undefined) PAUSED_MS.set(jobId, (PAUSED_MS.get(jobId) ?? 0) + Date.now() - since)
+        if (since !== undefined) PAUSED_MS.set(jobId, (PAUSED_MS.get(jobId) ?? 0) + now - since)
         await patchJob($, jobId, j => ({ ...j, status: 'running' }))
-        startTimeout($, options, jobId, job.startedAt)
+        await startTimeout($, options, jobId)
       }
       const tail = seen.tail.slice(-2048)
       if (tail && (tail !== job.tail || agent.sessionId !== job.sessionId)) {
@@ -1130,7 +1232,8 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
   }
 }
 
-type Seen = { result?: string; tail: string }
+/** `mark`: the transcript's last bytes, which change whenever it grows (it is only ever appended to). */
+type Seen = { result?: string; tail: string; mark?: string }
 
 /** The latest reply and tail of a --bg session's transcript (empty when it cannot be read). */
 async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<Seen> {
@@ -1138,7 +1241,7 @@ async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessio
   const t = path
     ? await $.process.run(['tail', '-c', '262144', path], { timeoutMs: 10000 }).catch(() => undefined)
     : undefined
-  return t !== undefined && t.exitCode === 0 ? readTranscript(t.stdout) : { tail: '' }
+  return t !== undefined && t.exitCode === 0 ? { ...readTranscript(t.stdout), mark: t.stdout.slice(-512) } : { tail: '' }
 }
 
 /** The transcript of a --bg session; a long (cut + hashed) slug is found by its prefix and the session's file. */
@@ -1164,17 +1267,18 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
     agents.filter(a => a.status === 'running' || a.status === 'pending' || a.status === 'waiting').map(a => a.id),
   )
   const dead = new Set<string>()
+  const now = await clockNow($)
   for (const job of stale) {
     // A --bg session outlives this process; the poller settles a gone one.
+    // A re-adopted job's deadlines run from when it really started (outside tests $.clock is the host's).
     if (job.bgId !== undefined) {
+      CLOCK_START.set(job.id, job.startedAt)
+      if (job.status === 'blocked') BLOCKED_AT.set(job.id, now)
       adoptBg($, options, job, job.bgId)
-      if (job.status === 'blocked') {
-        TIMERS.get(job.id)?.cancel()
-        TIMERS.delete(job.id)
-        BLOCKED_AT.set(job.id, Date.now())
-      }
+    } else if (job.agentId !== undefined && live.has(job.agentId)) {
+      CLOCK_START.set(job.id, job.startedAt)
+      adoptSubagent($, options, job, job.agentId)
     }
-    else if (job.agentId !== undefined && live.has(job.agentId)) adoptSubagent($, options, job, job.agentId)
     else dead.add(job.id)
   }
   if (dead.size === 0) return
@@ -1263,7 +1367,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     killed = true
     void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
   })
-  startTimeout($, options, jobId, job.startedAt)
+  void startTimeout($, options, jobId)
 
   const take = (line: string) => {
     const ev = plan.parse(line)
@@ -1289,6 +1393,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
         const text = pending
         pending = ''
         lastFlush = Date.now()
+        GROWTH.set(jobId, { mark: '', at: await clockNow($) })
         await patchJob($, jobId, j => ({ ...j, tail: pushTail(j.tail, text) }))
       }
     }
@@ -1789,9 +1894,9 @@ async function agentDefs($: EngineInterface): Promise<{ defs: AgentDef[]; isComp
 
 // ── worker worktrees ($ halves; the argv and texts are in worktree.ts) ───
 
-async function git($: EngineInterface, argv: string[]): Promise<GitRun> {
+async function git($: EngineInterface, argv: string[], timeoutMs = 30000): Promise<GitRun> {
   const r = await $.process
-    .run(argv, { timeoutMs: 30000 })
+    .run(argv, { timeoutMs })
     .catch((err: unknown) => ({ exitCode: 1, stdout: '', stderr: String(err) }))
   return r.exitCode === 0 ? { isOk: true, out: r.stdout } : { isOk: false, out: (r.stderr || r.stdout).trim() || `exit ${r.exitCode}` }
 }

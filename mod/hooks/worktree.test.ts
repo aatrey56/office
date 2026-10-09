@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { branchName, checkedOutIn, repoRootFromCommonDir, worktreeReport } from './worktree'
+import { branchName, checkedOutIn, repoRootFromCommonDir, wipAddArgv, wipCommitArgv, worktreeReport } from './worktree'
 
 const OUTCOME = {
   branch: 'office/j1-fix-login',
@@ -28,6 +28,13 @@ describe('checkedOutIn', () => {
     const listed = 'worktree /r\nHEAD 1\nbranch refs/heads/main\n\nworktree /w/j1\nHEAD 2\nbranch refs/heads/office/j1\n\nworktree /w/d\nHEAD 3\ndetached\n'
     expect(checkedOutIn(listed, 'office/j1')).toBe('/w/j1')
     expect(checkedOutIn(listed, 'office')).toBe(undefined)
+  })
+})
+
+describe('WIP commit', () => {
+  test('adds all but the skipped paths, taken literally; commits with the hooks run (never --no-verify)', () => {
+    expect(wipAddArgv('/w/j1', ['data/big*.bin'])).toEqual(['git', '-C', '/w/j1', 'add', '-A', '--', '.', ':(exclude,literal)data/big*.bin'])
+    expect(wipCommitArgv('/w/j1', 45)).toEqual(['git', '-C', '/w/j1', 'commit', '-m', 'WIP: timed out at 45 min (office)'])
   })
 })
 

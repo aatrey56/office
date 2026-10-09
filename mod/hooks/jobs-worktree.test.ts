@@ -11,6 +11,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
 // `branches` exist (show-ref finds them), `worktrees` is `git worktree list --porcelain`; any `<x>^{commit}` is OTHER;
+// `dirty` leaves src/x.ts and big.bin uncommitted until a commit (exiting `commitExit`) takes them;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
 // the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
@@ -18,10 +19,11 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
+  let isDirty = fake.dirty === true
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
     runs.sets.push(e.key)
@@ -67,6 +69,12 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     if (argv.includes('agents')) return out(fake.agents?.() ?? '[]')
     if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
     if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
+    if (cmd.endsWith('status --porcelain')) return out(isDirty ? ' M src/x.ts\n?? big.bin\n' : '')
+    if (argv.includes('ls-files')) return out(isDirty ? 'src/x.ts\0big.bin\0' : '')
+    if (argv.includes('commit')) {
+      isDirty = (fake.commitExit ?? 0) !== 0
+      return out(isDirty ? '' : '[x 1234567] WIP', fake.commitExit ?? 0)
+    }
     return out('') // worktree add / remove, status: clean
   })
   return runs
@@ -211,6 +219,61 @@ describe('worker worktrees', () => {
     await clock.advance(70_000) // the next poll resumes the timeout, a full minute from then
     expect(runs.some(run => run.argv.includes('stop'))).toBe(true)
     expect(delivered.join('\n')).toContain('timed out')
+  })
+})
+
+describe('watchdog: deadline', () => {
+  const turn = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } })
+  const agent = (state: string, status = 'busy') =>
+    `[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"${state}","status":"${status}"}]`
+  const spawn = ($: Engine) => $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+  async function start($: Engine, on: On) {
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    // big.bin is 6 MB; everything else is small.
+    on('fs.stat', (_$, e) => ({ value: { kind: 'file' as const, size: e.path.endsWith('big.bin') ? 6 * 1024 * 1024 : 10, mtimeMs: 0, isLink: false } }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+  }
+  const stops = (runs: Runs) => runs.filter(run => run.argv.join(' ').endsWith('stop 5ac0f0df')).length
+
+  test('still writing at the deadline: extended once, then ended with its work committed as WIP and the worktree kept', { options: { jobTimeoutMin: 1, jobTimeoutHardMin: 2 } }, async ($, on) => {
+    let turns = 0
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn(`step ${++turns}`), dirty: true })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000)
+    expect(stops(runs)).toBe(0) // its transcript grew: extended to 2 min
+    await clock.advance(60_000)
+    expect(stops(runs)).toBe(1)
+    const add = runs.find(run => run.argv.includes('add') && run.argv.includes('-A'))?.argv ?? []
+    expect(add.at(-1)).toBe(':(exclude,literal)big.bin')
+    const commit = runs.find(run => run.argv.includes('commit'))?.argv ?? []
+    expect(commit.slice(-2)).toEqual(['-m', 'WIP: timed out at 2 min (office)'])
+    expect(commit).not.toContain('--no-verify')
+    expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+    const text = delivered.join('\n')
+    expect(text).toContain('timed out after 2 min (jobTimeoutHardMin): extended once at 1 min')
+    expect(text).toContain('committed on its branch as "WIP: timed out at 2 min (office)"')
+    expect(text).toContain('Left out, over 5 MB: big.bin')
+    expect(text).toMatch(/Worktree kept at \/cfg\/office\/worktrees\//)
+  })
+
+  test('a failed WIP commit keeps the worktree and says so', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, commitExit: 1 })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000) // a transcript that never changed: no extension
+    const text = delivered.join('\n')
+    expect(text).toContain('timed out after 1 min (jobTimeoutMin); not extended')
+    expect(text).toContain('WIP commit failed')
+    expect(text).toMatch(/Uncommitted changes left in \/cfg\/office\/worktrees\//)
+    expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
   })
 })
 

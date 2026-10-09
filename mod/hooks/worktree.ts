@@ -73,6 +73,24 @@ export function workerPreamble(dir: string, branch: string, base: string): strin
   ].join('\n')
 }
 
+/** Files over this size are left out of a WIP commit (and stay uncommitted in the kept worktree). */
+export const WIP_MAX_BYTES = 5 * 1024 * 1024
+
+/** `git -C <dir> ls-files -z --others --modified --exclude-standard`: every file `add -A` would take. */
+export function wipCandidatesArgv(dir: string): string[] {
+  return ['git', '-C', dir, 'ls-files', '-z', '--others', '--modified', '--exclude-standard']
+}
+
+/** `git -C <dir> add -A` of the whole worktree but the `skipped` paths (relative to it, taken literally). */
+export function wipAddArgv(dir: string, skipped: readonly string[]): string[] {
+  return ['git', '-C', dir, 'add', '-A', '--', '.', ...skipped.map(p => `:(exclude,literal)${p}`)]
+}
+
+/** The WIP commit of a worker ended past its time; never --no-verify, so the repo's hooks still run. */
+export function wipCommitArgv(dir: string, minutes: number): string[] {
+  return ['git', '-C', dir, 'commit', '-m', `WIP: timed out at ${minutes} min (office)`]
+}
+
 export type WorktreeOutcome = {
   branch: string
   base: string

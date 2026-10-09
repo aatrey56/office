@@ -4,8 +4,8 @@ import type { Effort, Job } from '../types'
 import { EFFORTS } from './router'
 import { projectSlug, SLUG_MAX } from './sessions'
 
-/** Kill handles of the jobs this module environment runs, by job id. */
-export const RUNNING = new Map<string, () => void>()
+/** Kill handles of the jobs this module environment runs, by job id; one that stops its worker by a command resolves once that ran. */
+export const RUNNING = new Map<string, () => void | Promise<void>>()
 
 export const TAIL_MAX = 2048
 export const RESULT_MAX = 64 * 1024
