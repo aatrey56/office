@@ -154,7 +154,22 @@ code (`codex-rounds.ts`, wired in `jobs.tsx`):
   branch: each round's HEAD, base, model, job id, time, and its final text (first 4 KB) once
   done. A failed or killed round is dropped; rounds older than 14 days are pruned. Writes take
   their own cross-session flock (`codex-rounds.lock`), as the capacity lock does.
-- Your `/codex-review` is never refused and runs as typed (`--force` still passes the budget
+- **Full-review window cap** (`codexFullReviewsPer5h`, 10; 0 = no cap): at most that many
+  full-model reviews (any round on the review or deep model, not the re-review model) start in
+  any trailing 5 h, counted across all sessions and branches (a full review is ~4% of the plan's
+  5-hour limit). `codexFullReviews` in `$.store` holds each one's start time and job id, pruned past
+  5 h, read and written under the same `codex-rounds` lock when a round is booked. At the cap a
+  round that would be a re-review still runs on Luna; one that needs a full review (round 1,
+  rebase, size, `full: true`, deep) is refused for agents and for you, with the count and the ISO
+  time the next slot frees; round 1 is never downgraded to Luna. A failed, killed or interrupted
+  job gives its slot back, as it drops its round. A write that fails refuses the agent's round and
+  runs yours with a note, as for the ledger.
+- **Codex out of usage:** a codex run failing on "usage limit", "rate limit" or "hit your limit"
+  (`isUsageLimit`), and a budget-guard refusal, add a fallback to the result: run an Opus review via
+  a subagent; it is a same-model-family review with lower trust (Claude also wrote the code), so
+  verify each finding, a clean one is no evidence the branch is correct, and the PR description
+  says "reviewed by Opus (Codex out of usage), not independent".
+- Your `/codex-review` is never refused by the round cap and runs as typed (`--force` still passes the budget
   guard); it is recorded, so it counts toward an agent's cap.
 - The job title and the start message show the round: `codex re-review 2/3 vs a1b2c3d (luna)`.
 
