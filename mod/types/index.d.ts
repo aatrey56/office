@@ -58,6 +58,7 @@ export type Job = {
   isExtended?: boolean // the one extension past jobTimeoutMin is spent
   pausedMs?: number // time spent blocked in finished blocks (it does not count toward the deadline)
   blockedAt?: number // when the current block began
+  hasReplied?: boolean // bg-mode worker: an assistant turn was seen in its transcript (never reported stalled after)
 }
 
 // ── manga (manga.tsx) ────────────────────────────────────────────────────

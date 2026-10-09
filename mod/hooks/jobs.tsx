@@ -1243,7 +1243,10 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         continue
       }
       const sinceStart = now - (CLOCK_START.get(jobId) ?? job.startedAt)
-      if (isStalled(sinceStart, seen.hasTurn === true, STALL_REPORTED.has(jobId))) {
+      // Kept on the job: a later tail read may hold no turn (a big tool result pushed it out).
+      const hasReplied = job.hasReplied === true || seen.hasTurn === true
+      if (hasReplied && job.hasReplied !== true) await patchJob($, jobId, j => ({ ...j, hasReplied: true }))
+      if (isStalled(sinceStart, hasReplied, STALL_REPORTED.has(jobId))) {
         STALL_REPORTED.add(jobId)
         const text = `Worker ${jobId} (${job.title}) has not replied ${formatElapsed(sinceStart)} after it started: no assistant turn in its transcript, so it may be stalled. Stop it (kill it in /jobs, or \`claude stop ${bgId}\`) and spawn it again.`
         $.ui.toast(`Worker ${jobId} may be stalled: no reply yet`)

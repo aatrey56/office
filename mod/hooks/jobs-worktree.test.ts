@@ -351,6 +351,19 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     expect(delivered.join('\n')).toContain('waiting for approval or input (twice blockedTimeoutMin 1)')
   })
 
+  test('a turn seen once is remembered: a tail that later holds none is not stalled', async ($, on) => {
+    let reads = 0
+    const tool = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'x'.repeat(1000) }] } })
+    fakeRepo(on, { agents: () => agent('working'), transcript: () => (++reads === 1 ? turn('Reading the code.') : tool) })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(7 * 60_000)
+    expect(reads).toBeGreaterThan(1)
+    expect(delivered.join('\n')).not.toContain('may be stalled')
+  })
+
   test('no assistant turn 5 min after the start: reported as stalled once, not ended', async ($, on) => {
     const runs = fakeRepo(on, { agents: () => agent('working') })
     const clock = mock.clock(on)
