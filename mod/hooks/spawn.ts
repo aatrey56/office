@@ -405,7 +405,9 @@ export const SPAWN_TOOL = {
   description:
     'Start a background worker on a self-contained task: a `claude --bg` background session (default), a headless `claude -p` process, or a subagent. ' +
     'With no model, the office router picks the cheapest adequate model tier and effort (at most high). Returns a job id at once; ' +
-    'the worker result is appended to this conversation when it finishes (watch it in /jobs).',
+    'the worker result is appended to this conversation when it finishes (watch it in /jobs). ' +
+    'In a git repo the worker already runs on its own branch in its own worktree: never tell it to git switch, check out or create a branch; ' +
+    'name the branch with `branch` and start it from another commit with `base` instead.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -418,6 +420,11 @@ export const SPAWN_TOOL = {
         description: 'Omit to route (low/medium/high). xhigh/max only when the user explicitly asks.',
       },
       cwd: { type: 'string', description: 'Working directory (absolute); default the session cwd.' },
+      base: { type: 'string', description: "Commit or branch the worker's worktree starts from; default the current HEAD." },
+      branch: {
+        type: 'string',
+        description: "Name of the worker's branch; default office/<job>-<title>. Refused if it exists or is checked out elsewhere.",
+      },
     },
     required: ['task'],
   },

@@ -4,11 +4,13 @@ import type { On } from 'claude-code'
 
 const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 const BASE = 'abc1234def5678abc1234def5678abc1234def56'
+const OTHER = 'feed123def5678abc1234def5678abc1234def56'
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }
 
 // A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
+// `branches` exist (show-ref finds them), `worktrees` is `git worktree list --porcelain`; any `<x>^{commit}` is OTHER;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
 // the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
@@ -16,7 +18,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -53,6 +55,9 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
     if (cmd.includes('--git-common-dir')) return out('/r/.git\n')
     if (cmd.endsWith('rev-parse HEAD')) return out(`${BASE}\n`)
+    if (cmd.endsWith('^{commit}')) return out(`${OTHER}\n`)
+    if (argv.includes('show-ref')) return out('', fake.branches?.some(b => cmd.endsWith(`refs/heads/${b}`)) ? 0 : 1)
+    if (cmd.endsWith('worktree list --porcelain')) return out(fake.worktrees ?? '')
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
     if (argv.includes('--bg')) {
@@ -122,6 +127,27 @@ describe('worker worktrees', () => {
     expect(bg?.argv.at(-1)).toContain('Task:\nrename x to y')
     expect(bg?.argv.at(-1)).toContain('end your final reply with the line [office: done]')
     expect(JSON.stringify(r.result)).toContain(branch)
+  })
+
+  test('base and branch: the worktree starts from that commit on that branch, and the worker is told never to switch', async ($, on) => {
+    const runs = fakeRepo(on)
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', base: 'release', branch: 'fix/rename' })
+    const add = runs.find(run => run.argv.includes('worktree') && run.argv.includes('add'))?.argv ?? []
+    expect(add[add.indexOf('-b') + 1]).toBe('fix/rename')
+    expect(add.at(-1)).toBe(OTHER)
+    const task = runs.find(run => run.argv.includes('--bg'))?.argv.at(-1) ?? ''
+    expect(task).toContain('already on your own branch fix/rename')
+    expect(task).toContain('Never switch, create or rename branches')
+    expect(JSON.stringify(r.result)).toContain('Own branch fix/rename (from feed123)')
+  })
+
+  test('a branch that exists or is checked out elsewhere is refused before anything starts', async ($, on) => {
+    const runs = fakeRepo(on, { branches: ['main', 'taken'], worktrees: 'worktree /r\nHEAD abc\nbranch refs/heads/main\n' })
+    const spawn = (branch: string) =>
+      $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', branch }).then(r => JSON.stringify(r))
+    expect(await spawn('main')).toContain('Branch main is checked out in /r')
+    expect(await spawn('taken')).toContain('Branch taken already exists')
+    expect(runs.some(run => run.argv.includes('add') || run.argv.includes('--bg'))).toBe(false)
   })
 
   test('a clean finished worker gives its worktree back and reports its branch', async ($, on) => {

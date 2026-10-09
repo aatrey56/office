@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { branchName, repoRootFromCommonDir, worktreeReport } from './worktree'
+import { branchName, checkedOutIn, repoRootFromCommonDir, worktreeReport } from './worktree'
 
 const OUTCOME = {
   branch: 'office/j1-fix-login',
@@ -20,6 +20,14 @@ describe('branchName', () => {
     expect(long.startsWith('office/j2-rewrite-the-whole')).toBe(true)
     expect(tail.length <= 40).toBe(true)
     expect(/^[a-z0-9-]+$/.test(tail) && !tail.endsWith('-')).toBe(true)
+  })
+})
+
+describe('checkedOutIn', () => {
+  test('the worktree a branch is checked out in, from the porcelain listing', () => {
+    const listed = 'worktree /r\nHEAD 1\nbranch refs/heads/main\n\nworktree /w/j1\nHEAD 2\nbranch refs/heads/office/j1\n\nworktree /w/d\nHEAD 3\ndetached\n'
+    expect(checkedOutIn(listed, 'office/j1')).toBe('/w/j1')
+    expect(checkedOutIn(listed, 'office')).toBe(undefined)
   })
 })
 

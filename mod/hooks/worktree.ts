@@ -23,6 +23,26 @@ export function addWorktreeArgv(projectRoot: string, dir: string, branch: string
   return ['git', '-C', projectRoot, 'worktree', 'add', '-b', branch, dir, base]
 }
 
+/** A `branch` or `base` a caller gave is refused when git could read it as an option. */
+export function refArgError(what: 'branch' | 'base', ref: string): string | undefined {
+  return ref.startsWith('-') ? `${what} "${ref}" may not start with "-".` : undefined
+}
+
+/** `git -C <cwd> rev-parse --verify --quiet <base>^{commit}`: the commit a given base names. */
+export function resolveBaseArgv(cwd: string, base: string): string[] {
+  return ['git', '-C', cwd, 'rev-parse', '--verify', '--quiet', `${base}^{commit}`]
+}
+
+/** The worktree `branch` is checked out in, from `git worktree list --porcelain`; undefined when none. */
+export function checkedOutIn(porcelain: string, branch: string): string | undefined {
+  let dir: string | undefined
+  for (const line of porcelain.split('\n')) {
+    if (line.startsWith('worktree ')) dir = line.slice('worktree '.length)
+    else if (line === `branch refs/heads/${branch}`) return dir
+  }
+  return undefined
+}
+
 /** `git -C <projectRoot> worktree remove <dir>`, never --force: a worktree with uncommitted work stays. */
 export function removeWorktreeArgv(projectRoot: string, dir: string): string[] {
   return ['git', '-C', projectRoot, 'worktree', 'remove', dir]
@@ -42,9 +62,10 @@ export function repoRootFromCommonDir(stdout: string): string | null {
 /** Put before the worker's task: its worktree and branch, and the git rules (commit there, never push or switch branch). */
 export function workerPreamble(dir: string, branch: string, base: string): string {
   return [
-    `You work in the git worktree ${dir} on branch ${branch}, started from ${base}.`,
-    'Commit your work on this branch with clear messages.',
-    'Never push, never switch branches, never touch other worktrees or the main checkout.',
+    `You work in the git worktree ${dir}, already on your own branch ${branch}, started from ${base}.`,
+    'Commit your work on this branch with clear messages: it is the branch your result is read from.',
+    'Never switch, create or rename branches (no git switch, git checkout <branch>, git branch -m), even if the task says to: your branch is already set up.',
+    'Never push, never touch other worktrees or the main checkout.',
     'Dependencies (node_modules, venvs) may be missing in a fresh worktree: install them if a check needs them.',
     'If a guard, hook or permission check blocks an action, stop and report it; never route around it another way.',
     '',

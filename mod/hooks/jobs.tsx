@@ -90,9 +90,12 @@ import type { BgAgent, Reservation, WorkerMode } from './spawn'
 import {
   addWorktreeArgv,
   branchName,
+  checkedOutIn,
   projectRootArgv,
+  refArgError,
   removeWorktreeArgv,
   repoRootFromCommonDir,
+  resolveBaseArgv,
   workerPreamble,
   worktreeDir,
   worktreeReport,
@@ -312,7 +315,8 @@ export function installJobs(on: On, options: PluginOptions) {
     const task = str(input.task)
     if (!task) return { deny: 'spawn_worker needs a task.' }
     const mode: WorkerMode = isWorkerMode(input.mode) ? input.mode : 'bg'
-    const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT)
+    const want = { base: str(input.base), branch: str(input.branch) }
+    const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT, want)
     return msg.ok ? { result: msg.text } : { deny: msg.text }
   })
 
@@ -1548,6 +1552,7 @@ async function startWorker(
   effortArg: unknown,
   cwdArg: string | undefined,
   by: SpawnedBy,
+  want: Placement = {},
 ): Promise<Started> {
   let ran: { load: Load; view: BgView }
   try {
@@ -1567,6 +1572,9 @@ async function startWorker(
   const atHard = budgetVerdict(windows, caps, { isSmall: false, isExplicit: false, isForced })
   if (!atHard.isAllowed && atHard.zone === 'hard') return { ok: false, text: `${atHard.reason}. /spawn --force (typed by the person) is the only override.` }
   const cwd = await resolveCwd($, cwdArg)
+  // A base or branch the caller named is checked before routing or holding a slot.
+  const placement = await checkPlacement($, options, cwd, want)
+  if (typeof placement === 'string') return { ok: false, text: placement }
   const now = Date.now()
   const routed = modelArg === undefined ? await route($, options, task) : undefined
   const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet')
@@ -1589,14 +1597,14 @@ async function startWorker(
   // A slow start (worktree, --bg, a listing) may outlast one reservation: it is renewed until settled.
   const renewal = renewSlot($, slot)
   try {
-    return await launchWorker($, options, slot, task, mode, { modelId, effort, routed, cwd, now, warning: verdict.warning })
+    return await launchWorker($, options, slot, task, mode, { modelId, effort, routed, cwd, now, warning: verdict.warning, placement })
   } finally {
     renewal.cancel()
     await releaseSlot($, slot)
   }
 }
 
-type Launch = { modelId: string; effort: Effort; routed?: RouteDecision; cwd: string; now: number; warning?: string }
+type Launch = { modelId: string; effort: Effort; routed?: RouteDecision; cwd: string; now: number; warning?: string; placement: Placement }
 
 /** Starts a worker on a reserved slot; the slot is settled once the worker counts where it runs. */
 async function launchWorker(
@@ -1605,9 +1613,9 @@ async function launchWorker(
   slot: Slot,
   task: string,
   mode: WorkerMode,
-  { modelId, effort, routed, cwd, now, warning }: Launch,
+  { modelId, effort, routed, cwd, now, warning, placement }: Launch,
 ): Promise<Started> {
-  const placed = await placeWorker($, options, task, {
+  const placed = await placeWorker($, options, task, placement, {
     id: slot.jobId,
     kind: 'worker',
     title: task.replace(/\s+/g, ' ').slice(0, 60),
@@ -1620,6 +1628,7 @@ async function launchWorker(
     mode,
     tail: '',
   })
+  if (placed.error !== undefined) return { ok: false, text: `Worker not started: ${placed.error}` }
   const job = placed.job
   const workerTask = withDoneRule(placed.task)
   const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}${warning ? `. Budget: ${warning}` : ''}`
@@ -1787,18 +1796,56 @@ async function git($: EngineInterface, argv: string[]): Promise<GitRun> {
   return r.exitCode === 0 ? { isOk: true, out: r.stdout } : { isOk: false, out: (r.stderr || r.stdout).trim() || `exit ${r.exitCode}` }
 }
 
+/** The base commit and branch name a caller asked a worker's worktree for; unset parts take the defaults. */
+type Placement = { base?: string; branch?: string }
+
+/**
+ * A base or branch the caller gave, checked: the base resolved to its commit, the branch a valid
+ * name nobody has (not an existing branch, not checked out in any worktree). A refusal is the text.
+ */
+async function checkPlacement($: EngineInterface, options: PluginOptions, cwd: string, want: Placement): Promise<Placement | string> {
+  if (want.base === undefined && want.branch === undefined) return {}
+  if (opt(options, 'workerWorktree', 'auto') === 'off') return 'base and branch need worker worktrees, and workerWorktree is off.'
+  const common = await git($, projectRootArgv(cwd))
+  const root = common.isOk ? repoRootFromCommonDir(common.out) : null
+  if (root === null) return `${cwd} is not in a git repository: base and branch need one.`
+  let base: string | undefined
+  if (want.base !== undefined) {
+    const bad = refArgError('base', want.base)
+    if (bad !== undefined) return bad
+    const sha = await git($, resolveBaseArgv(cwd, want.base))
+    if (!sha.isOk || sha.out.trim() === '') return `base "${want.base}" names no commit in ${cwd}.`
+    base = sha.out.trim()
+  }
+  const branch = want.branch
+  if (branch !== undefined) {
+    const bad = refArgError('branch', branch)
+    if (bad !== undefined) return bad
+    if (!(await git($, ['git', '-C', root, 'check-ref-format', '--branch', branch])).isOk) return `"${branch}" is not a valid branch name.`
+    const listed = await git($, ['git', '-C', root, 'worktree', 'list', '--porcelain'])
+    const where = listed.isOk ? checkedOutIn(listed.out, branch) : undefined
+    if (where !== undefined) return `Branch ${branch} is checked out in ${where}; pick another name.`
+    if ((await git($, ['git', '-C', root, 'show-ref', '--verify', '--quiet', `refs/heads/${branch}`])).isOk) {
+      return `Branch ${branch} already exists; pick another name, or omit branch for office/<job>-<title>.`
+    }
+  }
+  return { base, branch }
+}
+
 /**
  * Gives a worker started in a git repo its own branch in its own worktree:
  * the job then runs there and the task leads with the git rules. Outside a
  * repo, with workerWorktree off, or when a git step fails, it runs in the
- * cwd it was given; `note` says why for the start message.
+ * cwd it was given; `note` says why for the start message. A worker asked
+ * for a base or branch never falls back: `error` says why it cannot start.
  */
 async function placeWorker(
   $: EngineInterface,
   options: PluginOptions,
   task: string,
+  want: Placement,
   job: Job,
-): Promise<{ job: Job; task: string; note: string }> {
+): Promise<{ job: Job; task: string; note: string; error?: string }> {
   const here = { job, task, note: '' }
   if (opt(options, 'workerWorktree', 'auto') === 'off') return here
   const common = await git($, projectRootArgv(job.cwd))
@@ -1806,15 +1853,16 @@ async function placeWorker(
   if (root === null) return here
   const fallback = (why: string) => ({ ...here, note: `No worktree of its own (${why}): it shares this checkout.` })
   // From the commit the caller is on: a manager in a linked worktree hands out its own branch.
-  const head = await git($, ['git', '-C', job.cwd, 'rev-parse', 'HEAD'])
+  const head = want.base !== undefined ? { isOk: true, out: want.base } : await git($, ['git', '-C', job.cwd, 'rev-parse', 'HEAD'])
   if (!head.isOk) return fallback(`git rev-parse HEAD: ${head.out}`)
   const base = head.out.trim()
   const dir = worktreeDir(await configDirOf($), root, job.id)
-  const branch = branchName(job.id, job.title)
+  const branch = want.branch ?? branchName(job.id, job.title)
   const added = await git($, addWorktreeArgv(root, dir, branch, base))
   if (!added.isOk) {
-    // `add -b` may have made the branch before failing; its name holds the new job id, so it is ours.
-    await git($, ['git', '-C', root, 'branch', '-d', branch])
+    // `add -b` may have made the branch before failing; a default name holds the new job id, so it is ours.
+    if (want.branch === undefined) await git($, ['git', '-C', root, 'branch', '-d', branch])
+    if (want.base !== undefined || want.branch !== undefined) return { ...here, error: `git worktree add: ${added.out}` }
     return fallback(`git worktree add: ${added.out}`)
   }
   const status = await git($, ['git', '-C', job.cwd, 'status', '--porcelain'])
