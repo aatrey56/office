@@ -87,7 +87,69 @@ export function textLines(content: string): number {
   return (content.match(/\n/g)?.length ?? 0) + (content !== '' && !content.endsWith('\n') ? 1 : 0)
 }
 
-export type RoundPolicy = { maxRounds: number; maxLines: number; review: CodexTier; rereview: CodexTier }
+/** The trailing window the full-review cap counts in. */
+export const FULL_WINDOW_MS = 5 * 3_600_000
+
+/** One full-model review: when it was booked and its job (a failed or interrupted job gives its slot back). */
+export type FullReview = { at: number; jobId: string }
+
+/** The stored full reviews, read defensively, without those past the window. */
+export function parseFullReviews(raw: unknown, now: number): FullReview[] {
+  if (!Array.isArray(raw)) return []
+  const ok = (r: unknown): r is FullReview => typeof (r as FullReview | null)?.at === 'number' && typeof (r as FullReview).jobId === 'string'
+  return raw.filter(ok).filter(r => now - r.at < FULL_WINDOW_MS)
+}
+
+/** The full reviews without those of dropped jobs (settlements with no findings). */
+export function settledFulls(fulls: readonly FullReview[], settlements: readonly { jobId: string; findings?: string }[]): FullReview[] {
+  const dropped = new Set(settlements.filter(s => s.findings === undefined).map(s => s.jobId))
+  return fulls.filter(r => !dropped.has(r.jobId))
+}
+
+/** Whether a round on this tier is a full review for the cap: any model but the re-review model. */
+export function isFullTier(tier: CodexTier, policy: Pick<RoundPolicy, 'rereview'>): boolean {
+  return tier.model !== policy.rereview.model
+}
+
+/** When the next full-review slot frees (ms): the (count - cap + 1)th oldest in the window expires. Undefined with a free slot. */
+export function nextFullSlot(fulls: readonly FullReview[], now: number, cap: number): number | undefined {
+  const times = fulls.filter(r => now - r.at < FULL_WINDOW_MS).map(r => r.at).sort((a, b) => a - b)
+  return cap > 0 && times.length >= cap ? times[times.length - cap]! + FULL_WINDOW_MS : undefined
+}
+
+/** The refusal of a full review at the cap, or undefined when a slot is free (or there is no cap). */
+export function fullReviewRefusal(fulls: readonly FullReview[], now: number, cap: number, rereviewModel: string): string | undefined {
+  const free = nextFullSlot(fulls, now, cap)
+  if (free === undefined) return undefined
+  const ran = fulls.filter(r => now - r.at < FULL_WINDOW_MS).length
+  return (
+    `Codex full-review cap reached: ${ran} full reviews ran in the last 5 h (codexFullReviewsPer5h ${cap}); ` +
+    `the next slot frees at ${new Date(free).toISOString()}. No review started. ` +
+    `A full review (round 1, a rebase, a large diff or full: true) has to wait for that slot; ` +
+    `a re-review of new commits (no target, no full) still runs on ${rereviewModel}. Otherwise ask the person.`
+  )
+}
+
+/** Codex's usage / rate-limit failure wording, matched case-insensitively. */
+const USAGE_LIMIT = /usage limit|rate limit|hit your limit/i
+export function isUsageLimit(text: string): boolean {
+  return USAGE_LIMIT.test(text)
+}
+
+/** What a manager does when Codex cannot review: the ChatGPT plan's usage or rate limit is hit. */
+export const CODEX_OUT_FALLBACK_TEXT =
+  'Codex is out of usage (the ChatGPT plan\'s usage or rate limit was hit). Fallback: run an Opus review via a subagent instead. ' +
+  'It is a same-model-family review with lower trust: Claude also wrote this code and may confirm its own bias, ' +
+  'so verify each finding yourself, and do not count a clean Opus review as evidence the branch is correct. ' +
+  'Say "reviewed by Opus (Codex out of usage), not independent" in the PR description.'
+
+export type RoundPolicy = {
+  maxRounds: number
+  maxLines: number
+  review: CodexTier
+  rereview: CodexTier
+  maxFullReviews?: number // codexFullReviewsPer5h: full reviews allowed in any FULL_WINDOW_MS; 0 or unset: no cap
+}
 
 /** What the call knows: the branch's rounds, the tree now, the caller's choices, and git's view of the last reviewed sha. */
 export type RoundFacts = {
@@ -99,6 +161,8 @@ export type RoundFacts = {
   isFull: boolean // full: true, or a deep review
   instructions?: string
   sinceLast?: { isAncestor: boolean; changedLines: number }
+  now?: number // with `fullReviews`: the full-review window is counted at this time
+  fullReviews?: readonly FullReview[] // every session's and branch's full reviews; unset: not counted
 }
 
 /**
@@ -130,6 +194,7 @@ const short = (sha: string) => sha.slice(0, 7)
  * - round 1, `full` / deep, a rebase past the last sha, or more than maxLines changed since
  *   it → a full review on the review model;
  * - a later round with an explicit target → that target as given, on the re-review model;
+ * - any full review at maxFullReviews in the trailing 5 h → refused, for the person too (a re-review still runs);
  * - otherwise a re-review of the changes since the last sha on the re-review model, checking
  *   the previous round's findings.
  */
@@ -137,9 +202,15 @@ export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPl
   const { rounds, head, isDirty } = facts
   const round = rounds.length + 1
   const last = rounds.at(-1)
-  const full = (note?: string): RoundPlan => ({
-    isAllowed: true, round, isRereview: false, tier: policy.review, target: facts.target, instructions: facts.instructions, note,
-  })
+  const full = (note?: string): RoundPlan => {
+    // The cap holds for the person too, and for a forced full re-review; it never downgrades a full round to the re-review model.
+    const cap = policy.maxFullReviews ?? 0
+    if (cap > 0 && facts.fullReviews !== undefined && facts.now !== undefined && isFullTier(policy.review, policy)) {
+      const reason = fullReviewRefusal(facts.fullReviews, facts.now, cap, policy.rereview.model)
+      if (reason !== undefined) return { isAllowed: false, reason }
+    }
+    return { isAllowed: true, round, isRereview: false, tier: policy.review, target: facts.target, instructions: facts.instructions, note }
+  }
   if (facts.isPerson || last === undefined) return full()
   if (last.sha === head && !isDirty && last.isCovering === true) {
     return { isAllowed: false, reason: `Nothing new since round ${rounds.length} (${short(head)}, clean tree): no review started.` }

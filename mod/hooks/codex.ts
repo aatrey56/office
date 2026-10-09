@@ -166,7 +166,13 @@ export const CODEX_REVIEW_TOOL = {
     'it becomes a full review after a rebase, when the diff since then is large, or with full: true. ' +
     'Later rounds with an explicit target run that target as given, also on the cheaper model, unless full: true or deep: true; they still count as rounds. ' +
     'A call with nothing new since the last round is refused. At codexMaxRounds rounds (default 3) calls are refused: ' +
-    'then stop, summarise the remaining findings and ask the person.',
+    'then stop, summarise the remaining findings and ask the person. ' +
+    'Full reviews are also capped across all sessions and branches at codexFullReviewsPer5h (default 10) in any 5 hours, each about 4% of the owner\'s 5-hour Codex limit: ' +
+    'at the cap a call that needs a full review (round 1, a rebase, a large diff, full: true, deep: true) is refused with the time the next slot frees, ' +
+    'while a re-review of new commits still runs on the cheaper model; do not retry before that time. ' +
+    'If Codex is out of usage (the result says so), run an Opus review via a subagent instead: it is a same-model-family review with lower trust, ' +
+    'since Claude also wrote the code and may confirm its own bias, so verify each finding, do not count a clean Opus review as evidence the branch is correct, ' +
+    'and say "reviewed by Opus (Codex out of usage), not independent" in the PR description.',
   inputSchema: {
     type: 'object',
     properties: {

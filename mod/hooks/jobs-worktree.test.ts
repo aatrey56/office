@@ -650,6 +650,25 @@ describe('codex review rounds', () => {
     expect(runs.some(x => x.argv.join(' ') === `git diff --shortstat ${OLD}`)).toBe(true)
   })
 
+  test('the 11th full review in 5 h is refused, for the person too; a re-review still runs on luna and takes no slot', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const hour = 3_600_000
+    const fulls = Array.from({ length: 10 }, (_, i) => ({ jobId: `j-full${i}`, at: Date.now() - (4 - i * 0.3) * hour }))
+    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x')] }, codexFullReviews: fulls })
+    const clock = mock.clock(on)
+    const refused = await $.tool.call({ tool: 'mcp__office__codex_review', full: true, cwd: '/r/src' })
+    expect(refused.deny ?? '').toContain('10 full reviews ran in the last 5 h')
+    expect(refused.deny ?? '').toContain(`next slot frees at ${new Date(fulls[0]!.at + 5 * hour).toISOString()}`)
+    const typed = await $.command.run({ command: 'codex-review', args: '', ...TYPED })
+    expect(JSON.stringify(typed)).toContain('10 full reviews ran in the last 5 h')
+    const ok = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(ok.result)).toContain('Started Codex re-review job')
+    expect(String(ok.result)).toContain('gpt-6-luna')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    expect(runs.store.get('codexFullReviews')).toEqual(fulls)
+    expect((runs.store.get('codexRounds') as Record<string, unknown[]>)[KEY]).toHaveLength(2)
+  })
+
   test('at the cap the tool is refused; the person\'s /codex-review still runs, on sol, and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {
     const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round('a'.repeat(40)), round('b'.repeat(40)), round('c'.repeat(40))] } })
     const clock = mock.clock(on)

@@ -83,6 +83,7 @@ describe('route through the plugin', () => {
 describe('codex handoff', () => {
   test('a failed `codex login status` fails the job with the login hint', async ($, on) => {
     const runs: string[] = []
+    on('store.set', () => ({ value: undefined })) // not a repo: the review still books a slot of the full-review window
     on('process.run', (_$, e) => {
       runs.push(e.argv.join(' '))
       const value = { exitCode: 1, stdout: '', stderr: 'Not logged in', isStdoutTruncated: false, isStderrTruncated: false }

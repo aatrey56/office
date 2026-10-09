@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CODEX_DEFAULTS } from './codex'
-import { coversBranch, FINDINGS_MAX, parseLedger, planCovers, planReviewRound, ROUND_TTL_MS, roundTitle, settledLedger, shortstatLines, textLines } from './codex-rounds'
+import {
+  CODEX_OUT_FALLBACK_TEXT, coversBranch, FINDINGS_MAX, FULL_WINDOW_MS, isUsageLimit, nextFullSlot, parseFullReviews, parseLedger,
+  planCovers, planReviewRound, ROUND_TTL_MS, roundTitle, settledFulls, settledLedger, shortstatLines, textLines,
+} from './codex-rounds'
 import type { ReviewRound, RoundFacts } from './codex-rounds'
 
 const A = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
@@ -100,5 +103,58 @@ describe('codex review rounds', () => {
     const kept = settledLedger(ledger, `j-${B}`, 'x'.repeat(FINDINGS_MAX + 100))
     expect(kept.k![0]!.findings!.length).toBeLessThan(FINDINGS_MAX + 20)
     expect(settledLedger(ledger, `j-${B}`, undefined)).toEqual({})
+  })
+
+  const H = 3_600_000
+  const full = (jobId: string, at: number) => ({ jobId, at })
+  const tenIn5h = (now: number) => Array.from({ length: 10 }, (_, i) => full(`f${i}`, now - (4.5 - i * 0.4) * H)) // oldest 4.5 h ago
+
+  test('the full-review window counts the trailing 5 h only, prunes older ones, and gives a dropped job its slot back', () => {
+    const now = 100 * H
+    const stored = [full('old', now - FULL_WINDOW_MS), full('in', now - FULL_WINDOW_MS + 1), { jobId: 1 }, 'junk']
+    expect(parseFullReviews(stored, now).map(r => r.jobId)).toEqual(['in'])
+    expect(parseFullReviews(undefined, now)).toEqual([])
+    const fulls = [full('a', now), full('b', now)]
+    expect(settledFulls(fulls, [{ jobId: 'a' }, { jobId: 'b', findings: 'kept' }]).map(r => r.jobId)).toEqual(['b'])
+  })
+
+  test('the next slot frees when the oldest full review leaves the window (the cap-th newest, past the cap)', () => {
+    const now = 100 * H
+    const fulls = tenIn5h(now)
+    expect(nextFullSlot(fulls.slice(1), now, 10)).toBeUndefined() // 9 of 10
+    expect(nextFullSlot(fulls, now, 0)).toBeUndefined() // no cap
+    expect(nextFullSlot(fulls, now, 10)).toBe(now - 4.5 * H + FULL_WINDOW_MS)
+    expect(nextFullSlot(fulls, now, 8)).toBe(fulls[2]!.at + FULL_WINDOW_MS) // 10 in the window, cap 8: two must leave
+  })
+
+  test('at the full-review cap a full round is refused (agent, person, forced full) but a re-review runs on the re-review model', () => {
+    const now = 100 * H
+    const capped = { ...policy, maxFullReviews: 10 }
+    const at = (over: Partial<RoundFacts>) => planReviewRound(facts({ now, fullReviews: tenIn5h(now), ...over }), capped)
+    const iso = new Date(now - 4.5 * H + FULL_WINDOW_MS).toISOString()
+    for (const refused of [
+      at({ rounds: [], sinceLast: undefined }), // round 1: not downgraded to Luna
+      at({ isPerson: true }),
+      at({ isFull: true }),
+      at({ sinceLast: { isAncestor: false, changedLines: 0 } }), // rebase
+      at({ sinceLast: { isAncestor: true, changedLines: 401 } }), // size
+    ]) {
+      expect(refused.isAllowed).toBe(false)
+      expect((refused as { reason: string }).reason).toContain(`10 full reviews ran in the last 5 h`)
+      expect((refused as { reason: string }).reason).toContain(`next slot frees at ${iso}`)
+    }
+    expect(at({})).toMatchObject({ isAllowed: true, isRereview: true, tier: CODEX_DEFAULTS.rereview })
+    expect(at({ target: { args: ['--commit', B], label: 'c' } })).toMatchObject({ isAllowed: true, tier: CODEX_DEFAULTS.rereview })
+    // 9 in the window, or no cap: a full round runs
+    expect(planReviewRound(facts({ now, fullReviews: tenIn5h(now).slice(1), isFull: true }), capped).isAllowed).toBe(true)
+    expect(planReviewRound(facts({ now, fullReviews: tenIn5h(now), isFull: true }), { ...policy, maxFullReviews: 0 }).isAllowed).toBe(true)
+  })
+
+  test('a Codex usage / rate limit failure is matched case-insensitively; other failures are not', () => {
+    for (const text of ["You've hit your usage limit. Try again at 3:11 AM.", 'Rate Limit exceeded', 'ERROR: you HIT YOUR LIMIT']) {
+      expect(isUsageLimit(text)).toBe(true)
+    }
+    for (const text of ['Not logged in', 'stream error: 429 Too Many Requests', 'model not supported', '']) expect(isUsageLimit(text)).toBe(false)
+    expect(CODEX_OUT_FALLBACK_TEXT).toContain('reviewed by Opus (Codex out of usage), not independent')
   })
 })
