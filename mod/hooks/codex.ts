@@ -37,6 +37,7 @@ export function defaultReviewTarget(porcelain: string, branches: readonly string
 export type CodexTier = { model: string; effort: string }
 export const CODEX_DEFAULTS = {
   review: { model: 'gpt-6.1-sol', effort: 'high' }, // /codex-review, codex_review
+  rereview: { model: 'gpt-6-luna', effort: 'medium' }, // codex_review's later rounds (codex-rounds.ts)
   exec: { model: 'gpt-6-luna', effort: 'medium' }, // codex_exec second opinions
   deep: { model: 'gpt-6-astra', effort: 'high' }, // only `--deep` / deep: true; scarce quota
 } as const satisfies Record<string, CodexTier>
@@ -77,9 +78,11 @@ export function codexReviewPrompt(target: ReviewTarget, instructions: string): s
   const what =
     flag === '--commit'
       ? `Review the changes introduced by commit ${value} (see \`git show ${value}\`).`
-      : flag === '--base'
-        ? `Review the changes on the current branch against the base branch ${value} (see \`git diff ${value}...HEAD\`).`
-        : 'Review the uncommitted changes in this repository: staged, unstaged and untracked files (see `git status` and `git diff HEAD`).'
+      : flag === '--base' && /^[0-9a-f]{7,40}$/.test(value ?? '')
+        ? `Review the changes made since commit ${value}, committed or not (see \`git log ${value}..HEAD\`, \`git diff ${value}\` and \`git status\`).`
+        : flag === '--base'
+          ? `Review the changes on the current branch against the base branch ${value} (see \`git diff ${value}...HEAD\`).`
+          : 'Review the uncommitted changes in this repository: staged, unstaged and untracked files (see `git status` and `git diff HEAD`).'
   return `${what}\n\nAdditional review instructions:\n${instructions}`
 }
 
