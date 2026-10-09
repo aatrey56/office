@@ -1572,7 +1572,7 @@ async function bookRound(
   const key = branchKey(commonDir, (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD'])) ?? '')
   const isIncremental = !facts.isPerson && facts.target === undefined && !facts.isFull
   const measureLast = async () => {
-    const last = parseLedger(await storeGet($, ROUNDS_KEY), now)[key]?.at(-1)
+    const last = (await readLedgerLocked($, now)).ledger[key]?.at(-1) // the reconciled ledger, as the lock will see it
     return last !== undefined && last.isCovering === true && isIncremental
       ? { sha: last.sha, since: await sinceSha($, cwd, last.sha) }
       : undefined
@@ -1623,14 +1623,20 @@ async function readLedgerLocked($: EngineInterface, now: number) {
   return { stored, ledger: settledAll(parseLedger(stored, now), pending), pending }
 }
 
-/** Writes the ledger when it changed, then clears the pending settlements it applied (call holding the rounds lock). */
+/**
+ * Writes the ledger when it changed, then clears the pending settlements it applied (call holding
+ * the rounds lock). A write that fails keeps them pending, for the next ledger access to apply.
+ */
 async function saveLedgerLocked(
   $: EngineInterface,
   stored: unknown,
   ledger: RoundLedger,
   pending: readonly { key: string }[],
 ): Promise<void> {
-  if (JSON.stringify(ledger) !== JSON.stringify(stored)) await $.store.set(ROUNDS_KEY, ledger).catch(() => undefined)
+  if (JSON.stringify(ledger) !== JSON.stringify(stored)) {
+    const isWritten = await $.store.set(ROUNDS_KEY, ledger).then(() => true, () => false)
+    if (!isWritten) return
+  }
   for (const p of pending) await $.store.delete(p.key).catch(() => undefined)
 }
 

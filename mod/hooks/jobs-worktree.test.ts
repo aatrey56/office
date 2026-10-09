@@ -16,12 +16,13 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; untracked?: string }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; untracked?: string; failSet?: string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock() }) as Runs
   const { store } = runs
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
+    if (e.key === fake.failSet) throw new Error('disk full')
     runs.sets.push(e.key)
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
     return { value: undefined }
@@ -499,10 +500,11 @@ describe('codex review rounds', () => {
   const OLD = 'f00d'.repeat(10)
   const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
   const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings, isCovering: true })
-  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }) => {
+  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }, failSet?: string) => {
     const reviews: { argv: readonly string[]; input?: string }[] = []
     const runs = fakeRepo(on, {
       store,
+      failSet,
       untracked: untracked && `${untracked.path}\0`,
       async *spawn(e) {
         if (e.argv[0] === 'codex') reviews.push(e)
@@ -599,6 +601,28 @@ describe('codex review rounds', () => {
     await clock.advance(0)
     expect(reviews).toHaveLength(1)
     expect((runs.store.get('codexRounds') as Record<string, unknown[]>)[KEY]).toHaveLength(1)
+  })
+
+  test('a pending settlement is kept when the ledger write fails, so its findings are not lost (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs } = reviewRuns(on, {
+      codexRounds: { [KEY]: [round(OLD)] },
+      'codexSettle:j-old': { jobId: `j-${OLD}`, at: Date.now(), findings: '[P1] kept' },
+    }, undefined, 'codexRounds')
+    mock.clock(on)
+    await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(runs.store.get('codexSettle:j-old')).toMatchObject({ findings: '[P1] kept' })
+  })
+
+  test('a drop pending for the newest of two covering rounds leaves the other as the baseline of an incremental review (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const NEWER = 'b'.repeat(40)
+    const { runs } = reviewRuns(on, {
+      codexRounds: { [KEY]: [round(OLD, '[P1] x'), round(NEWER)] },
+      'codexSettle:j-newer': { jobId: `j-${NEWER}`, at: Date.now() },
+    })
+    mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 2/3 (vs f00df00, gpt-6-luna)')
+    expect(runs.some(x => x.argv.join(' ') === `git diff --shortstat ${OLD}`)).toBe(true)
   })
 
   test('at the cap the tool is refused; the person\'s /codex-review still runs, on sol, and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {
