@@ -32,7 +32,10 @@ import {
   parseCodexReviewArgs,
 } from './codex-budget'
 import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
-import { branchKey, parseLedger, planCovers, planReviewRound, roundOf, roundTitle, settledLedger, shortstatLines } from './codex-rounds'
+import {
+  branchKey, parseLedger, planCovers, planReviewRound, roundOf, roundTitle, settledLedger, shortstatLines, textLines,
+  UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
+} from './codex-rounds'
 import type { RoundFacts, RoundPlan, RoundPolicy } from './codex-rounds'
 import {
   CLAUDE_SYSTEM,
@@ -1588,7 +1591,23 @@ async function sinceSha($: EngineInterface, cwd: string, sha: string): Promise<{
   const isAncestor = (await gitOut($, cwd, ['merge-base', '--is-ancestor', sha, 'HEAD'])) !== undefined
   if (!isAncestor) return { isAncestor, changedLines: 0 }
   const stat = await gitOut($, cwd, ['diff', '--shortstat', sha])
-  return { isAncestor, changedLines: stat === undefined ? Number.POSITIVE_INFINITY : shortstatLines(stat) }
+  if (stat === undefined) return { isAncestor, changedLines: Number.POSITIVE_INFINITY }
+  return { isAncestor, changedLines: shortstatLines(stat) + (await untrackedLines($, cwd)) }
+}
+
+/** Lines in the files git does not track yet (`git diff` skips them); Infinity when they cannot be measured or are too many. */
+async function untrackedLines($: EngineInterface, cwd: string): Promise<number> {
+  const top = (await gitOut($, cwd, ['rev-parse', '--show-toplevel'])) || cwd
+  const listed = await gitOut($, top, ['ls-files', '--others', '--exclude-standard', '-z'])
+  if (listed === undefined) return Number.POSITIVE_INFINITY
+  const files = listed.split('\0').filter(Boolean)
+  if (files.length > UNTRACKED_MAX_FILES) return Number.POSITIVE_INFINITY
+  let lines = 0
+  for (const file of files) {
+    lines += textLines(await $.fs.read(`${top}/${file}`).catch(() => '\0'))
+    if (lines > UNTRACKED_MAX_LINES) return Number.POSITIVE_INFINITY
+  }
+  return lines
 }
 
 /** A review job's end: its final text kept on its round (the next round checks it), or the round dropped when it failed. */

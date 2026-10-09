@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CODEX_DEFAULTS } from './codex'
-import { coversBranch, FINDINGS_MAX, parseLedger, planCovers, planReviewRound, ROUND_TTL_MS, roundTitle, settledLedger, shortstatLines } from './codex-rounds'
+import { coversBranch, FINDINGS_MAX, parseLedger, planCovers, planReviewRound, ROUND_TTL_MS, roundTitle, settledLedger, shortstatLines, textLines } from './codex-rounds'
 import type { ReviewRound, RoundFacts } from './codex-rounds'
 
 const A = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2'
@@ -69,6 +69,12 @@ describe('codex review rounds', () => {
     const plan = planReviewRound(facts({ rounds: partial }), policy) as { isRereview: boolean; note: string }
     expect(plan.isRereview).toBe(false)
     expect(plan.note).toContain('did not review the whole branch')
+  })
+
+  test('untracked files count as changed lines; binary ones cannot be measured', () => {
+    expect([textLines(''), textLines('a\nb\n'), textLines('a\nb')]).toEqual([0, 2, 2])
+    expect(textLines('PNG\0\x01')).toBe(Number.POSITIVE_INFINITY)
+    expect((planReviewRound(facts({ sinceLast: { isAncestor: true, changedLines: Number.POSITIVE_INFINITY } }), policy) as { note: string }).note).toContain('could not be measured')
   })
 
   test('at codexMaxRounds an agent is refused and told to ask the person; the person is not', () => {

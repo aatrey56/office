@@ -62,6 +62,16 @@ export function shortstatLines(text: string): number {
   return n('insertion') + n('deletion')
 }
 
+/** Past this many untracked files (or lines) a re-review's size is not measured: it is taken as too large. */
+export const UNTRACKED_MAX_FILES = 100
+export const UNTRACKED_MAX_LINES = 100_000
+
+/** Lines of an untracked file as `git diff` would count them added; Infinity for binary content (NUL), which cannot be measured. */
+export function textLines(content: string): number {
+  if (content.includes('\0')) return Number.POSITIVE_INFINITY
+  return (content.match(/\n/g)?.length ?? 0) + (content !== '' && !content.endsWith('\n') ? 1 : 0)
+}
+
 export type RoundPolicy = { maxRounds: number; maxLines: number; review: CodexTier; rereview: CodexTier }
 
 /** What the call knows: the branch's rounds, the tree now, the caller's choices, and git's view of the last reviewed sha. */

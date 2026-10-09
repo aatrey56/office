@@ -16,7 +16,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; untracked?: string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -55,6 +55,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     if (cmd.endsWith('rev-parse HEAD')) return out(`${BASE}\n`)
     if (cmd.includes('symbolic-ref')) return out('feature\n')
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
+    if (cmd.includes('ls-files')) return out(fake.untracked ?? '')
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
     if (argv.includes('--bg')) {
       await fake.bgGate
@@ -492,15 +493,16 @@ describe('codex review rounds', () => {
   const OLD = 'f00d'.repeat(10)
   const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
   const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings, isCovering: true })
-  const reviewRuns = (on: On, store: Record<string, unknown>) => {
+  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }) => {
     const reviews: { argv: readonly string[]; input?: string }[] = []
     const runs = fakeRepo(on, {
       store,
+      untracked: untracked && `${untracked.path}\0`,
       async *spawn(e) {
         if (e.argv[0] === 'codex') reviews.push(e)
       },
     })
-    on('fs.read', () => ({ value: 'No P1/P2 left.' }))
+    on('fs.read', (_$, e) => ({ value: untracked && e.path.endsWith(untracked.path) ? 'x\n'.repeat(untracked.lines) : 'No P1/P2 left.' }))
     collectDelivery(on)
     return { runs, reviews }
   }
@@ -535,6 +537,16 @@ describe('codex review rounds', () => {
     expect(rounds.map(x => x.isCovering)).toEqual([false, true])
     await $.command.run({ command: 'codex-review', args: '--commit abc1234', ...TYPED })
     expect((runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!.map(x => x.isCovering)).toEqual([false, true, false])
+  })
+
+  test('untracked files count toward the re-review size limit (a large new file makes it a full review)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x')] } }, { path: 'new.ts', lines: 401 })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6.1-sol)')
+    expect(String(r.result)).toContain('401 lines changed')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
   })
 
   test('at the cap the tool is refused; the person\'s /codex-review still runs, on sol, and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {
