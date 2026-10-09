@@ -2,8 +2,22 @@
 // reported or ended, and when a --bg worker that never replied is reported. jobs.tsx keeps the
 // timers and the git commits; every time here is read from one clock ($.clock.now).
 
+import { bgPhase } from './spawn'
+import type { BgAgent } from './spawn'
+
 /** A transcript (or output stream) that grew this recently counts as a worker still working. */
 export const GROWTH_WINDOW_MS = 5 * 60_000
+/** How long a stopped worker is waited for, and how often it is looked at meanwhile. */
+export const STOP_CONFIRM_MS = 20_000
+export const STOP_POLL_MS = 2_000
+
+/** A --bg session `claude agents --json --all` no longer lists, or lists as ended: its stop is confirmed. */
+export function isBgStopped(agent: BgAgent | undefined): boolean {
+  if (agent === undefined) return true
+  const phase = bgPhase(agent.state, agent.status)
+  return phase === 'done' || phase === 'failed'
+}
+
 /** A --bg worker with no assistant turn this long after its start is reported as stalled. */
 export const STALL_MS = 5 * 60_000
 

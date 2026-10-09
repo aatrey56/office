@@ -12,6 +12,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
 // `branches` exist (show-ref finds them), `worktrees` is `git worktree list --porcelain`; any `<x>^{commit}` is OTHER;
 // `dirty` leaves src/x.ts and big.bin uncommitted until a commit (exiting `commitExit`) takes them;
+// `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
 // the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
@@ -19,11 +20,12 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
   let isDirty = fake.dirty === true
+  const stopped = new Set<string>()
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
     runs.sets.push(e.key)
@@ -66,7 +68,11 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
       await fake.bgGate
       return out(fake.bg ?? 'backgrounded · 5ac0f0df\n', fake.bgExit ?? 0)
     }
-    if (argv.includes('agents')) return out(fake.agents?.() ?? '[]')
+    if (argv[1] === 'stop' && !fake.stopIgnored) stopped.add(argv[2] ?? '')
+    if (argv.includes('agents')) {
+      const listed = JSON.parse(fake.agents?.() ?? '[]') as { id: string; state?: string }[]
+      return out(JSON.stringify(listed.map(a => (stopped.has(a.id) ? { ...a, state: 'stopped' } : a))))
+    }
     if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
     if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
     if (cmd.endsWith('status --porcelain')) return out(isDirty ? ' M src/x.ts\n?? big.bin\n' : '')
@@ -273,6 +279,22 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     expect(text).toContain('timed out after 1 min (jobTimeoutMin); not extended')
     expect(text).toContain('WIP commit failed')
     expect(text).toMatch(/Uncommitted changes left in \/cfg\/office\/worktrees\//)
+    expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+  })
+
+  test('a worker not confirmed stopped: its work is left uncommitted and the worktree kept', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, stopIgnored: true })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000)
+    expect(stops(runs)).toBe(1)
+    expect(delivered.join('\n')).not.toContain('Worker FAILED') // still waiting to see it stop
+    await clock.advance(30_000)
+    const text = delivered.join('\n')
+    expect(text).toContain('Could not confirm the worker stopped; its work was left uncommitted in /cfg/office/worktrees/')
+    expect(runs.some(run => run.argv.includes('commit') || (run.argv.includes('add') && run.argv.includes('-A')))).toBe(false)
     expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
   })
 

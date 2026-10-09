@@ -104,7 +104,7 @@ import {
   worktreeDir,
   worktreeReport,
 } from './worktree'
-import { blockedVerdict, deadlineVerdict, isStalled, nextGrowth, timeoutText } from './watchdog'
+import { blockedVerdict, deadlineVerdict, isBgStopped, isStalled, nextGrowth, STOP_CONFIRM_MS, STOP_POLL_MS, timeoutText } from './watchdog'
 import type { Growth } from './watchdog'
 
 // Owner: jobs agent. Codex handoff, router, worker spawner, jobs pane.
@@ -1043,7 +1043,7 @@ async function registerBgLocked($: EngineInterface, slot: Slot, bgId: string, mo
 
 /** Kill (or timeout): stop the work and mark the job failed right away. */
 async function killJob($: EngineInterface, id: string, why: string): Promise<void> {
-  RUNNING.get(id)?.()
+  void RUNNING.get(id)?.()
   await finishJob($, id, 'failed', why)
 }
 
@@ -1086,9 +1086,10 @@ async function onDeadline($: EngineInterface, options: PluginOptions, id: string
 }
 
 /**
- * Ends a job past its time: stops its worker (waiting for `claude stop`), commits a dirty
- * worktree's work on its branch as WIP, then fails it with `why` and what became of the work.
- * The worktree is kept for recovery: finishJob never removes a failed job's.
+ * Ends a job past its time: stops its worker and waits until it is confirmed stopped, commits a
+ * dirty worktree's work on its branch as WIP, then fails it with `why` and what became of the work.
+ * A worker not confirmed stopped may still be writing: its work is left uncommitted. The worktree
+ * is kept for recovery: finishJob never removes a failed job's.
  */
 async function endJob($: EngineInterface, id: string, why: string, minutes: number): Promise<void> {
   const job = (await read($, JOBS)).find(j => j.id === id)
@@ -1096,9 +1097,12 @@ async function endJob($: EngineInterface, id: string, why: string, minutes: numb
   ENDING.add(id)
   let saved = ''
   try {
-    await RUNNING.get(id)?.()
-    RUNNING.delete(id) // stopped: it no longer counts toward maxWorkers while its work is committed
-    if (job.worktree !== undefined) saved = await commitWip($, job.worktree, minutes)
+    const isStopped = (await RUNNING.get(id)?.()) ?? true
+    RUNNING.delete(id) // stopped (or given up on): it no longer counts toward maxWorkers
+    if (!isStopped) {
+      const where = job.worktree !== undefined ? `; its work was left uncommitted in ${job.worktree}` : ''
+      saved = `Could not confirm the worker stopped${where}. It may still be running: check it before reusing its branch.`
+    } else if (job.worktree !== undefined) saved = await commitWip($, job.worktree, minutes)
   } catch (err) {
     saved = `Its work was not committed (${String(err).slice(0, 200)}); the worktree is kept at ${job.worktree}.`
   } finally {
@@ -1132,22 +1136,41 @@ async function commitWip($: EngineInterface, dir: string, minutes: number): Prom
   return `Its uncommitted work was committed on its branch as "WIP: timed out at ${minutes} min (office)"; the worktree is kept for recovery.${left}`
 }
 
-/** Registers a subagent job's kill handle, its answer route and its timeout. */
+/** Asks `isStopped` until it says yes, for at most STOP_CONFIRM_MS: whether a worker's stop is confirmed. */
+async function confirmStopped($: EngineInterface, isStopped: () => Promise<boolean>): Promise<boolean> {
+  for (let waited = 0; ; waited += STOP_POLL_MS) {
+    if (await isStopped().catch(() => false)) return true
+    if (waited >= STOP_CONFIRM_MS) return false
+    await $.clock.sleep(STOP_POLL_MS)
+  }
+}
+
+/** Registers a subagent job's kill handle (TaskStop, then its loop gone from $.agent.list), its answer route and its timeout. */
 function adoptSubagent($: EngineInterface, options: PluginOptions, job: Job, agentId: string): void {
   SUBAGENT_JOBS.set(agentId, job.id)
-  RUNNING.set(job.id, () => {
+  RUNNING.set(job.id, async () => {
     SUBAGENT_JOBS.delete(agentId)
-    void $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(() => undefined)
+    await $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(() => undefined)
+    return confirmStopped($, async () => {
+      const agent = (await $.agent.list()).find(a => a.id === agentId)
+      return agent === undefined || !['running', 'pending', 'waiting'].includes(agent.status)
+    })
   })
   void startTimeout($, options, job.id)
 }
 
-/** Registers a --bg job's kill handle (`claude stop`, awaited by endJob), its polling and its timeout. */
+/** Registers a --bg job's kill handle (`claude stop`, then the session ended in `claude agents`), its polling and its timeout. */
 function adoptBg($: EngineInterface, options: PluginOptions, job: Job, bgId: string): void {
   BG_JOBS.set(job.id, bgId)
   RUNNING.set(job.id, async () => {
     BG_JOBS.delete(job.id)
-    await $.process.run([opt(options, 'claudePath', 'claude'), 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
+    const bin = opt(options, 'claudePath', 'claude')
+    // A failed stop may mean the session already ended: the listing decides.
+    await $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
+    return confirmStopped($, async () => {
+      const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: 20000 })
+      return listed.exitCode === 0 && isBgStopped(parseAgentsJson(listed.stdout).find(a => a.id === bgId))
+    })
   })
   // A blocked job's deadline waits for its unblock, which re-arms it (pollBg).
   if (job.status !== 'blocked') void startTimeout($, options, job.id)
@@ -1391,10 +1414,13 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   let exit: { code: number | null; signal: string | null } | undefined
   let startError: string | undefined
 
+  let isClosed = false // the loop over the child's output was left: the stream, and so the child, is ended
   const stream = $.process.spawn({ argv: plan.argv, cwd: plan.cwd, input: plan.input, env: WORKER_ENV })
-  RUNNING.set(jobId, () => {
+  RUNNING.set(jobId, async () => {
     killed = true
+    // Not awaited: a return() queued behind a pending read could wait on the child it ends.
     void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+    return confirmStopped($, async () => isClosed)
   })
   void startTimeout($, options, jobId)
 
@@ -1433,6 +1459,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   } catch (err) {
     if (!killed) startError = String(err)
   }
+  isClosed = true
   if (pending !== '') {
     const text = pending
     await patchJob($, jobId, j => ({ ...j, tail: pushTail(j.tail, text) }))
