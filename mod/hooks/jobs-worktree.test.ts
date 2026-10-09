@@ -12,7 +12,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
 // `branches` exist (show-ref finds them), `worktrees` is `git worktree list --porcelain`; any `<x>^{commit}` is OTHER;
 // `dirty` leaves src/x.ts and big.bin uncommitted until a commit (exiting `commitExit`) takes them;
-// `staged` lists what `diff --cached` shows while dirty; `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
+// `noHead`: a repo with no commits (rev-parse HEAD fails); `staged` lists what `diff --cached` shows while dirty; `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
 // the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
@@ -20,7 +20,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[] }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -58,7 +58,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     const cmd = argv.join(' ')
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
     if (cmd.includes('--git-common-dir')) return out('/r/.git\n')
-    if (cmd.endsWith('rev-parse HEAD')) return out(`${BASE}\n`)
+    if (cmd.endsWith('rev-parse HEAD')) return fake.noHead ? out('', 128) : out(`${BASE}\n`)
     if (cmd.endsWith('^{commit}')) return out(`${OTHER}\n`)
     if (argv.includes('show-ref')) return out('', fake.branches?.some(b => cmd.endsWith(`refs/heads/${b}`)) ? 0 : 1)
     if (cmd.endsWith('worktree list --porcelain')) return out(fake.worktrees ?? '')
@@ -154,6 +154,13 @@ describe('worker worktrees', () => {
     expect(task).toContain('already on your own branch fix/rename')
     expect(task).toContain('Never switch, create or rename branches')
     expect(JSON.stringify(r.result)).toContain('Own branch fix/rename (from feed123)')
+  })
+
+  test('a branch asked for in a repo with no commits is refused, never started in the shared checkout', async ($, on) => {
+    const runs = fakeRepo(on, { noHead: true })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', branch: 'fix/rename' })
+    expect(JSON.stringify(r)).toContain('Worker not started: git rev-parse HEAD')
+    expect(runs.some(run => run.argv.includes('--bg'))).toBe(false)
   })
 
   test('a branch that exists or is checked out elsewhere is refused before anything starts', async ($, on) => {

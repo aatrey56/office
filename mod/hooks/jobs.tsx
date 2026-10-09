@@ -2032,7 +2032,9 @@ async function placeWorker(
   const common = await git($, projectRootArgv(job.cwd))
   const root = common.isOk ? repoRootFromCommonDir(common.out) : null
   if (root === null) return here
-  const fallback = (why: string) => ({ ...here, note: `No worktree of its own (${why}): it shares this checkout.` })
+  // A worker asked for a base or branch never shares the checkout: it is not started.
+  const isAsked = want.base !== undefined || want.branch !== undefined
+  const fallback = (why: string) => (isAsked ? { ...here, error: why } : { ...here, note: `No worktree of its own (${why}): it shares this checkout.` })
   // From the commit the caller is on: a manager in a linked worktree hands out its own branch.
   const head = want.base !== undefined ? { isOk: true, out: want.base } : await git($, ['git', '-C', job.cwd, 'rev-parse', 'HEAD'])
   if (!head.isOk) return fallback(`git rev-parse HEAD: ${head.out}`)
@@ -2043,7 +2045,6 @@ async function placeWorker(
   if (!added.isOk) {
     // `add -b` may have made the branch before failing; a default name holds the new job id, so it is ours.
     if (want.branch === undefined) await git($, ['git', '-C', root, 'branch', '-d', branch])
-    if (want.base !== undefined || want.branch !== undefined) return { ...here, error: `git worktree add: ${added.out}` }
     return fallback(`git worktree add: ${added.out}`)
   }
   const status = await git($, ['git', '-C', job.cwd, 'status', '--porcelain'])
