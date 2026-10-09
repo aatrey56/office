@@ -15,15 +15,20 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // is perl's wait running out: every holder still waiting exits 1, printing nothing, and never takes the lock.
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
-type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
+type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock }
 type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; untracked?: string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
-  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
-  const { store, flock } = runs
+  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock() }) as Runs
+  const { store } = runs
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
     runs.sets.push(e.key)
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
     return { value: undefined }
   })
   on('process.spawn', async function* (_$, e, next) {
@@ -33,6 +38,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
       return { value: { code: 0, signal: null } }
     }
     if (fake.perl === 'missing') throw new Error('spawn perl ENOENT')
+    const flock = e.argv.some(a => a.includes('codex-rounds')) ? runs.roundsFlock : runs.flock // one lock file each
     const drop = await flock.take(flock.expired)
     if (drop === undefined) return { value: { code: 1, signal: null } }
     try {
@@ -547,6 +553,52 @@ describe('codex review rounds', () => {
     expect(String(r.result)).toContain('401 lines changed')
     await clock.advance(0)
     expect(reviews).toHaveLength(1)
+  })
+
+  test('a settlement the busy ledger lock holds up is kept pending, then applied by the next ledger access', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, {})
+    const clock = mock.clock(on)
+    const started = String((await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })).result)
+    const id = /job (\S+),/.exec(started)![1]!
+    const drop = await runs.roundsFlock.take() // another session holds the ledger lock
+    await clock.advance(0)
+    runs.roundsFlock.expire() // perl's wait runs out, for every attempt
+    await clock.advance(10_000)
+    await clock.settle()
+    expect(reviews).toHaveLength(1)
+    expect(runs.store.get(`codexSettle:${id}`)).toMatchObject({ jobId: id, findings: 'No P1/P2 left.' })
+    drop()
+    // The next call (nothing new: refused) still reads the ledger, so the findings land and the record goes.
+    const next = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(next.deny ?? '').toContain('Nothing new since round 1')
+    const rounds = (runs.store.get('codexRounds') as Record<string, { findings?: string }[]>)[KEY]!
+    expect(rounds.map(x => x.findings)).toEqual(['No P1/P2 left.'])
+    expect(runs.store.has(`codexSettle:${id}`)).toBe(false)
+  })
+
+  test('the diff since the last sha is measured before the ledger lock is taken, not under it', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x')] } })
+    mock.clock(on)
+    const drop = await runs.roundsFlock.take() // another session holds the ledger lock
+    const queued = runs.roundsFlock.queued()
+    const call = $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    await queued // the call waits on the lock...
+    expect(runs.some(r => r.argv.join(' ') === `git diff --shortstat ${OLD}`)).toBe(true) // ...with its git runs done
+    drop()
+    expect(String((await call).result)).toContain('re-review')
+  })
+
+  test('a round dropped by a reload (parked while the lock was busy) no longer counts or blocks its HEAD', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, {
+      codexRounds: { [KEY]: [{ ...round(BASE), jobId: 'j-dead' }] },
+      'codexSettle:j-dead': { jobId: 'j-dead', at: Date.now() },
+    })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 1/3')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    expect((runs.store.get('codexRounds') as Record<string, unknown[]>)[KEY]).toHaveLength(1)
   })
 
   test('at the cap the tool is refused; the person\'s /codex-review still runs, on sol, and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {

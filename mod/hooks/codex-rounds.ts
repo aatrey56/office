@@ -56,6 +56,21 @@ export function settledLedger(ledger: RoundLedger, jobId: string, findings: stri
   return out
 }
 
+/** A settlement that could not take the ledger lock: kept under its own store key, applied by the next ledger access. */
+export type PendingSettle = { jobId: string; findings?: string; at: number }
+export const SETTLE_PREFIX = 'codexSettle:'
+
+export function parsePending(raw: unknown): PendingSettle | undefined {
+  const o = raw as { jobId?: unknown; findings?: unknown; at?: unknown } | null
+  if (typeof o?.jobId !== 'string' || typeof o.at !== 'number') return undefined
+  return { jobId: o.jobId, at: o.at, ...(typeof o.findings === 'string' ? { findings: o.findings } : {}) }
+}
+
+/** The ledger with every pending settlement applied, oldest first. */
+export function settledAll(ledger: RoundLedger, pending: readonly PendingSettle[]): RoundLedger {
+  return [...pending].sort((a, b) => a.at - b.at).reduce((l, p) => settledLedger(l, p.jobId, p.findings), ledger)
+}
+
 /** Changed lines (insertions + deletions) from `git diff --shortstat`; 0 for no change. */
 export function shortstatLines(text: string): number {
   const n = (word: string) => Number(text.match(new RegExp(`(\\d+) ${word}`))?.[1] ?? 0)
@@ -147,7 +162,8 @@ export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPl
     return full(`full review: round ${rounds.length} (${short(last.sha)}) did not review the whole branch, so it cannot be a baseline`)
   }
   const since = facts.sinceLast
-  if (since === undefined || !since.isAncestor) {
+  if (since === undefined) return full(`full review: the changes since ${short(last.sha)} could not be measured`)
+  if (!since.isAncestor) {
     return full(`full review: ${short(last.sha)} is no longer an ancestor of HEAD (rebase or force-push)`)
   }
   if (since.changedLines > policy.maxLines) {
