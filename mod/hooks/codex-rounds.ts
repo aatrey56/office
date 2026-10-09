@@ -90,8 +90,9 @@ const short = (sha: string) => sha.slice(0, 7)
  * runs as asked; it is still a round. For an agent:
  * - nothing new since the last round (same HEAD, clean tree) → refused;
  * - maxRounds rounds already → refused: the manager stops and asks the person;
- * - round 1, an explicit target, `full`, a rebase past the last sha, or more than maxLines
- *   changed since it → a full review on the review model;
+ * - round 1, `full` / deep, a rebase past the last sha, or more than maxLines changed since
+ *   it → a full review on the review model;
+ * - a later round with an explicit target → that target as given, on the re-review model;
  * - otherwise a re-review of the changes since the last sha on the re-review model, checking
  *   the previous round's findings.
  */
@@ -115,8 +116,11 @@ export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPl
         'Only they can run more, with /codex-review --force (or plain /codex-review).',
     }
   }
-  if (facts.target !== undefined) return full()
-  if (facts.isFull) return full(`full review as asked (round ${round})`)
+  if (facts.isFull) return full(facts.target === undefined ? `full review as asked (round ${round})` : undefined)
+  // An explicit target is not a way round the cheaper model: only full / deep earn the review model.
+  if (facts.target !== undefined) {
+    return { isAllowed: true, round, isRereview: false, tier: policy.rereview, target: facts.target, instructions: facts.instructions }
+  }
   const since = facts.sinceLast
   if (since === undefined || !since.isAncestor) {
     return full(`full review: ${short(last.sha)} is no longer an ancestor of HEAD (rebase or force-push)`)

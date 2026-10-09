@@ -43,8 +43,15 @@ describe('codex review rounds', () => {
     expect(fullOn({ sinceLast: { isAncestor: false, changedLines: 0 } }).note).toContain('no longer an ancestor')
     expect(fullOn({ sinceLast: { isAncestor: true, changedLines: 401 } }).note).toContain('401 lines changed')
     expect(fullOn({ isFull: true })).toMatchObject({ isRereview: false, tier: CODEX_DEFAULTS.review })
-    expect(fullOn({ target: { args: ['--uncommitted'], label: 'uncommitted changes' } })).toMatchObject({ isRereview: false, round: 2 })
+    expect(fullOn({ isFull: true, target: { args: ['--uncommitted'], label: 'uncommitted changes' } })).toMatchObject({ isRereview: false, tier: CODEX_DEFAULTS.review })
     expect(shortstatLines(' 3 files changed, 250 insertions(+), 151 deletions(-)')).toBe(401)
+  })
+
+  test('a later round with an explicit target runs that target on the re-review model unless full', () => {
+    const target = { args: ['--commit', B], label: `commit ${B}` }
+    expect(planReviewRound(facts({ target }), policy)).toMatchObject({ isAllowed: true, round: 2, isRereview: false, tier: CODEX_DEFAULTS.rereview, target })
+    expect(planReviewRound(facts({ target, isFull: true }), policy)).toMatchObject({ tier: CODEX_DEFAULTS.review, target })
+    expect(planReviewRound(facts({ rounds: [], target }), policy)).toMatchObject({ round: 1, tier: CODEX_DEFAULTS.review })
   })
 
   test('at codexMaxRounds an agent is refused and told to ask the person; the person is not', () => {

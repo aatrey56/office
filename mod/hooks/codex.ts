@@ -164,7 +164,7 @@ export const CODEX_REVIEW_TOOL = {
     'A later call with no target re-reviews only the changes since the last reviewed commit, on a cheaper model, ' +
     'checking that the previous round\'s findings are fixed and that the fixes broke nothing; ' +
     'it becomes a full review after a rebase, when the diff since then is large, or with full: true. ' +
-    'An explicit target runs as given on the review model and still counts as a round. ' +
+    'Later rounds with an explicit target run that target as given, also on the cheaper model, unless full: true or deep: true; they still count as rounds. ' +
     'A call with nothing new since the last round is refused. At codexMaxRounds rounds (default 3) calls are refused: ' +
     'then stop, summarise the remaining findings and ask the person.',
   inputSchema: {
