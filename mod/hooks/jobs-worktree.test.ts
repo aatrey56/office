@@ -283,6 +283,24 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
   })
 
+  test('a reload keeps a granted extension: the re-adopted job runs on to jobTimeoutHardMin', { options: { jobTimeoutMin: 1, jobTimeoutHardMin: 2 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step') })
+    const clock = mock.clock(on, { now: 61_000 })
+    const job = { id: 'j1', kind: 'worker', title: 'rename x to y', cwd: '/r', status: 'running', startedAt: 0, mode: 'bg', bgId: '5ac0f0df', tail: '', isExtended: true }
+    // The record the last load left, read until the first write of the jobs.
+    let left: unknown = [job]
+    on('state.set', (_$, e, next) => {
+      if (e.key === 'jobs') left = undefined
+      return next(e)
+    })
+    on('state.get', (_$, e, next) => (left !== undefined && e.key === 'jobs' ? { value: { value: left, version: 0 } } : next(e)))
+    await start($, on)
+    await clock.advance(30_000)
+    expect(stops(runs)).toBe(0)
+    await clock.advance(30_000)
+    expect(stops(runs)).toBe(1)
+  })
+
   test('an oversized file the worker staged is unstaged and left out of the WIP commit', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
     const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, staged: ['out/staged-big.bin'] })
     const clock = mock.clock(on)

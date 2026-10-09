@@ -1080,6 +1080,7 @@ async function onDeadline($: EngineInterface, options: PluginOptions, id: string
   const verdict = deadlineVerdict({ softMin, hardMin, isExtended, grewAt: GROWTH.get(id)?.at, now: await clockNow($) })
   if (verdict === 'extend') {
     EXTENDED.add(id)
+    await patchJob($, id, j => ({ ...j, isExtended: true }))
     $.ui.toast(`Job ${id} still active at ${softMin} min: extended to ${hardMin} min`)
     await startTimeout($, options, id)
     return
@@ -1268,7 +1269,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         TIMERS.get(jobId)?.cancel()
         TIMERS.delete(jobId)
         BLOCKED_AT.set(jobId, now)
-        await patchJob($, jobId, j => ({ ...j, status: 'blocked', tail: seen.tail || j.tail, sessionId: agent.sessionId ?? j.sessionId }))
+        await patchJob($, jobId, j => ({ ...j, status: 'blocked', blockedAt: now, tail: seen.tail || j.tail, sessionId: agent.sessionId ?? j.sessionId }))
         const latest = seen.result ? `\n\nLatest reply:\n${seen.result}` : ''
         const text = `Worker ${jobId} (${job.title}) is waiting for input: \`claude attach ${bgId}\`${latest}`
         $.ui.toast(`Worker waiting for input: claude attach ${bgId}`)
@@ -1280,7 +1281,8 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         BLOCKED_AT.delete(jobId)
         BLOCK_REPORTED.delete(jobId)
         if (since !== undefined) PAUSED_MS.set(jobId, (PAUSED_MS.get(jobId) ?? 0) + now - since)
-        await patchJob($, jobId, j => ({ ...j, status: 'running' }))
+        const pausedMs = PAUSED_MS.get(jobId)
+        await patchJob($, jobId, j => ({ ...j, status: 'running', pausedMs, blockedAt: undefined }))
         await startTimeout($, options, jobId)
       }
       const tail = seen.tail.slice(-2048)
@@ -1331,13 +1333,19 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
   const now = await clockNow($)
   for (const job of stale) {
     // A --bg session outlives this process; the poller settles a gone one.
-    // A re-adopted job's deadlines run from when it really started (outside tests $.clock is the host's).
-    if (job.bgId !== undefined) {
+    // A re-adopted job's deadlines run from when it really started (outside tests $.clock is the host's),
+    // with the extension and blocked time its record kept.
+    const restore = () => {
       CLOCK_START.set(job.id, job.startedAt)
-      if (job.status === 'blocked') BLOCKED_AT.set(job.id, now)
+      if (job.isExtended === true) EXTENDED.add(job.id)
+      if (job.pausedMs !== undefined) PAUSED_MS.set(job.id, job.pausedMs)
+    }
+    if (job.bgId !== undefined) {
+      restore()
+      if (job.status === 'blocked') BLOCKED_AT.set(job.id, job.blockedAt ?? now)
       adoptBg($, options, job, job.bgId)
     } else if (job.agentId !== undefined && live.has(job.agentId)) {
-      CLOCK_START.set(job.id, job.startedAt)
+      restore()
       adoptSubagent($, options, job, job.agentId)
     }
     else dead.add(job.id)

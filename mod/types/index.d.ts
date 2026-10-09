@@ -54,6 +54,10 @@ export type Job = {
   branch?: string // worker: the branch its worktree is on (kept after the worktree goes)
   baseRef?: string // worker: the commit its branch started from
   costUsd?: number // headless worker: total_cost_usd from its stream-json result
+  // The watchdog's deadline state, kept here so a plugin reload re-arms the same deadline:
+  isExtended?: boolean // the one extension past jobTimeoutMin is spent
+  pausedMs?: number // time spent blocked in finished blocks (it does not count toward the deadline)
+  blockedAt?: number // when the current block began
 }
 
 // ── manga (manga.tsx) ────────────────────────────────────────────────────
