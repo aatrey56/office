@@ -4,7 +4,7 @@ import type { AgentSpawnInput, EngineInterface, On, PluginOptions, Timer } from 
 import type { BudgetCaps, Effort, EvalReport, Job, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
 import type { AgentDef, AgentPin } from './agentguard'
 import { agentGuard, agentRouteText, hardDeny, isManagerSession, needsRoute, parseAgentFile, pinOf } from './agentguard'
-import { budgetVerdict, DEFAULT_CAPS, isSmallRoute, tierOfModelId } from './budget'
+import { budgetVerdict, DEFAULT_CAPS, isOpusTier, isSmallRoute, tierOfModelId } from './budget'
 import { formatSets, parseCases, scoreRoutes } from './evals'
 import { endLine, finishedLine, foldInbox, formatInbox, INBOX_FILE, routeLine, routedLine } from './inbox'
 import {
@@ -48,6 +48,8 @@ import {
   addJobTo,
   bgArgv,
   bgPhase,
+  CAP_LOCK_HELD,
+  capLockArgv,
   capResult,
   deliveryText,
   formatElapsed,
@@ -56,14 +58,21 @@ import {
   lastLine,
   isLive,
   isWorkerMode,
+  liveBgIds,
+  liveReservations,
   newestBgSince,
   newJobId,
   parseAgentsJson,
   parseBgId,
+  parseBgIds,
+  parseBgModels,
+  prunedBg,
   parseSpawnArgs,
   parseStreamJsonLine,
   pushTail,
   readTranscript,
+  RESERVATION_MS,
+  RESERVATION_RENEW_MS,
   ROUTE_TOOL,
   RUNNING,
   SPAWN_TOOL,
@@ -77,7 +86,7 @@ import {
   withoutDoneMarker,
   workerAgentName,
 } from './spawn'
-import type { WorkerMode } from './spawn'
+import type { BgAgent, Reservation, WorkerMode } from './spawn'
 import {
   addWorktreeArgv,
   branchName,
@@ -118,8 +127,19 @@ const KEY_RETRY_MS = 60_000
 /** The Jev key once resolved, for the module's life; a miss is re-tried at most once a minute. Never logged or stored. */
 let jevKeyCache: { key?: string; at: number } | undefined
 const WORKER_ENV = { [WORKER_ENV_NAME]: WORKER_ENV_VALUE }
-/** $.store key: the --bg ids this plugin started (counted against maxWorkers across sessions). */
+/** $.store key: the --bg ids this plugin started (counted against maxWorkers across sessions); a string[], as older versions read it. */
 const BG_STORE_KEY = 'bgIds'
+/** $.store keys: those ids' models, { id: model }, for maxOpusWorkers (older versions ignore it); the slots held by starts under way. */
+const BG_MODELS_KEY = 'bgModels'
+const RESERVED_KEY = 'reservedSlots'
+/** How long a wait for the capacity lock lasts before the start is refused (a holder never gets taken over). */
+const LOCK_WAIT_MS = 15_000
+/** What a refused start says when the capacity lock stayed held past LOCK_WAIT_MS. */
+const CAP_BUSY_TEXT = 'office capacity lock busy; try again in a moment.'
+/** How many times a started worker's registration waits out a busy capacity lock. */
+const REGISTER_ATTEMPTS = 3
+/** perl's exit code when it gave up waiting for the flock (capLockArgv). */
+const CAP_LOCK_TIMEOUT_CODE = 1
 /** $.store keys: Codex's last read rate limits, and the models out of quota until their reset. */
 const CODEX_LIMITS_KEY = 'codexLimits'
 const CODEX_OUT_KEY = 'codexOut'
@@ -718,37 +738,277 @@ function logInbox($: EngineInterface, line: string | undefined): void {
   })
 }
 
-/**
- * maxWorkers counts this process's own jobs (codex, headless, subagent) plus
- * every live --bg session this plugin started, from any session (ids in $.store).
- */
-async function capacityError($: EngineInterface, options: PluginOptions): Promise<string | undefined> {
-  const max = num(options, 'maxWorkers', 4)
-  const local = [...RUNNING.keys()].filter(id => !BG_JOBS.has(id)).length
-  let bg = 0
-  const stored = await $.store.get(BG_STORE_KEY).catch(() => undefined)
-  const ids = Array.isArray(stored) ? stored.filter((x): x is string => typeof x === 'string') : []
-  if (ids.length > 0) {
-    const listed = await $.process
-      .run([opt(options, 'claudePath', 'claude'), 'agents', '--json', '--all'], { timeoutMs: 20000 })
-      .catch(() => undefined)
-    if (listed !== undefined && listed.exitCode === 0) {
-      const agents = parseAgentsJson(listed.stdout).filter(a => ids.includes(a.id))
-      bg = agents.filter(a => { const p = bgPhase(a.state); return p === 'active' || p === 'blocked' }).length
-      const kept = agents.map(a => a.id)
-      if (kept.length !== ids.length) await $.store.set(BG_STORE_KEY, kept).catch(() => undefined)
-    } else {
-      bg = BG_JOBS.size // cannot list: count what this process knows
-    }
-  }
-  const used = local + bg
-  return used >= max ? `${used} jobs already running (maxWorkers ${max}); wait for one or kill it in /jobs.` : undefined
+/** Jobs running now, and how many of them are workers on Opus-tier models. */
+type Load = { used: number; opus: number }
+
+/** What one `claude agents` listing saw: the stored --bg ids read just before it, and the agents (none when it failed). */
+type BgView = { before: string[]; agents?: BgAgent[] }
+
+/** A slot reserved for a worker being started (`id` names the reservation); settled once released or turned into the --bg registration. */
+type Slot = { id: string; jobId: string; isOpus: boolean; isSettled: boolean }
+
+/** This process's reservations not yet given back: reservation id → the job it is for. */
+const OWN_SLOTS = new Map<string, string>()
+
+async function storeGet($: EngineInterface, key: string): Promise<unknown> {
+  return $.store.get(key).catch(() => undefined)
 }
 
-async function rememberBgId($: EngineInterface, bgId: string): Promise<void> {
-  const stored = await $.store.get(BG_STORE_KEY).catch(() => undefined)
-  const ids = Array.isArray(stored) ? stored.filter((x): x is string => typeof x === 'string') : []
-  if (!ids.includes(bgId)) await $.store.set(BG_STORE_KEY, [...ids, bgId].slice(-200)).catch(() => undefined)
+/** Reservation times run on $.clock (a test's moves them); the host's clock if that is refused. */
+async function clockNow($: EngineInterface): Promise<number> {
+  return $.clock.now().catch(() => Date.now())
+}
+
+/** Serializes this process's capacity updates; the lock file serializes them across sessions. */
+let capChain: Promise<unknown> = Promise.resolve()
+
+/** The capacity lock stayed held by another session past LOCK_WAIT_MS: the transaction was not run. */
+class CapLockBusy extends Error {
+  constructor() {
+    super(CAP_BUSY_TEXT)
+  }
+}
+
+/**
+ * Runs `fn` holding the capacity lock: every read of the --bg ids, models and reservations that counts, and every write.
+ * Throws CapLockBusy, never running `fn`, when another session holds the lock past LOCK_WAIT_MS.
+ */
+async function withCapLock<T>($: EngineInterface, fn: () => Promise<T>): Promise<T> {
+  const run = capChain.then(async () => {
+    const release = await takeCapLock($)
+    try {
+      return await fn()
+    } finally {
+      await release?.()
+    }
+  })
+  capChain = run.catch(() => undefined)
+  return run
+}
+
+/** Like withCapLock, but a busy lock is `undefined` for a caller whose work can wait or lapse (a renewal, a release). */
+async function withCapLockIfFree<T>($: EngineInterface, what: string, fn: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await withCapLock($, fn)
+  } catch (err) {
+    if (!(err instanceof CapLockBusy)) throw err
+    debugLog($, `office: capacity lock busy; ${what} skipped`)
+    return undefined
+  }
+}
+
+/** Whether the loud "no cross-session lock" line has been logged: once per process. */
+let hasWarnedNoCapLock = false
+
+/**
+ * The capacity lock every session sharing this store takes: the kernel's flock on a file beside
+ * it, held by a perl child (capLockArgv) until `release` ends it. Only the process holding an
+ * flock can drop it, and its death always does, so a crashed holder needs no takeover and no
+ * session can ever remove another's lock.
+ *
+ * Held past LOCK_WAIT_MS it throws CapLockBusy: the caller must not run its transaction, which
+ * could overwrite what the holder is mid-way through. The holder this wait spawned is ended
+ * first, so it cannot take the lock later and keep it. Returns undefined, and the caller goes on
+ * with only this process's chain to serialize it (logged loudly once), when no lock is possible
+ * at all: no config dir, or perl missing or unable to open the lock file.
+ */
+async function takeCapLock($: EngineInterface): Promise<(() => Promise<void>) | undefined> {
+  let holder: ReturnType<EngineInterface['process']['spawn']> | undefined
+  const release = async () => {
+    await holder?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+  }
+  let isTimedOut = false
+  try {
+    const path = `${(await configDirOf($)).replace(/\/+$/, '')}/office/locks/capacity.lock`
+    holder = $.process.spawn({ argv: capLockArgv(path, LOCK_WAIT_MS) })
+    void holder.result.catch(() => undefined)
+    let out = ''
+    for (let piece = await holder.next(); ; piece = await holder.next()) {
+      if (piece.done) {
+        isTimedOut = out === '' && piece.value?.code === CAP_LOCK_TIMEOUT_CODE
+        break
+      }
+      if (piece.value.stream === 'stdout') out += piece.value.text
+      if (out.startsWith(CAP_LOCK_HELD)) return release
+    }
+  } catch {
+    // no config dir, or perl missing or refused: degraded, below
+  }
+  await release()
+  if (isTimedOut) {
+    debugLog($, `office: capacity lock held past ${LOCK_WAIT_MS} ms; start refused`)
+    throw new CapLockBusy()
+  }
+  if (!hasWarnedNoCapLock) {
+    hasWarnedNoCapLock = true
+    debugLog($, 'office: WARNING no cross-session capacity lock (perl did not run); maxWorkers and maxOpusWorkers can be exceeded by sessions starting at the same moment')
+  }
+  return undefined
+}
+
+/** Reads the stored --bg ids, then lists `claude agents`; ids it shows gone are pruned under the lock, when counting. */
+async function bgView($: EngineInterface, options: PluginOptions): Promise<BgView> {
+  const before = parseBgIds(await storeGet($, BG_STORE_KEY))
+  if (before.length === 0) return { before, agents: [] }
+  const listed = await $.process
+    .run([opt(options, 'claudePath', 'claude'), 'agents', '--json', '--all'], { timeoutMs: 20000 })
+    .catch(() => undefined)
+  if (listed === undefined || listed.exitCode !== 0) return { before }
+  return { before, agents: parseAgentsJson(listed.stdout) }
+}
+
+/**
+ * The load, from one read of the store under the capacity lock (call it holding the lock): a
+ * worker another session is turning from a reservation into a --bg id is seen as one or the
+ * other, never both. Ids the listing showed gone are pruned, with their models, first: an id
+ * registered since the listing stays, and nothing is written when nothing is gone.
+ *
+ * maxWorkers counts this process's own jobs (codex, headless, subagent), every live --bg session
+ * this plugin started from any session, and the slots reserved by starts under way in any session;
+ * maxOpusWorkers counts the workers among them on Opus-tier models.
+ */
+async function lockedLoad($: EngineInterface, view: BgView): Promise<{ load: Load; held: Reservation[]; now: number }> {
+  const now = await clockNow($)
+  let ids = parseBgIds(await storeGet($, BG_STORE_KEY))
+  let models = parseBgModels(await storeGet($, BG_MODELS_KEY))
+  if (view.agents !== undefined) {
+    const kept = prunedBg(ids, models, view.before, view.agents)
+    if (kept.ids.length !== ids.length) await $.store.set(BG_STORE_KEY, kept.ids).catch(() => undefined)
+    if (Object.keys(kept.models).length !== Object.keys(models).length) await $.store.set(BG_MODELS_KEY, kept.models).catch(() => undefined)
+    ids = kept.ids
+    models = kept.models
+  }
+  const held = liveReservations(await storeGet($, RESERVED_KEY), now)
+  const jobs = await read($, JOBS)
+  const isOpusWorker = (job: Job | undefined) => job?.kind === 'worker' && isOpusTier(job.model)
+  const local = [...RUNNING.keys()].filter(id => !BG_JOBS.has(id))
+  // A slot of this process whose job already runs here (a local start mid-handoff) counts once, as the job.
+  const pending = held.filter(r => !RUNNING.has(OWN_SLOTS.get(r.id) ?? ''))
+  let used = local.length + pending.length
+  let opus = local.filter(id => isOpusWorker(jobs.find(j => j.id === id))).length + pending.filter(r => r.isOpus).length
+  const modelOf = (id: string) => models[id] ?? jobs.find(j => j.bgId === id)?.model
+  if (view.agents !== undefined) {
+    const live = liveBgIds(ids, view.before, view.agents)
+    used += live.length
+    opus += live.filter(id => isOpusTier(modelOf(id))).length
+  } else {
+    // Cannot list: count what this process knows, and ids other sessions added since the read.
+    const own = new Set(BG_JOBS.values())
+    const since = ids.filter(id => !view.before.includes(id) && !own.has(id))
+    used += BG_JOBS.size + since.length
+    opus += [...BG_JOBS.keys()].filter(id => isOpusWorker(jobs.find(j => j.id === id))).length
+    opus += since.filter(id => isOpusTier(modelOf(id))).length
+  }
+  return { load: { used, opus }, held, now }
+}
+
+/** The load as a precheck sees it; throws CapLockBusy when the lock stayed held, so no start goes on unchecked. */
+async function runningLoad($: EngineInterface, options: PluginOptions): Promise<{ load: Load; view: BgView }> {
+  const view = await bgView($, options)
+  return { load: (await withCapLock($, () => lockedLoad($, view))).load, view }
+}
+
+function totalError(load: Load, options: PluginOptions): string | undefined {
+  const max = num(options, 'maxWorkers', 4)
+  return load.used >= max ? `${load.used} jobs already running (maxWorkers ${max}); wait for one or kill it in /jobs.` : undefined
+}
+
+async function capacityError($: EngineInterface, options: PluginOptions): Promise<string | undefined> {
+  try {
+    return totalError((await runningLoad($, options)).load, options)
+  } catch (err) {
+    if (err instanceof CapLockBusy) return err.message
+    throw err
+  }
+}
+
+/** maxOpusWorkers 0 (the default) sets no limit beyond maxWorkers. */
+function opusError(load: Load, options: PluginOptions, modelId: string): string | undefined {
+  const max = num(options, 'maxOpusWorkers', 0)
+  if (max === 0 || !isOpusTier(modelId) || load.opus < max) return undefined
+  return `${load.opus} Opus jobs already running (maxOpusWorkers ${max}); wait for one, pick a cheaper model, or kill one in /jobs.`
+}
+
+/**
+ * Checks both caps again with the model known and, in the same hold of the lock, reserves the
+ * slot: a start racing this one, here or in another session, sees it. A refusal is the text.
+ */
+async function reserveSlot($: EngineInterface, options: PluginOptions, view: BgView, jobId: string, modelId: string): Promise<Slot | string> {
+  try {
+    return await withCapLock($, async () => {
+      const { load, held, now } = await lockedLoad($, view)
+      const refused = totalError(load, options) ?? opusError(load, options, modelId)
+      if (refused !== undefined) return refused
+      // A job id alone may repeat across sessions; the suffix keeps one session's release off another's slot.
+      const slot = { id: `${jobId}.${Math.random().toString(36).slice(2, 8)}`, jobId, isOpus: isOpusTier(modelId), isSettled: false }
+      await $.store.set(RESERVED_KEY, [...held, { id: slot.id, isOpus: slot.isOpus, until: now + RESERVATION_MS }]).catch(() => undefined)
+      OWN_SLOTS.set(slot.id, jobId)
+      return slot
+    })
+  } catch (err) {
+    // The lock stayed held: no worker starts on a count nobody checked.
+    if (err instanceof CapLockBusy) return err.message
+    throw err
+  }
+}
+
+/** Keeps a slot reserved while its start runs on: every RESERVATION_RENEW_MS it holds RESERVATION_MS more. */
+function renewSlot($: EngineInterface, slot: Slot): Timer {
+  return $.clock.every(RESERVATION_RENEW_MS, () =>
+    void withCapLockIfFree($, 'a reservation renewal', async () => {
+      if (slot.isSettled) return
+      const now = await clockNow($)
+      const others = liveReservations(await storeGet($, RESERVED_KEY), now).filter(r => r.id !== slot.id)
+      await $.store.set(RESERVED_KEY, [...others, { id: slot.id, isOpus: slot.isOpus, until: now + RESERVATION_MS }]).catch(() => undefined)
+    }),
+  )
+}
+
+/** Gives a slot back: its worker failed to start, or now counts where it runs (this process's RUNNING). */
+async function releaseSlot($: EngineInterface, slot: Slot): Promise<void> {
+  if (slot.isSettled) return
+  slot.isSettled = true
+  try {
+    // Held past the wait: the reservation lapses by itself within RESERVATION_MS.
+    await withCapLockIfFree($, 'a reservation release', async () => {
+      const stored = await storeGet($, RESERVED_KEY)
+      const left = liveReservations(stored, await clockNow($)).filter(r => r.id !== slot.id)
+      if (JSON.stringify(left) !== JSON.stringify(stored)) await $.store.set(RESERVED_KEY, left).catch(() => undefined)
+    })
+  } finally {
+    OWN_SLOTS.delete(slot.id)
+  }
+}
+
+/** Turns a slot into the --bg registration in one hold of the lock: the worker is never counted twice, nor missed. */
+async function registerBg($: EngineInterface, slot: Slot, bgId: string, model: string): Promise<void> {
+  slot.isSettled = true
+  // The worker already runs, so a busy lock is waited for again rather than written around.
+  for (let attempt = 1; attempt <= REGISTER_ATTEMPTS; attempt++) {
+    try {
+      await registerBgLocked($, slot, bgId, model)
+      return
+    } catch (err) {
+      if (!(err instanceof CapLockBusy)) throw err
+    }
+  }
+  OWN_SLOTS.delete(slot.id)
+  debugLog($, `office: WARNING capacity lock busy; worker ${bgId} not recorded, so it does not count toward maxWorkers`)
+}
+
+async function registerBgLocked($: EngineInterface, slot: Slot, bgId: string, model: string): Promise<void> {
+  await withCapLock($, async () => {
+    const stored = parseBgIds(await storeGet($, BG_STORE_KEY))
+    const ids = stored.includes(bgId) ? stored : [...stored, bgId].slice(-200)
+    const models = Object.fromEntries(
+      Object.entries({ ...parseBgModels(await storeGet($, BG_MODELS_KEY)), [bgId]: model }).filter(([id]) => ids.includes(id)),
+    )
+    const left = liveReservations(await storeGet($, RESERVED_KEY), await clockNow($)).filter(r => r.id !== slot.id)
+    await $.store.set(BG_STORE_KEY, ids).catch(() => undefined)
+    await $.store.set(BG_MODELS_KEY, models).catch(() => undefined)
+    await $.store.set(RESERVED_KEY, left).catch(() => undefined)
+    OWN_SLOTS.delete(slot.id)
+  })
 }
 
 /** Kill (or timeout): stop the work and mark the job failed right away. */
@@ -1289,7 +1549,15 @@ async function startWorker(
   cwdArg: string | undefined,
   by: SpawnedBy,
 ): Promise<Started> {
-  const full = await capacityError($, options)
+  let ran: { load: Load; view: BgView }
+  try {
+    ran = await runningLoad($, options)
+  } catch (err) {
+    if (err instanceof CapLockBusy) return { ok: false, text: err.message }
+    throw err
+  }
+  const { load, view } = ran
+  const full = totalError(load, options)
   if (full) return { ok: false, text: full }
   // The budget guard, in two looks: past the hard limit nothing starts, so no routing call
   // is spent finding out the task's size; in the soft zone the route decides.
@@ -1303,6 +1571,9 @@ async function startWorker(
   const routed = modelArg === undefined ? await route($, options, task) : undefined
   const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet')
   const effort: Effort = isEffort(effortArg) ? effortArg : (routed?.effort ?? 'medium')
+  // Refused, never quietly moved to a cheaper model (checked again with the slot reserved below).
+  const opusFull = opusError(load, options, modelId)
+  if (opusFull) return { ok: false, text: opusFull }
   const verdict = budgetVerdict(windows, caps, {
     isSmall: isSmallRoute(routed?.model ?? tierOfModelId(modelId), effort),
     // Only a model the person typed counts as their explicit choice; an agent's does not.
@@ -1312,8 +1583,32 @@ async function startWorker(
   if (!verdict.isAllowed) {
     return { ok: false, text: `${verdict.reason}. This task was sized as ${modelId} at ${effort} effort; only small tasks (sonnet at low or medium) start in the soft zone.` }
   }
+  // The load above was read before routing: a start racing this one may have taken the last slot.
+  const slot = await reserveSlot($, options, view, newJobId(now), modelId)
+  if (typeof slot === 'string') return { ok: false, text: slot }
+  // A slow start (worktree, --bg, a listing) may outlast one reservation: it is renewed until settled.
+  const renewal = renewSlot($, slot)
+  try {
+    return await launchWorker($, options, slot, task, mode, { modelId, effort, routed, cwd, now, warning: verdict.warning })
+  } finally {
+    renewal.cancel()
+    await releaseSlot($, slot)
+  }
+}
+
+type Launch = { modelId: string; effort: Effort; routed?: RouteDecision; cwd: string; now: number; warning?: string }
+
+/** Starts a worker on a reserved slot; the slot is settled once the worker counts where it runs. */
+async function launchWorker(
+  $: EngineInterface,
+  options: PluginOptions,
+  slot: Slot,
+  task: string,
+  mode: WorkerMode,
+  { modelId, effort, routed, cwd, now, warning }: Launch,
+): Promise<Started> {
   const placed = await placeWorker($, options, task, {
-    id: newJobId(now),
+    id: slot.jobId,
     kind: 'worker',
     title: task.replace(/\s+/g, ' ').slice(0, 60),
     cwd,
@@ -1327,7 +1622,7 @@ async function startWorker(
   })
   const job = placed.job
   const workerTask = withDoneRule(placed.task)
-  const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}${verdict.warning ? `. Budget: ${verdict.warning}` : ''}`
+  const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}${warning ? `. Budget: ${warning}` : ''}`
   const where = `in ${job.cwd}.${placed.note ? ` ${placed.note}` : ''}`
   // A start that failed gives back its fresh worktree and branch (both refuse to go if any work is there).
   const failed = async (why: string) => failedJob($, await dropWorktree($, job), why)
@@ -1375,9 +1670,9 @@ async function startWorker(
       return failedJob($, job, `claude --bg gave no session id we could find, so this job is not tracked; it may still be running (\`claude agents\` lists it): ${why}.${kept}`)
     }
     const withBg = { ...job, bgId }
+    await registerBg($, slot, bgId, modelId)
     await addJob($, withBg)
     logInbox($, routedLine(job, task, now))
-    await rememberBgId($, bgId)
     adoptBg($, options, withBg, bgId)
     return {
       ok: true,
@@ -1394,7 +1689,14 @@ async function startWorker(
     label: 'Worker',
     parse: parseStreamJsonLine,
   }
-  $.clock.after(0, () => void runJob($, options, job, plan))
+  // The slot is handed to the timer: it holds until runJob has the job in RUNNING (its first, synchronous step),
+  // and is counted once meanwhile (lockedLoad skips this process's slots whose job is in RUNNING).
+  const handed: Slot = { ...slot }
+  slot.isSettled = true
+  $.clock.after(0, () => {
+    void runJob($, options, job, plan)
+    void releaseSlot($, handed)
+  })
   return {
     ok: true,
     text: `Started headless worker job ${job.id} on ${how} ${where} Its result is appended to this conversation when it finishes; /jobs shows progress.`,

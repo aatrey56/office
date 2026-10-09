@@ -117,7 +117,7 @@ section. Who manages what is kept in the mod's store and cleared when that sessi
 ### 3.4 Budget guard (new; `session_usage` tool exists as of tonight)
 
 Two lines per window, checked in code wherever a worker or Codex job starts, next to the
-existing `maxWorkers` check:
+existing `maxWorkers` check (and `maxOpusWorkers`, a separate cap on workers running on Opus-tier models):
 
 | Usage | What happens |
 | --- | --- |
@@ -302,7 +302,7 @@ Measured just now: this session's context 23%; 5-hour window 4% used; week 14% u
 | `Image` scaling is blurry or slow | LO path on `Raster` (§5.2) |
 | Clicking sprites directly isn't possible | Name-tag buttons or keys |
 | Subagents inside other sessions are invisible across sessions | Out of scope; only office-spawned workers appear |
-| A manager spawning too much | Budget guard + existing `maxWorkers` (4) + job timeout (30 min) |
+| A manager spawning too much | Budget guard + existing `maxWorkers` (4) + `maxOpusWorkers` (Opus-tier workers at once; 0, the default, sets no separate limit) + job timeout (30 min) |
 | Router quality unproven | It only advises until the routing test shows a number you accept |
 
 ## 8. What I need from you
