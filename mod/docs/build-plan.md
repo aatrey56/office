@@ -19,7 +19,7 @@ Checked against the code in `mod/hooks`. The rest of this document is the origin
 | `/route-eval` and `evals/routing.jsonl` | Built, tested; never run, so no accuracy numbers yet |
 | Budget guard (soft and hard lines) | Built, tested |
 | `/spawn` workers in `bg`, `headless` and `subagent` modes | Built, tested |
-| Codex review (`/codex-review`) | Built |
+| Codex review (`/codex-review`) | Built; an agent's `codex_review` rounds are capped per branch (§3.5, 2026-10-08) |
 | Worker git worktrees (option `workerWorktree`) | Partly built, in progress on `feat/worker-worktrees` |
 | Every subagent of a conversation drawn as a character | Partly built, in progress on `feat/worker-worktrees` |
 | Lobby view with one door per project | Not built; only a fallback lobby room (`h`/`l` switch offices) |
@@ -135,6 +135,28 @@ existing `maxWorkers` check (and `maxOpusWorkers`, a separate cap on workers run
   warning; spawns started by an agent follow the table.
 - Settings: `budgetSoftFiveHourPct` (80), `budgetSoftSevenDayPct` (85), `budgetHardPct` (95).
 - Shown in the scene footer as two bars.
+
+### 3.5 Codex review rounds (built 2026-10-08)
+
+Managers re-ran `codex_review` on the same branch until no P1/P2 was left; each full Sol
+review of a branch costs ~4% of the ChatGPT plan's 5-hour Codex limit. The rules are now in
+code (`codex-rounds.ts`, wired in `jobs.tsx`):
+
+| Call | What runs |
+| --- | --- |
+| Round 1 of a branch | A full review on `codexReviewModel` (Sol), as before |
+| A later round, no target | Only the changes since the last reviewed commit, on `codexRereviewModel` (Luna, effort medium), told the previous round's findings: check each is fixed, look for problems the fixes added |
+| A later round after a rebase, more than `codexRereviewMaxLines` (400) changed lines, `full: true` or an explicit target | A full review on the review model; still a round |
+| Same HEAD as the last round, clean tree | Refused: nothing new |
+| `codexMaxRounds` (3) rounds already | Refused: the manager summarises the open findings and asks you |
+
+- The ledger lives in `$.store` (`codexRounds`), keyed by the repo's git common dir and the
+  branch: each round's HEAD, base, model, job id, time, and its final text (first 4 KB) once
+  done. A failed or killed round is dropped; rounds older than 14 days are pruned. Writes take
+  their own cross-session flock (`codex-rounds.lock`), as the capacity lock does.
+- Your `/codex-review` is never refused and runs as typed (`--force` still passes the budget
+  guard); it is recorded, so it counts toward an agent's cap.
+- The job title and the start message show the round: `codex re-review 2/3 vs a1b2c3d (luna)`.
 
 ## 4. Routing
 
