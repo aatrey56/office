@@ -325,10 +325,11 @@ export function transcriptPath(
   return { projects, prefix: `${slug.slice(0, SLUG_MAX)}-` }
 }
 
-/** A transcript's tail: the last assistant text (the result) and a progress tail. */
-export function readTranscript(text: string): { result?: string; tail: string } {
+/** A transcript's tail: the last assistant text (the result), a progress tail, and whether any assistant turn is there. */
+export function readTranscript(text: string): { result?: string; tail: string; hasTurn: boolean } {
   const lines: string[] = []
   let result: string | undefined
+  let hasTurn = false
   for (const line of text.split('\n')) {
     if (!line.trim().startsWith('{')) continue
     let o: { type?: string; message?: { content?: unknown } }
@@ -338,6 +339,7 @@ export function readTranscript(text: string): { result?: string; tail: string } 
       continue // the first line of a cut tail
     }
     if (o.type !== 'assistant') continue
+    hasTurn = true
     const content = o.message?.content
     if (!Array.isArray(content)) continue
     const texts: string[] = []
@@ -350,7 +352,7 @@ export function readTranscript(text: string): { result?: string; tail: string } 
       lines.push(result)
     }
   }
-  return { result, tail: lines.join('\n').slice(-TAIL_MAX) }
+  return { result, tail: lines.join('\n').slice(-TAIL_MAX), hasTurn }
 }
 
 /** `/spawn [--force] [--mode m] [--model x] [--effort e] [--] <task>`; --force starts past the budget's hard limit. */

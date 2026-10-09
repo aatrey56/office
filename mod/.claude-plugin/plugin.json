@@ -116,6 +116,12 @@
       "description": "Where the one extension of a still-active job ends; at most the job timeout means no extension.",
       "default": 60
     },
+    "blockedTimeoutMin": {
+      "type": "number",
+      "title": "Blocked worker limit (minutes)",
+      "description": "A background worker waiting on approval or input this long is reported to its manager once; at twice this it is ended, its work committed as WIP on its branch.",
+      "default": 20
+    },
     "messageApproval": {
       "type": "string",
       "title": "Message approval",

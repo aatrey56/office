@@ -104,7 +104,7 @@ import {
   worktreeDir,
   worktreeReport,
 } from './worktree'
-import { deadlineVerdict, nextGrowth, timeoutText } from './watchdog'
+import { blockedVerdict, deadlineVerdict, isStalled, nextGrowth, timeoutText } from './watchdog'
 import type { Growth } from './watchdog'
 
 // Owner: jobs agent. Codex handoff, router, worker spawner, jobs pane.
@@ -190,6 +190,9 @@ const CLOCK_START = new Map<string, number>()
 const GROWTH = new Map<string, Growth>()
 /** Jobs whose one extension past jobTimeoutMin is spent. */
 const EXTENDED = new Set<string>()
+/** Jobs already reported to the manager: blocked past blockedTimeoutMin (once per block), stalled before a first turn. */
+const BLOCK_REPORTED = new Set<string>()
+const STALL_REPORTED = new Set<string>()
 /** Jobs being ended past their time: stopped and their work committed before finishJob delivers them. */
 const ENDING = new Set<string>()
 /** A WIP commit runs the repo's hooks, which may run checks. */
@@ -700,6 +703,8 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   CLOCK_START.delete(id)
   GROWTH.delete(id)
   EXTENDED.delete(id)
+  BLOCK_REPORTED.delete(id)
+  STALL_REPORTED.delete(id)
   const before = (await read($, JOBS)).find(j => j.id === id)
   if (before === undefined || !isLive(before)) return
   if (before.agentId !== undefined) SUBAGENT_JOBS.delete(before.agentId)
@@ -1159,6 +1164,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
     const jobs = await read($, JOBS)
     const configDir = await configDirOf($)
     const now = await clockNow($)
+    const blockedMin = num(options, 'blockedTimeoutMin', 20)
     for (const [jobId, bgId] of [...BG_JOBS]) {
       const job = jobs.find(j => j.id === jobId)
       if (job === undefined || !isLive(job)) {
@@ -1203,6 +1209,28 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         await finishJob($, jobId, 'failed', `background session ${bgId} ended: ${agent.state}${last}`)
         continue
       }
+      const sinceStart = now - (CLOCK_START.get(jobId) ?? job.startedAt)
+      if (isStalled(sinceStart, seen.hasTurn === true, STALL_REPORTED.has(jobId))) {
+        STALL_REPORTED.add(jobId)
+        const text = `Worker ${jobId} (${job.title}) has not replied ${formatElapsed(sinceStart)} after it started: no assistant turn in its transcript, so it may be stalled. Stop it (kill it in /jobs, or \`claude stop ${bgId}\`) and spawn it again.`
+        $.ui.toast(`Worker ${jobId} may be stalled: no reply yet`)
+        await notifyModel($, jobId, text, `Worker ${jobId} may be stalled: see above.`)
+      }
+      if (phase === 'blocked' && job.status === 'blocked') {
+        const since = BLOCKED_AT.get(jobId) ?? now
+        const blocked = blockedVerdict(now - since, blockedMin, BLOCK_REPORTED.has(jobId))
+        if (blocked === 'end') {
+          const why = `ended after ${formatElapsed(now - since)} waiting for approval or input (twice blockedTimeoutMin ${blockedMin})`
+          await endJob($, jobId, why, Math.round(sinceStart / 60_000))
+          continue
+        }
+        if (blocked === 'report') {
+          BLOCK_REPORTED.add(jobId)
+          const text = `Worker ${jobId} (${job.title}) has waited ${formatElapsed(now - since)} for approval or input (blockedTimeoutMin ${blockedMin}): \`claude attach ${bgId}\` answers it. Still waiting at ${2 * blockedMin} min, it is ended and its work committed as WIP on its branch.`
+          $.ui.toast(`Worker ${jobId} blocked ${blockedMin}+ min: claude attach ${bgId}`)
+          await notifyModel($, jobId, text, `Worker ${jobId} is still blocked: see above.`)
+        }
+      }
       if (phase === 'blocked' && job.status === 'running') {
         // Pause the timeout and tell the model once per block.
         TIMERS.get(jobId)?.cancel()
@@ -1218,6 +1246,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       if ((phase === 'active' || phase === 'idle') && job.status === 'blocked') {
         const since = BLOCKED_AT.get(jobId)
         BLOCKED_AT.delete(jobId)
+        BLOCK_REPORTED.delete(jobId)
         if (since !== undefined) PAUSED_MS.set(jobId, (PAUSED_MS.get(jobId) ?? 0) + now - since)
         await patchJob($, jobId, j => ({ ...j, status: 'running' }))
         await startTimeout($, options, jobId)
@@ -1233,7 +1262,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
 }
 
 /** `mark`: the transcript's last bytes, which change whenever it grows (it is only ever appended to). */
-type Seen = { result?: string; tail: string; mark?: string }
+type Seen = { result?: string; tail: string; hasTurn?: boolean; mark?: string }
 
 /** The latest reply and tail of a --bg session's transcript (empty when it cannot be read). */
 async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<Seen> {

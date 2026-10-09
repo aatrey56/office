@@ -222,7 +222,7 @@ describe('worker worktrees', () => {
   })
 })
 
-describe('watchdog: deadline', () => {
+describe('watchdog: deadline, blocked limit, stalled worker', () => {
   const turn = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } })
   const agent = (state: string, status = 'busy') =>
     `[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"${state}","status":"${status}"}]`
@@ -274,6 +274,38 @@ describe('watchdog: deadline', () => {
     expect(text).toContain('WIP commit failed')
     expect(text).toMatch(/Uncommitted changes left in \/cfg\/office\/worktrees\//)
     expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+  })
+
+  test('blocked past blockedTimeoutMin: reported once; ended at twice it', { options: { blockedTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('blocked', 'idle'), transcript: () => turn('May I run npm install?') })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(5_000)
+    expect(delivered.join('\n')).toContain('is waiting for input')
+    await clock.advance(90_000)
+    const reports = () => delivered.filter(t => t.includes('(blockedTimeoutMin 1)')).length
+    expect(reports()).toBe(1)
+    expect(stops(runs)).toBe(0)
+    await clock.advance(30_000)
+    expect(stops(runs)).toBe(1)
+    expect(reports()).toBe(1)
+    expect(delivered.join('\n')).toContain('Worker FAILED: rename x to y')
+    expect(delivered.join('\n')).toContain('waiting for approval or input (twice blockedTimeoutMin 1)')
+  })
+
+  test('no assistant turn 5 min after the start: reported as stalled once, not ended', async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working') })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(4 * 60_000)
+    expect(delivered.join('\n')).not.toContain('may be stalled')
+    await clock.advance(3 * 60_000)
+    expect(delivered.filter(t => t.includes('may be stalled') && t.includes('spawn it again'))).toHaveLength(1)
+    expect(stops(runs)).toBe(0)
   })
 })
 
