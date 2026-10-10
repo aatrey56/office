@@ -19,6 +19,8 @@ Checked against the code in `mod/hooks`. The rest of this document is the origin
 | `/route-eval` and `evals/routing.jsonl` | Built, tested; never run, so no accuracy numbers yet |
 | Budget guard (soft and hard lines) | Built, tested |
 | `/spawn` workers in `bg`, `headless` and `subagent` modes | Built, tested |
+| `spawn_worker` `base` and `branch` (worker told it is already on its branch, never to switch) | Built, tested |
+| Worker watchdog: progress-aware timeout with one extension (`jobTimeoutMin` 45, `jobTimeoutHardMin` 60), WIP commit of a timed-out worker's work, blocked limit (`blockedTimeoutMin` 20: report, end at 2x), stalled report (no reply 5 min after start) | Built, tested; subagent workers have no growth signal, so they are never extended |
 | Codex review (`/codex-review`) | Built |
 | Worker git worktrees (option `workerWorktree`) | Partly built, in progress on `feat/worker-worktrees` |
 | Every subagent of a conversation drawn as a character | Partly built, in progress on `feat/worker-worktrees` |
@@ -302,7 +304,7 @@ Measured just now: this session's context 23%; 5-hour window 4% used; week 14% u
 | `Image` scaling is blurry or slow | LO path on `Raster` (§5.2) |
 | Clicking sprites directly isn't possible | Name-tag buttons or keys |
 | Subagents inside other sessions are invisible across sessions | Out of scope; only office-spawned workers appear |
-| A manager spawning too much | Budget guard + existing `maxWorkers` (4) + `maxOpusWorkers` (Opus-tier workers at once; 0, the default, sets no separate limit) + job timeout (30 min) |
+| A manager spawning too much | Budget guard + existing `maxWorkers` (4) + `maxOpusWorkers` (Opus-tier workers at once; 0, the default, sets no separate limit) + job timeout (45 min, one extension to 60 while the transcript still grows; the work committed as WIP) + blocked limit (reported at 20 min, ended at 40) |
 | Router quality unproven | It only advises until the routing test shows a number you accept |
 
 ## 8. What I need from you

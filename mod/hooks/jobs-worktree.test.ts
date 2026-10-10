@@ -4,11 +4,17 @@ import type { On } from 'claude-code'
 
 const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 const BASE = 'abc1234def5678abc1234def5678abc1234def56'
+const OTHER = 'feed123def5678abc1234def5678abc1234def56'
 const USAGE = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateLimits: [] } }
 
 // A repo at /r, asked from /r/src; git answers as a clean checkout would, `claude --bg` prints its id
 // (or `bg`; `bgExit` its exit code, `bgGate` holds it), `claude agents` lists what `agents()` says;
+// `branches` exist (show-ref finds them), `worktrees` is `git worktree list --porcelain`; any `<x>^{commit}` is OTHER;
+// `afterStop` is what `claude agents` prints once a stop was asked (`'slow'`: its first runs out its timeout on `wait`, the mock clock's sleep, exiting 124);
+// `whole` is the whole transcript `grep` searches (default: `transcript()`);
+// `dirty` leaves src/x.ts and big.bin uncommitted until a commit (exiting `commitExit`) takes them;
+// `noHead`: a repo with no commits (rev-parse HEAD fails); `staged` lists what `diff --cached` shows while dirty; `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
 // the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
@@ -16,10 +22,14 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown> }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
+  let isDirty = fake.dirty === true
+  const stopped = new Set<string>()
+  let isStopAsked = false
+  let isSlowDone = false
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
     runs.sets.push(e.key)
@@ -52,16 +62,39 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     const cmd = argv.join(' ')
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
     if (cmd.includes('--git-common-dir')) return out('/r/.git\n')
-    if (cmd.endsWith('rev-parse HEAD')) return out(`${BASE}\n`)
+    if (cmd.endsWith('rev-parse HEAD')) return fake.noHead ? out('', 128) : out(`${BASE}\n`)
+    if (cmd.endsWith('^{commit}')) return out(`${OTHER}\n`)
+    if (argv.includes('show-ref')) return out('', fake.branches?.some(b => cmd.endsWith(`refs/heads/${b}`)) ? 0 : 1)
+    if (cmd.endsWith('worktree list --porcelain')) return out(fake.worktrees ?? '')
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
     if (argv.includes('--bg')) {
       await fake.bgGate
-      return out(fake.bg ?? 'backgrounded · 5ac0f0df\n', fake.bgExit ?? 0)
+      return out((typeof fake.bg === 'function' ? fake.bg() : fake.bg) ?? 'backgrounded · 5ac0f0df\n', fake.bgExit ?? 0)
     }
-    if (argv.includes('agents')) return out(fake.agents?.() ?? '[]')
+    if (argv[1] === 'stop') isStopAsked = true
+    if (argv[1] === 'stop' && !fake.stopIgnored) stopped.add(argv[2] ?? '')
+    if (argv.includes('agents') && isStopAsked && fake.afterStop === 'slow' && !isSlowDone) {
+      isSlowDone = true
+      await fake.wait?.(e.init?.timeoutMs ?? 30000)
+      return out('', 124)
+    }
+    if (argv.includes('agents') && isStopAsked && fake.afterStop !== undefined && fake.afterStop !== 'slow') return out(fake.afterStop)
+    if (argv.includes('agents') && fake.rawAgents !== undefined) return { value: { ...RUN, ...fake.rawAgents } }
+    if (argv.includes('agents')) {
+      const listed = JSON.parse(fake.agents?.() ?? '[]') as { id: string; state?: string }[]
+      return out(JSON.stringify(listed.map(a => (stopped.has(a.id) ? { ...a, state: 'stopped' } : a))))
+    }
     if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
+    if (argv[0] === 'grep') return out('', (fake.whole ?? fake.transcript)?.().includes(argv.at(-2) ?? '') ? 0 : 1)
     if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
+    if (cmd.endsWith('status --porcelain')) return out(isDirty ? ' M src/x.ts\n?? big.bin\n' : '')
+    if (argv.includes('ls-files')) return out(isDirty ? 'src/x.ts\0big.bin\0' : '')
+    if (cmd.includes(' diff --cached ')) return out(isDirty ? (fake.staged ?? []).map(p => `${p}\0`).join('') : '')
+    if (argv.includes('commit')) {
+      isDirty = (fake.commitExit ?? 0) !== 0
+      return out(isDirty ? '' : '[x 1234567] WIP', fake.commitExit ?? 0)
+    }
     return out('') // worktree add / remove, status: clean
   })
   return runs
@@ -122,6 +155,34 @@ describe('worker worktrees', () => {
     expect(bg?.argv.at(-1)).toContain('Task:\nrename x to y')
     expect(bg?.argv.at(-1)).toContain('end your final reply with the line [office: done]')
     expect(JSON.stringify(r.result)).toContain(branch)
+  })
+
+  test('base and branch: the worktree starts from that commit on that branch, and the worker is told never to switch', async ($, on) => {
+    const runs = fakeRepo(on)
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', base: 'release', branch: 'fix/rename' })
+    const add = runs.find(run => run.argv.includes('worktree') && run.argv.includes('add'))?.argv ?? []
+    expect(add[add.indexOf('-b') + 1]).toBe('fix/rename')
+    expect(add.at(-1)).toBe(OTHER)
+    const task = runs.find(run => run.argv.includes('--bg'))?.argv.at(-1) ?? ''
+    expect(task).toContain('already on your own branch fix/rename')
+    expect(task).toContain('Never switch, create or rename branches')
+    expect(JSON.stringify(r.result)).toContain('Own branch fix/rename (from feed123)')
+  })
+
+  test('a branch asked for in a repo with no commits is refused, never started in the shared checkout', async ($, on) => {
+    const runs = fakeRepo(on, { noHead: true })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', branch: 'fix/rename' })
+    expect(JSON.stringify(r)).toContain('Worker not started: git rev-parse HEAD')
+    expect(runs.some(run => run.argv.includes('--bg'))).toBe(false)
+  })
+
+  test('a branch that exists or is checked out elsewhere is refused before anything starts', async ($, on) => {
+    const runs = fakeRepo(on, { branches: ['main', 'taken'], worktrees: 'worktree /r\nHEAD abc\nbranch refs/heads/main\n' })
+    const spawn = (branch: string) =>
+      $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', branch }).then(r => JSON.stringify(r))
+    expect(await spawn('main')).toContain('Branch main is checked out in /r')
+    expect(await spawn('taken')).toContain('Branch taken already exists')
+    expect(runs.some(run => run.argv.includes('add') || run.argv.includes('--bg'))).toBe(false)
   })
 
   test('a clean finished worker gives its worktree back and reports its branch', async ($, on) => {
@@ -185,6 +246,195 @@ describe('worker worktrees', () => {
     await clock.advance(70_000) // the next poll resumes the timeout, a full minute from then
     expect(runs.some(run => run.argv.includes('stop'))).toBe(true)
     expect(delivered.join('\n')).toContain('timed out')
+  })
+})
+
+describe('watchdog: deadline, blocked limit, stalled worker', () => {
+  const turn = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } })
+  const agent = (state: string, status = 'busy') =>
+    `[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"${state}","status":"${status}"}]`
+  const spawn = ($: Engine) => $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+  async function start($: Engine, on: On) {
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    // big.bin is 6 MB; everything else is small.
+    on('fs.stat', (_$, e) => ({ value: { kind: 'file' as const, size: e.path.endsWith('big.bin') ? 6 * 1024 * 1024 : 10, mtimeMs: 0, isLink: false } }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+  }
+  const stops = (runs: Runs) => runs.filter(run => run.argv.join(' ').endsWith('stop 5ac0f0df')).length
+
+  test('still writing at the deadline: extended once, then ended with its work committed as WIP and the worktree kept', { options: { jobTimeoutMin: 1, jobTimeoutHardMin: 2 } }, async ($, on) => {
+    let turns = 0
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn(`step ${++turns}`), dirty: true })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000)
+    expect(stops(runs)).toBe(0) // its transcript grew: extended to 2 min
+    await clock.advance(60_000)
+    expect(stops(runs)).toBe(1)
+    const add = runs.find(run => run.argv.includes('add') && run.argv.includes('-A'))?.argv ?? []
+    expect(add.at(-1)).toBe(':(exclude,literal)big.bin')
+    const commit = runs.find(run => run.argv.includes('commit'))?.argv ?? []
+    expect(commit.slice(-2)).toEqual(['-m', 'WIP: timed out at 2 min (office)'])
+    expect(commit).not.toContain('--no-verify')
+    expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+    const text = delivered.join('\n')
+    expect(text).toContain('timed out after 2 min (jobTimeoutHardMin): extended once at 1 min')
+    expect(text).toContain('committed on its branch as "WIP: timed out at 2 min (office)"')
+    expect(text).toContain('Left out, over 5 MB (uncommitted in the worktree): big.bin')
+    expect(text).toMatch(/Worktree kept at \/cfg\/office\/worktrees\//)
+  })
+
+  test('a failed WIP commit keeps the worktree and says so', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, commitExit: 1 })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000) // a transcript that never changed: no extension
+    const text = delivered.join('\n')
+    expect(text).toContain('timed out after 1 min (jobTimeoutMin); not extended')
+    expect(text).toContain('WIP commit failed')
+    expect(text).toMatch(/Uncommitted changes left in \/cfg\/office\/worktrees\//)
+    expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+  })
+
+  test('a reload keeps a granted extension: the re-adopted job runs on to jobTimeoutHardMin', { options: { jobTimeoutMin: 1, jobTimeoutHardMin: 2 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step') })
+    const clock = mock.clock(on, { now: 61_000 })
+    const job = { id: 'j1', kind: 'worker', title: 'rename x to y', cwd: '/r', status: 'running', startedAt: 0, mode: 'bg', bgId: '5ac0f0df', tail: '', isExtended: true }
+    // The record the last load left, read until the first write of the jobs.
+    let left: unknown = [job]
+    on('state.set', (_$, e, next) => {
+      if (e.key === 'jobs') left = undefined
+      return next(e)
+    })
+    on('state.get', (_$, e, next) => (left !== undefined && e.key === 'jobs' ? { value: { value: left, version: 0 } } : next(e)))
+    await start($, on)
+    await clock.advance(30_000)
+    expect(stops(runs)).toBe(0)
+    await clock.advance(30_000)
+    expect(stops(runs)).toBe(1)
+  })
+
+  test('an oversized file the worker staged is unstaged and left out of the WIP commit', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, staged: ['out/staged-big.bin'] })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000)
+    const at = (pred: (a: string[]) => boolean) => runs.findIndex(run => pred(run.argv))
+    const reset = at(a => a.includes('reset'))
+    expect(runs[reset]?.argv.slice(-3)).toEqual(['--', ':(literal)big.bin', ':(literal)out/staged-big.bin'])
+    expect(reset).toBeLessThan(at(a => a.includes('commit')))
+    expect(runs[at(a => a.includes('add') && a.includes('-A'))]?.argv).toContain(':(exclude,literal)out/staged-big.bin')
+    expect(delivered.join('\n')).toContain('Left out, over 5 MB (uncommitted in the worktree): big.bin, out/staged-big.bin')
+  })
+
+  test('a worker not confirmed stopped: its work is left uncommitted and the worktree kept', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, stopIgnored: true })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(61_000)
+    expect(stops(runs)).toBe(1)
+    expect(delivered.join('\n')).not.toContain('Worker FAILED') // still waiting to see it stop
+    await clock.advance(30_000)
+    const text = delivered.join('\n')
+    expect(text).toContain('Could not confirm the worker stopped; its work was left uncommitted in /cfg/office/worktrees/')
+    expect(runs.some(run => run.argv.includes('commit') || (run.argv.includes('add') && run.argv.includes('-A')))).toBe(false)
+    expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
+  })
+
+  test('a malformed listing after a failed stop is no proof it stopped: nothing is committed (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, stopIgnored: true, afterStop: '[{"id":"5ac0f0df","st' })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(91_000)
+    expect(delivered.join('\n')).toContain('Could not confirm the worker stopped')
+    expect(runs.some(run => run.argv.includes('commit'))).toBe(false)
+  })
+
+  test('confirming a stop keeps to its time, a slow listing included, and never holds the other workers\' polls (regression)', { options: { blockedTimeoutMin: 1 } }, async ($, on) => {
+    const clock = mock.clock(on)
+    const ids = ['5ac0f0df', '7bd1e0aa']
+    // The first worker stays blocked; the second finishes at 128 s, while the first's stop is being confirmed.
+    const listing = () => `[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"blocked","status":"idle"},{"id":"7bd1e0aa","sessionId":"S2","cwd":"/r","kind":"background","state":"${clock.now() < 128_000 ? 'working' : 'done'}","status":"busy"}]`
+    fakeRepo(on, { bg: () => `backgrounded · ${ids.shift()}\n`, agents: listing, transcript: () => turn('May I run npm install?'), stopIgnored: true, afterStop: 'slow', wait: ms => clock.sleep(ms) })
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'add a test', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(125_000) // the first: blocked at 5 s, ended at twice blockedTimeoutMin; its first listing then takes 20 s
+    await clock.advance(10_000)
+    expect(delivered.join('\n')).toContain('Worker finished: add a test')
+    expect(delivered.join('\n')).not.toContain('Could not confirm')
+    await clock.advance(15_000)
+    expect(delivered.join('\n')).toContain('Could not confirm the worker stopped')
+  })
+
+  test('blocked past blockedTimeoutMin: reported once; ended at twice it', { options: { blockedTimeoutMin: 1 } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('blocked', 'idle'), transcript: () => turn('May I run npm install?') })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(5_000)
+    expect(delivered.join('\n')).toContain('is waiting for input')
+    await clock.advance(90_000)
+    const reports = () => delivered.filter(t => t.includes('(blockedTimeoutMin 1)')).length
+    expect(reports()).toBe(1)
+    expect(stops(runs)).toBe(0)
+    await clock.advance(30_000)
+    expect(stops(runs)).toBe(1)
+    expect(reports()).toBe(1)
+    expect(delivered.join('\n')).toContain('Worker FAILED: rename x to y')
+    expect(delivered.join('\n')).toContain('waiting for approval or input (twice blockedTimeoutMin 1)')
+  })
+
+  test('a turn seen once is remembered: a tail that later holds none is not stalled', async ($, on) => {
+    let reads = 0
+    const tool = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'x'.repeat(1000) }] } })
+    fakeRepo(on, { agents: () => agent('working'), transcript: () => (++reads === 1 ? turn('Reading the code.') : tool) })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(7 * 60_000)
+    expect(reads).toBeGreaterThan(1)
+    expect(delivered.join('\n')).not.toContain('may be stalled')
+  })
+
+  test('a turn the tail never saw, pushed out by a big tool result between polls, is found in the whole transcript (regression)', async ($, on) => {
+    const tool = JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', content: 'x'.repeat(1000) }] } })
+    fakeRepo(on, { agents: () => agent('working'), transcript: () => tool, whole: () => `${turn('Reading the code.')}\n${tool}` })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(7 * 60_000)
+    expect(delivered.join('\n')).not.toContain('may be stalled')
+  })
+
+  test('no assistant turn 5 min after the start: reported as stalled once, not ended', async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('working') })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await start($, on)
+    await spawn($)
+    await clock.advance(4 * 60_000)
+    expect(delivered.join('\n')).not.toContain('may be stalled')
+    await clock.advance(3 * 60_000)
+    expect(delivered.filter(t => t.includes('may be stalled') && t.includes('spawn it again'))).toHaveLength(1)
+    expect(stops(runs)).toBe(0)
   })
 })
 
@@ -374,6 +624,20 @@ describe('maxOpusWorkers', () => {
     // One still in time holds its slot. (5ac0f0df is not listed, so it is pruned and does not count.)
     runs.store.set('reservedSlots', [{ id: 'held.2', isOpus: true, until: Date.now() + 60_000 }])
     expect(await spawn($, 'opus')).toContain('1 Opus jobs already running (maxOpusWorkers 1)')
+  })
+
+  for (const [what, rawAgents] of [['malformed', { stdout: '[{"id":"a1","kind":"back' }], ['truncated', { stdout: '[]', isStdoutTruncated: true }]] as const) {
+    test(`a ${what} listing proves nothing: no stored id is pruned, the caps still count them (regression)`, { options: { maxWorkers: 2 } }, async ($, on) => {
+      const runs = fakeRepo(on, { rawAgents, store: { bgIds: ['a1', 'b2'], bgModels: { a1: OPUS, b2: OPUS } } })
+      expect(await spawn($, 'sonnet')).toContain('Started background worker')
+      expect(runs.store.get('bgIds')).toEqual(['a1', 'b2', '5ac0f0df'])
+    })
+  }
+
+  test('a truncated listing is not searched for a worker whose --bg printed no id (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const startedAt = Date.now() + 60000
+    fakeRepo(on, { bg: 'started\n', rawAgents: { stdout: JSON.stringify([{ id: 'c3', kind: 'background', cwd: '/r/src', startedAt }]), isStdoutTruncated: true } })
+    expect(await spawn($, 'sonnet')).toContain('gave no session id')
   })
 
   test('pruning keeps an id another session registered during the listing; gone ids lose their models (regression)', { options: { maxWorkers: 8 } }, async ($, on) => {

@@ -107,8 +107,20 @@
     "jobTimeoutMin": {
       "type": "number",
       "title": "Job timeout (minutes)",
-      "description": "A job still running after this long is ended.",
-      "default": 30
+      "description": "A job still running after this long (time blocked on approval not counted) is ended, unless its transcript grew in the last 5 minutes: then it gets one extension, to the hard timeout. A worker ended this way has its uncommitted work committed as WIP on its branch, and its worktree is kept.",
+      "default": 45
+    },
+    "jobTimeoutHardMin": {
+      "type": "number",
+      "title": "Job hard timeout (minutes)",
+      "description": "Where the one extension of a still-active job ends; at most the job timeout means no extension.",
+      "default": 60
+    },
+    "blockedTimeoutMin": {
+      "type": "number",
+      "title": "Blocked worker limit (minutes)",
+      "description": "A background worker waiting on approval or input this long is reported to its manager once; at twice this it is ended, its work committed as WIP on its branch.",
+      "default": 20
     },
     "messageApproval": {
       "type": "string",
