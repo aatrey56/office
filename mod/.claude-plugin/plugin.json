@@ -81,12 +81,6 @@
       "description": "Reviews an agent may start on one branch, the first included; then codex_review is refused. Your own /codex-review is never refused, and counts.",
       "default": 3
     },
-    "codexFullReviewsPer5h": {
-      "type": "number",
-      "title": "Codex full reviews per 5 hours",
-      "description": "Most full-model reviews (the review or deep model, not the re-review model) that may start in any trailing 5 hours, counted across all sessions and branches; each costs about 4% of the plan's 5-hour Codex limit. At the cap a round that needs a full review is refused, for you too; a re-review still runs on the re-review model. 0 = no cap.",
-      "default": 10
-    },
     "claudePath": {
       "type": "string",
       "title": "claude executable",

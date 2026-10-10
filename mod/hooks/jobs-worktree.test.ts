@@ -535,13 +535,14 @@ describe('codex review rounds', () => {
     ])
   })
 
-  test('a --commit round is not a baseline: the next automatic round is a full review vs main (coverage)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+  test('a --commit round is not a baseline: the next automatic round is a full review vs main, on luna, with the earlier findings (coverage)', { options: { workerWorktree: 'off' } }, async ($, on) => {
     const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [{ ...round(OLD, '[P2] y'), isCovering: false }] } })
     const clock = mock.clock(on)
     const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
-    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6.1-sol)')
+    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6-luna)')
     await clock.advance(0)
     expect(reviews).toHaveLength(1)
+    expect(reviews[0]!.input).toContain('[P2] y')
     const rounds = (runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!
     expect(rounds.map(x => x.isCovering)).toEqual([false, true])
     await $.command.run({ command: 'codex-review', args: '--commit abc1234', ...TYPED })
@@ -552,7 +553,7 @@ describe('codex review rounds', () => {
     const { reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x')] } }, { path: 'new.ts', lines: 401 })
     const clock = mock.clock(on)
     const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
-    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6.1-sol)')
+    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6-luna)')
     expect(String(r.result)).toContain('401 lines changed')
     await clock.advance(0)
     expect(reviews).toHaveLength(1)
@@ -650,32 +651,13 @@ describe('codex review rounds', () => {
     expect(runs.some(x => x.argv.join(' ') === `git diff --shortstat ${OLD}`)).toBe(true)
   })
 
-  test('the 11th full review in 5 h is refused, for the person too; a re-review still runs on luna and takes no slot', { options: { workerWorktree: 'off' } }, async ($, on) => {
-    const hour = 3_600_000
-    const fulls = Array.from({ length: 10 }, (_, i) => ({ jobId: `j-full${i}`, at: Date.now() - (4 - i * 0.3) * hour }))
-    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x')] }, codexFullReviews: fulls })
-    const clock = mock.clock(on)
-    const refused = await $.tool.call({ tool: 'mcp__office__codex_review', full: true, cwd: '/r/src' })
-    expect(refused.deny ?? '').toContain('10 full reviews ran in the last 5 h')
-    expect(refused.deny ?? '').toContain(`next slot frees at ${new Date(fulls[0]!.at + 5 * hour).toISOString()}`)
-    const typed = await $.command.run({ command: 'codex-review', args: '', ...TYPED })
-    expect(JSON.stringify(typed)).toContain('10 full reviews ran in the last 5 h')
-    const ok = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
-    expect(String(ok.result)).toContain('Started Codex re-review job')
-    expect(String(ok.result)).toContain('gpt-6-luna')
-    await clock.advance(0)
-    expect(reviews).toHaveLength(1)
-    expect(runs.store.get('codexFullReviews')).toEqual(fulls)
-    expect((runs.store.get('codexRounds') as Record<string, unknown[]>)[KEY]).toHaveLength(2)
-  })
-
-  test('at the cap the tool is refused; the person\'s /codex-review still runs, on sol, and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {
+  test('at the cap the tool is refused; the person\'s /codex-review still runs, on luna (a later round), and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {
     const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round('a'.repeat(40)), round('b'.repeat(40)), round('c'.repeat(40))] } })
     const clock = mock.clock(on)
     const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
     expect(r.deny ?? '').toContain('Codex review cap reached: 3 rounds')
     const typed = await $.command.run({ command: 'codex-review', args: '', ...TYPED })
-    expect(JSON.stringify(typed)).toContain('round 4 (vs main, gpt-6.1-sol)')
+    expect(JSON.stringify(typed)).toContain('round 4 (vs main, gpt-6-luna)')
     await clock.advance(0)
     expect(reviews).toHaveLength(1)
     const rounds = (runs.store.get('codexRounds') as Record<string, { isPerson?: boolean }[]>)[KEY]!

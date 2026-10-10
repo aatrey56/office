@@ -87,49 +87,6 @@ export function textLines(content: string): number {
   return (content.match(/\n/g)?.length ?? 0) + (content !== '' && !content.endsWith('\n') ? 1 : 0)
 }
 
-/** The trailing window the full-review cap counts in. */
-export const FULL_WINDOW_MS = 5 * 3_600_000
-
-/** One full-model review: when it was booked and its job (a failed or interrupted job gives its slot back). */
-export type FullReview = { at: number; jobId: string }
-
-/** The stored full reviews, read defensively, without those past the window. */
-export function parseFullReviews(raw: unknown, now: number): FullReview[] {
-  if (!Array.isArray(raw)) return []
-  const ok = (r: unknown): r is FullReview => typeof (r as FullReview | null)?.at === 'number' && typeof (r as FullReview).jobId === 'string'
-  return raw.filter(ok).filter(r => now - r.at < FULL_WINDOW_MS)
-}
-
-/** The full reviews without those of dropped jobs (settlements with no findings). */
-export function settledFulls(fulls: readonly FullReview[], settlements: readonly { jobId: string; findings?: string }[]): FullReview[] {
-  const dropped = new Set(settlements.filter(s => s.findings === undefined).map(s => s.jobId))
-  return fulls.filter(r => !dropped.has(r.jobId))
-}
-
-/** Whether a round on this tier is a full review for the cap: any model but the re-review model. */
-export function isFullTier(tier: CodexTier, policy: Pick<RoundPolicy, 'rereview'>): boolean {
-  return tier.model !== policy.rereview.model
-}
-
-/** When the next full-review slot frees (ms): the (count - cap + 1)th oldest in the window expires. Undefined with a free slot. */
-export function nextFullSlot(fulls: readonly FullReview[], now: number, cap: number): number | undefined {
-  const times = fulls.filter(r => now - r.at < FULL_WINDOW_MS).map(r => r.at).sort((a, b) => a - b)
-  return cap > 0 && times.length >= cap ? times[times.length - cap]! + FULL_WINDOW_MS : undefined
-}
-
-/** The refusal of a full review at the cap, or undefined when a slot is free (or there is no cap). */
-export function fullReviewRefusal(fulls: readonly FullReview[], now: number, cap: number, rereviewModel: string): string | undefined {
-  const free = nextFullSlot(fulls, now, cap)
-  if (free === undefined) return undefined
-  const ran = fulls.filter(r => now - r.at < FULL_WINDOW_MS).length
-  return (
-    `Codex full-review cap reached: ${ran} full reviews ran in the last 5 h (codexFullReviewsPer5h ${cap}); ` +
-    `the next slot frees at ${new Date(free).toISOString()}. No review started. ` +
-    `A full review (round 1, a rebase, a large diff or full: true) has to wait for that slot; ` +
-    `a re-review of new commits (no target, no full) still runs on ${rereviewModel}. Otherwise ask the person.`
-  )
-}
-
 /** Codex's usage / rate-limit failure wording, matched case-insensitively. */
 const USAGE_LIMIT = /usage limit|rate limit|hit your limit/i
 export function isUsageLimit(text: string): boolean {
@@ -146,9 +103,19 @@ export const CODEX_OUT_FALLBACK_TEXT =
 export type RoundPolicy = {
   maxRounds: number
   maxLines: number
-  review: CodexTier
-  rereview: CodexTier
-  maxFullReviews?: number // codexFullReviewsPer5h: full reviews allowed in any FULL_WINDOW_MS; 0 or unset: no cap
+  review: CodexTier // the branch's first round
+  rereview: CodexTier // every later round, diff-only or full
+}
+
+/**
+ * The two tiers of a call: the first round runs on `review` (Sol), every later one on `rereview` (Luna).
+ * `deep` (the deep model, only when the person asks) and the person's own `model` pin every round of the call to one model.
+ */
+export function roundTiers(base: { review: CodexTier; rereview: CodexTier; deep?: CodexTier; model?: string }): Pick<RoundPolicy, 'review' | 'rereview'> {
+  const first = base.deep ?? base.review
+  const pinned = base.deep !== undefined || base.model !== undefined
+  const review = base.model !== undefined ? { ...first, model: base.model } : first
+  return { review, rereview: pinned ? review : base.rereview }
 }
 
 /** What the call knows: the branch's rounds, the tree now, the caller's choices, and git's view of the last reviewed sha. */
@@ -161,8 +128,6 @@ export type RoundFacts = {
   isFull: boolean // full: true, or a deep review
   instructions?: string
   sinceLast?: { isAncestor: boolean; changedLines: number }
-  now?: number // with `fullReviews`: the full-review window is counted at this time
-  fullReviews?: readonly FullReview[] // every session's and branch's full reviews; unset: not counted
 }
 
 /**
@@ -191,26 +156,25 @@ const short = (sha: string) => sha.slice(0, 7)
  * runs as asked; it is still a round. For an agent:
  * - nothing new since the last round (same HEAD, clean tree) → refused;
  * - maxRounds rounds already → refused: the manager stops and asks the person;
- * - round 1, `full` / deep, a rebase past the last sha, or more than maxLines changed since
- *   it → a full review on the review model;
- * - a later round with an explicit target → that target as given, on the re-review model;
- * - any full review at maxFullReviews in the trailing 5 h → refused, for the person too (a re-review still runs);
- * - otherwise a re-review of the changes since the last sha on the re-review model, checking
- *   the previous round's findings.
+ * - round 1 → a full review on the review model;
+ * - every later round runs on the re-review model, whatever its scope, with the earlier rounds'
+ *   findings in its instructions (the earlier Codex session is not resumed: that re-reads the whole first review):
+ *   `full` / deep, a rebase past the last sha, or more than maxLines changed since it → the whole
+ *   branch scope; an explicit target → that target as given; otherwise only the changes since the last sha.
  */
 export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPlan {
   const { rounds, head, isDirty } = facts
   const round = rounds.length + 1
   const last = rounds.at(-1)
-  const full = (note?: string): RoundPlan => {
-    // The cap holds for the person too, and for a forced full re-review; it never downgrades a full round to the re-review model.
-    const cap = policy.maxFullReviews ?? 0
-    if (cap > 0 && facts.fullReviews !== undefined && facts.now !== undefined && isFullTier(policy.review, policy)) {
-      const reason = fullReviewRefusal(facts.fullReviews, facts.now, cap, policy.rereview.model)
-      if (reason !== undefined) return { isAllowed: false, reason }
-    }
-    return { isAllowed: true, round, isRereview: false, tier: policy.review, target: facts.target, instructions: facts.instructions, note }
-  }
+  const full = (note?: string): RoundPlan => ({
+    isAllowed: true,
+    round,
+    isRereview: false,
+    tier: last === undefined ? policy.review : policy.rereview,
+    target: facts.target,
+    instructions: last === undefined ? facts.instructions : priorFindingsInstructions(rounds, facts.instructions),
+    note,
+  })
   if (facts.isPerson || last === undefined) return full()
   if (last.sha === head && !isDirty && last.isCovering === true) {
     return { isAllowed: false, reason: `Nothing new since round ${rounds.length} (${short(head)}, clean tree): no review started.` }
@@ -225,10 +189,7 @@ export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPl
     }
   }
   if (facts.isFull) return full(facts.target === undefined ? `full review as asked (round ${round})` : undefined)
-  // An explicit target is not a way round the cheaper model: only full / deep earn the review model.
-  if (facts.target !== undefined) {
-    return { isAllowed: true, round, isRereview: false, tier: policy.rereview, target: facts.target, instructions: facts.instructions }
-  }
+  if (facts.target !== undefined) return full()
   if (last.isCovering !== true) {
     return full(`full review: round ${rounds.length} (${short(last.sha)}) did not review the whole branch, so it cannot be a baseline`)
   }
@@ -247,21 +208,44 @@ export function planReviewRound(facts: RoundFacts, policy: RoundPolicy): RoundPl
     isRereview: true,
     tier: policy.rereview,
     target: { args: ['--base', last.sha], label: `vs ${short(last.sha)}` },
-    instructions: rereviewInstructions(rounds.length, last, facts.instructions),
+    instructions: rereviewInstructions(rounds, facts.instructions),
   }
 }
 
-/** A re-review's focus: the previous round's findings to check, then the caller's own. */
-export function rereviewInstructions(lastRound: number, last: ReviewRound, extra: string | undefined): string {
-  const findings = last.findings?.trim() || '(its findings were not recorded)'
+/** How many earlier rounds' findings a later round is given, newest last. */
+export const PRIOR_ROUNDS_MAX = 3
+
+function priorFindings(rounds: readonly ReviewRound[]): string {
+  const shown = rounds.slice(-PRIOR_ROUNDS_MAX)
+  const offset = rounds.length - shown.length
+  return shown
+    .map((r, i) => `Round ${offset + i + 1} (commit ${r.sha}):\n${r.findings?.trim() || '(its findings were not recorded)'}`)
+    .join('\n\n')
+}
+
+/** A diff-only re-review's focus: the earlier rounds' findings to check, then the caller's own. */
+export function rereviewInstructions(rounds: readonly ReviewRound[], extra: string | undefined): string {
   return [
-    `This is a re-review. Round ${lastRound} reviewed commit ${last.sha} and reported:`,
+    `This is a re-review of the changes since commit ${rounds.at(-1)?.sha}. Earlier rounds reported:`,
     '<previous-findings>',
-    findings,
+    priorFindings(rounds),
     '</previous-findings>',
     '1. For each finding above, check whether the changes since then fix it; list each as fixed or still open.',
     '2. Look for new problems the fix commits introduced.',
     'Report only problems in, or caused by, the changes since that commit.',
+    ...(extra ? ['', extra] : []),
+  ].join('\n')
+}
+
+/** A later round that reviews its whole scope (not just the changes since the last sha): the earlier findings give it context. */
+export function priorFindingsInstructions(rounds: readonly ReviewRound[], extra: string | undefined): string {
+  return [
+    'This is a later review round of this branch. Earlier rounds reported:',
+    '<previous-findings>',
+    priorFindings(rounds),
+    '</previous-findings>',
+    '1. Review the whole scope you are given, as a fresh review would.',
+    '2. For each finding above that falls in this scope, say whether it is fixed or still open.',
     ...(extra ? ['', extra] : []),
   ].join('\n')
 }

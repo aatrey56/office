@@ -33,11 +33,10 @@ import {
 } from './codex-budget'
 import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
 import {
-  branchKey, CODEX_OUT_FALLBACK_TEXT, isFullTier, isUsageLimit, parseFullReviews, parseLedger, parsePending, planCovers,
-  planReviewRound, roundOf, roundTitle, settledAll, settledFulls, SETTLE_PREFIX, shortstatLines, textLines,
-  UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
+  branchKey, CODEX_OUT_FALLBACK_TEXT, isUsageLimit, parseLedger, parsePending, planCovers, planReviewRound, roundOf, roundTiers,
+  roundTitle, settledAll, SETTLE_PREFIX, shortstatLines, textLines, UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
 } from './codex-rounds'
-import type { FullReview, PendingSettle, RoundFacts, RoundLedger, RoundPlan, RoundPolicy } from './codex-rounds'
+import type { PendingSettle, RoundFacts, RoundLedger, RoundPlan, RoundPolicy } from './codex-rounds'
 import {
   CLAUDE_SYSTEM,
   claudePrompt,
@@ -152,8 +151,6 @@ const CODEX_OUT_KEY = 'codexOut'
 const CODEX_LIMITS_TIMEOUT_MS = 6000
 /** $.store key: the Codex review rounds per branch (codex-rounds.ts), shared by every session. */
 const ROUNDS_KEY = 'codexRounds'
-/** $.store key: the start times of full-model reviews in the trailing 5 hours, across every branch and session; written under the rounds lock. */
-const FULL_REVIEWS_KEY = 'codexFullReviews'
 /** How many times a review's settlement waits out a busy ledger lock before it is kept as a pending record. */
 const SETTLE_ATTEMPTS = 3
 const SETTLE_BACKOFF_MS = 2000
@@ -174,7 +171,7 @@ type RunPlan = {
   parse: (line: string) => LineEvent
   outFile?: string
   codexModel?: string // set for codex runs: names the model in a quota failure
-  isRound?: boolean // a review booked in the rounds ledger / full-review window: settled (or its slot released) when the job ends
+  isRound?: boolean // a review recorded in the rounds ledger: settled when the job ends
 }
 type Started = { ok: boolean; text: string }
 type GitRun = { isOk: boolean; out: string } // out: stdout, or why it failed
@@ -1459,15 +1456,16 @@ async function startCodexReview(
   const bin = opt(options, 'codexPath', 'codex')
   const asked = parseReviewTarget(targetArg)
   if (targetArg && !asked) return { ok: false, text: `Unknown review target "${targetArg}".` }
-  const review: CodexTier = deep
-    ? { model: opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model), effort: CODEX_DEFAULTS.deep.effort }
-    : { model: opt(options, 'codexReviewModel', CODEX_DEFAULTS.review.model), effort: CODEX_DEFAULTS.review.effort }
   const policy: RoundPolicy = {
     maxRounds: num(options, 'codexMaxRounds', 3),
     maxLines: num(options, 'codexRereviewMaxLines', 400),
-    maxFullReviews: num(options, 'codexFullReviewsPer5h', 10),
-    review: ask.model !== undefined ? { ...review, model: ask.model } : review,
-    rereview: { model: opt(options, 'codexRereviewModel', CODEX_DEFAULTS.rereview.model), effort: CODEX_DEFAULTS.rereview.effort },
+    // Sol reviews a branch's first round only; deep and the person's own --model pin every round of the call
+    ...roundTiers({
+      review: { model: opt(options, 'codexReviewModel', CODEX_DEFAULTS.review.model), effort: CODEX_DEFAULTS.review.effort },
+      rereview: { model: opt(options, 'codexRereviewModel', CODEX_DEFAULTS.rereview.model), effort: CODEX_DEFAULTS.rereview.effort },
+      deep: deep ? { model: opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model), effort: CODEX_DEFAULTS.deep.effort } : undefined,
+      model: ask.model,
+    }),
   }
   const status = await $.process.run(['git', 'status', '--porcelain'], { cwd }).catch(() => undefined)
   const isRepo = status !== undefined && status.exitCode === 0
@@ -1488,11 +1486,15 @@ async function startCodexReview(
     isFull: ask.isFull === true || deep,
     instructions,
   }
-  // Outside a repo (an explicit target only) no round is kept, but a full review still takes a slot of the window.
-  const plan = await bookRound($, cwd, jobId, now, policy, facts, fallback!)
-  if (typeof plan === 'string') return { ok: false, text: plan }
+  const booked = isRepo ? await bookRound($, cwd, jobId, now, policy, facts, fallback!) : undefined
+  if (typeof booked === 'string') return { ok: false, text: booked }
+  // Outside a repo (an explicit target only) no round is kept; codex reports the rest.
+  const plan = booked ?? planReviewRound({ ...facts, rounds: [], head: '' }, policy)
   if (!plan.isAllowed) return { ok: false, text: plan.reason }
-  const drop = () => settleRound($, jobId, undefined)
+  const isRound = booked !== undefined
+  const drop = async () => {
+    if (isRound) await settleRound($, jobId, undefined)
+  }
   const tier = plan.tier
   const target: ReviewTarget = plan.target ?? fallback!
   const verdict = await codexGuard($, bin, cwd, tier.model, ask.isForced)
@@ -1529,16 +1531,16 @@ async function startCodexReview(
     parse: codexLine,
     outFile,
     codexModel: tier.model,
-    isRound: true,
+    isRound,
   }
   $.clock.after(0, () => void runJob($, options, job, runPlan))
   const kind = plan.isRereview ? 're-review' : 'review'
-  const isLast = plan.isKept && !ask.isPerson && plan.round >= policy.maxRounds
+  const isLast = isRound && !ask.isPerson && plan.round >= policy.maxRounds
   const notes = [
     plan.note !== undefined ? `This is a ${plan.note}.` : '',
     isLast ? 'It is the last round an agent can start on this branch.' : '',
     verdict.warning ? `Budget: ${verdict.warning}` : '',
-    plan.isUnrecorded ? 'The round was not recorded (the review ledger could not be written), so it does not count toward the round cap or the full-review cap.' : '',
+    booked?.isUnrecorded ? 'The round was not recorded (the review ledger could not be written), so it does not count toward the cap.' : '',
   ].filter(Boolean)
   return {
     ok: true,
@@ -1552,14 +1554,10 @@ async function gitOut($: EngineInterface, cwd: string, args: string[]): Promise<
   return r !== undefined && r.exitCode === 0 ? r.stdout.trim() : undefined
 }
 
-/** A booked round: `isKept` when it is in the branch's ledger (not outside a repo, or in one with no commit). */
-type BookedPlan = RoundPlan & { isKept: boolean; isUnrecorded?: true }
-
 /**
- * Decides this call's round from the branch's ledger and the full-review window, and records both,
- * in one hold of the rounds lock: a call racing it, here or in another session, sees the round and
- * the slot. A branch with no commit to key it by keeps no round, but still takes a window slot for
- * a full review. A string when the lock stayed busy or the booking could not be written.
+ * Decides this call's round from the branch's ledger and records it, in one hold of the rounds
+ * lock: a call racing it, here or in another session, sees the round. Undefined when the branch
+ * has no commit to key it by (no round is kept); a string when the lock stayed busy.
  *
  * The slow git runs (size since the last sha) happen before the lock, against the last round as
  * read then; if another session added a round meanwhile, the lock is taken again and it is measured
@@ -1571,15 +1569,16 @@ async function bookRound(
   jobId: string,
   now: number,
   policy: RoundPolicy,
-  facts: Omit<RoundFacts, 'rounds' | 'head' | 'sinceLast' | 'now' | 'fullReviews'>,
+  facts: Omit<RoundFacts, 'rounds' | 'head' | 'sinceLast'>,
   fallback: ReviewTarget,
-): Promise<BookedPlan | string> {
+): Promise<(RoundPlan & { isUnrecorded?: true }) | string | undefined> {
   const head = await gitOut($, cwd, ['rev-parse', 'HEAD'])
   const commonDir = await gitOut($, cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
-  const key = head && commonDir ? branchKey(commonDir, (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD'])) ?? '') : undefined
+  if (!head || !commonDir) return undefined
+  const key = branchKey(commonDir, (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD'])) ?? '')
   const isIncremental = !facts.isPerson && facts.target === undefined && !facts.isFull
   const measureLast = async () => {
-    const last = key === undefined ? undefined : (await readLedgerLocked($, now)).ledger[key]?.at(-1) // the reconciled ledger, as the lock will see it
+    const last = (await readLedgerLocked($, now)).ledger[key]?.at(-1) // the reconciled ledger, as the lock will see it
     return last !== undefined && last.isCovering === true && isIncremental
       ? { sha: last.sha, since: await sinceSha($, cwd, last.sha) }
       : undefined
@@ -1587,38 +1586,29 @@ async function bookRound(
   let measured = await measureLast()
   try {
     for (let attempt = 1; ; attempt++) {
-      const booked = await withLock($, ROUNDS_LOCK, async (): Promise<BookedPlan | string | undefined> => {
-        const read = await readLedgerLocked($, now)
-        const { ledger, fulls } = read
-        const rounds = (key !== undefined ? ledger[key] : undefined) ?? []
+      const booked = await withLock($, ROUNDS_LOCK, async () => {
+        const { stored, ledger, pending } = await readLedgerLocked($, now)
+        const rounds = ledger[key] ?? []
         const last = rounds.at(-1)
         const isMeasured = measured !== undefined && measured.sha === last?.sha
         const needsMeasure = last !== undefined && last.isCovering === true && isIncremental
         if (needsMeasure && !isMeasured && attempt < MEASURE_ATTEMPTS) return undefined // the last round changed: measure again
-        const plan = planReviewRound(
-          { ...facts, rounds, head: head ?? '', sinceLast: isMeasured ? measured!.since : undefined, now, fullReviews: fulls },
-          policy,
-        )
+        const plan = planReviewRound({ ...facts, rounds, head, sinceLast: isMeasured ? measured!.since : undefined }, policy)
         if (!plan.isAllowed) {
-          await saveLedgerLocked($, read, ledger, fulls)
-          return { ...plan, isKept: false }
+          await saveLedgerLocked($, stored, ledger, pending)
+          return plan
         }
         const target = plan.target ?? fallback
         const base = target.args[0] === '--base' ? target.args[1]! : target.label
         const round = {
-          sha: head ?? '', base, model: plan.tier.model, jobId, at: now,
+          sha: head, base, model: plan.tier.model, jobId, at: now,
           isCovering: planCovers(plan, fallback),
           ...(facts.isPerson ? { isPerson: true } : {}),
         }
-        const isFull = isFullTier(plan.tier, policy)
-        const isRecorded = await saveLedgerLocked(
-          $, read, key !== undefined ? { ...ledger, [key]: [...rounds, round] } : ledger, isFull ? [...fulls, { at: now, jobId }] : fulls,
-        )
-        if (isRecorded) return { ...plan, isKept: key !== undefined }
-        // never fully recorded, so the caps could not count it: an agent waits, the person's review runs and says so.
-        // A half-written booking (the ledger but not the window, or the reverse) is dropped by the next ledger access.
-        await parkSettlement($, jobId)
-        return facts.isPerson ? { ...plan, isKept: false, isUnrecorded: true as const } : ROUNDS_UNRECORDED_TEXT
+        const isRecorded = await saveLedgerLocked($, stored, { ...ledger, [key]: [...rounds, round] }, pending)
+        if (isRecorded) return plan
+        // never recorded, so the cap could not count it: an agent waits, the person's review runs and says so
+        return facts.isPerson ? { ...plan, isUnrecorded: true as const } : ROUNDS_UNRECORDED_TEXT
       })
       if (booked !== undefined) return booked
       measured = await measureLast()
@@ -1629,47 +1619,34 @@ async function bookRound(
   }
 }
 
-type LedgerRead = Awaited<ReturnType<typeof readLedgerLocked>>
-
-/**
- * The ledger and the full-review window as stored, with the pending settlements applied (a dropped
- * job gives back its round and its slot). Only reads: safe with or without the rounds lock.
- */
+/** The ledger as stored, with the pending settlements applied. Only reads: safe with or without the rounds lock. */
 async function readLedgerLocked($: EngineInterface, now: number) {
   const stored = await storeGet($, ROUNDS_KEY)
-  const storedFulls = await storeGet($, FULL_REVIEWS_KEY)
   const pending: (PendingSettle & { key: string })[] = []
   for (const key of await $.store.keys().catch(() => [] as string[])) {
     if (!key.startsWith(SETTLE_PREFIX)) continue
     const p = parsePending(await storeGet($, key))
     if (p !== undefined) pending.push({ ...p, key })
   }
-  return {
-    stored,
-    storedFulls,
-    ledger: settledAll(parseLedger(stored, now), pending),
-    fulls: settledFulls(parseFullReviews(storedFulls, now), pending),
-    pending,
-  }
+  return { stored, ledger: settledAll(parseLedger(stored, now), pending), pending }
 }
 
 /**
- * Writes the ledger and the full-review window when they changed, then clears the pending settlements
- * they applied (call holding the rounds lock). A write that fails keeps them pending, for the next
- * ledger access to apply, and returns false: the caller's own changes are then only in memory (or
- * half written) and it must park them.
+ * Writes the ledger when it changed, then clears the pending settlements it applied (call holding
+ * the rounds lock). A write that fails keeps them pending, for the next ledger access to apply, and
+ * returns false: the caller's own changes are then only in memory and it must park them.
  */
 async function saveLedgerLocked(
   $: EngineInterface,
-  read: Pick<LedgerRead, 'stored' | 'storedFulls' | 'pending'>,
+  stored: unknown,
   ledger: RoundLedger,
-  fulls: readonly FullReview[],
+  pending: readonly { key: string }[],
 ): Promise<boolean> {
-  const write = async (key: string, value: unknown, stored: unknown) =>
-    JSON.stringify(value) === JSON.stringify(stored) || (await $.store.set(key, value).then(() => true, () => false))
-  if (!(await write(ROUNDS_KEY, ledger, read.stored))) return false
-  if (!(await write(FULL_REVIEWS_KEY, fulls, read.storedFulls ?? []))) return false
-  for (const p of read.pending) await $.store.delete(p.key).catch(() => undefined)
+  if (JSON.stringify(ledger) !== JSON.stringify(stored)) {
+    const isWritten = await $.store.set(ROUNDS_KEY, ledger).then(() => true, () => false)
+    if (!isWritten) return false
+  }
+  for (const p of pending) await $.store.delete(p.key).catch(() => undefined)
   return true
 }
 
@@ -1723,9 +1700,8 @@ async function settleRound($: EngineInterface, jobId: string, findings: string |
 }
 
 async function settleLocked($: EngineInterface, jobId: string, findings: string | undefined): Promise<void> {
-  const read = await readLedgerLocked($, Date.now())
-  const settlement = [{ jobId, findings, at: Date.now() }]
-  if (!(await saveLedgerLocked($, read, settledAll(read.ledger, settlement), settledFulls(read.fulls, settlement)))) {
+  const { stored, ledger, pending } = await readLedgerLocked($, Date.now())
+  if (!(await saveLedgerLocked($, stored, settledAll(ledger, [{ jobId, findings, at: Date.now() }]), pending))) {
     await parkSettlement($, jobId, findings)
   }
 }
@@ -1734,9 +1710,9 @@ async function settleLocked($: EngineInterface, jobId: string, findings: string 
 async function reconcileSettlements($: EngineInterface, interruptedJobIds: readonly string[]): Promise<void> {
   try {
     await withLock($, ROUNDS_LOCK, async () => {
-      const read = await readLedgerLocked($, Date.now())
+      const { stored, ledger, pending } = await readLedgerLocked($, Date.now())
       const dropped = interruptedJobIds.map(jobId => ({ jobId, at: Date.now() }))
-      if (!(await saveLedgerLocked($, read, settledAll(read.ledger, dropped), settledFulls(read.fulls, dropped)))) {
+      if (!(await saveLedgerLocked($, stored, settledAll(ledger, dropped), pending))) {
         for (const { jobId } of dropped) await parkSettlement($, jobId)
       }
     })

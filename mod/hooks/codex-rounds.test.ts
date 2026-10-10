@@ -2,8 +2,8 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { CODEX_DEFAULTS } from './codex'
 import {
-  CODEX_OUT_FALLBACK_TEXT, coversBranch, FINDINGS_MAX, FULL_WINDOW_MS, isUsageLimit, nextFullSlot, parseFullReviews, parseLedger,
-  planCovers, planReviewRound, ROUND_TTL_MS, roundTitle, settledFulls, settledLedger, shortstatLines, textLines,
+  CODEX_OUT_FALLBACK_TEXT, coversBranch, FINDINGS_MAX, isUsageLimit, parseLedger, planCovers, planReviewRound, ROUND_TTL_MS, roundTiers,
+  roundTitle, settledLedger, shortstatLines, textLines,
 } from './codex-rounds'
 import type { ReviewRound, RoundFacts } from './codex-rounds'
 
@@ -40,21 +40,36 @@ describe('codex review rounds', () => {
     )
   })
 
-  test('a rebase, a large diff, full: true or an explicit target make it a full review, still a round', () => {
-    const fullOn = (over: Partial<RoundFacts>) => planReviewRound(facts(over), policy) as { round: number; isRereview: boolean; tier: unknown; note?: string }
-    expect(fullOn({ sinceLast: { isAncestor: false, changedLines: 0 } })).toMatchObject({ round: 2, isRereview: false, tier: CODEX_DEFAULTS.review })
+  test('a rebase, a large diff or full: true make it a full review of the branch, still a round, on the re-review model', () => {
+    const fullOn = (over: Partial<RoundFacts>) => planReviewRound(facts(over), policy) as { round: number; isRereview: boolean; tier: unknown; note?: string; instructions?: string }
+    expect(fullOn({ sinceLast: { isAncestor: false, changedLines: 0 } })).toMatchObject({ round: 2, isRereview: false, tier: CODEX_DEFAULTS.rereview })
     expect(fullOn({ sinceLast: { isAncestor: false, changedLines: 0 } }).note).toContain('no longer an ancestor')
+    expect(fullOn({ sinceLast: { isAncestor: true, changedLines: 401 } })).toMatchObject({ isRereview: false, tier: CODEX_DEFAULTS.rereview })
     expect(fullOn({ sinceLast: { isAncestor: true, changedLines: 401 } }).note).toContain('401 lines changed')
-    expect(fullOn({ isFull: true })).toMatchObject({ isRereview: false, tier: CODEX_DEFAULTS.review })
-    expect(fullOn({ isFull: true, target: { args: ['--uncommitted'], label: 'uncommitted changes' } })).toMatchObject({ isRereview: false, tier: CODEX_DEFAULTS.review })
+    expect(fullOn({ isFull: true })).toMatchObject({ isRereview: false, tier: CODEX_DEFAULTS.rereview })
+    expect(fullOn({ isFull: true, target: { args: ['--uncommitted'], label: 'uncommitted changes' } })).toMatchObject({ isRereview: false, tier: CODEX_DEFAULTS.rereview })
+    // every later round, full or not, is given the earlier rounds' findings (not a resumed session)
+    expect(fullOn({ isFull: true, instructions: 'focus on auth' }).instructions).toContain('[P1] x.ts:3 off by one')
+    expect(fullOn({ isFull: true, instructions: 'focus on auth' }).instructions).toContain('focus on auth')
     expect(shortstatLines(' 3 files changed, 250 insertions(+), 151 deletions(-)')).toBe(401)
   })
 
-  test('a later round with an explicit target runs that target on the re-review model unless full', () => {
+  test('only the branch\'s first round runs on the review model; deep and the person\'s --model keep their model on every round', () => {
     const target = { args: ['--commit', B], label: `commit ${B}` }
     expect(planReviewRound(facts({ target }), policy)).toMatchObject({ isAllowed: true, round: 2, isRereview: false, tier: CODEX_DEFAULTS.rereview, target })
-    expect(planReviewRound(facts({ target, isFull: true }), policy)).toMatchObject({ tier: CODEX_DEFAULTS.review, target })
+    expect(planReviewRound(facts({ target }), policy)).toMatchObject({ instructions: expect.stringContaining('[P1] x.ts:3 off by one') })
     expect(planReviewRound(facts({ rounds: [], target }), policy)).toMatchObject({ round: 1, tier: CODEX_DEFAULTS.review })
+    // the person's typed /codex-review on a branch with rounds is a later round too
+    expect(planReviewRound(facts({ isPerson: true }), policy)).toMatchObject({ round: 2, isRereview: false, tier: CODEX_DEFAULTS.rereview })
+    const two = { review: CODEX_DEFAULTS.review, rereview: CODEX_DEFAULTS.rereview }
+    expect(roundTiers(two)).toEqual(two)
+    const deep = roundTiers({ ...two, deep: CODEX_DEFAULTS.deep })
+    for (const over of [{}, { isFull: true }, { sinceLast: { isAncestor: false, changedLines: 0 } }]) {
+      expect(planReviewRound(facts(over), { ...policy, ...deep })).toMatchObject({ tier: CODEX_DEFAULTS.deep })
+    }
+    const chosen = roundTiers({ ...two, model: 'gpt-6-nova' })
+    expect(planReviewRound(facts(), { ...policy, ...chosen })).toMatchObject({ isRereview: true, tier: { model: 'gpt-6-nova' } })
+    expect(planReviewRound(facts({ rounds: [] }), { ...policy, ...chosen })).toMatchObject({ tier: { model: 'gpt-6-nova' } })
   })
 
   test('only a round that covered the whole branch is a baseline; otherwise the next round is a full review (coverage)', () => {
@@ -68,7 +83,7 @@ describe('codex review rounds', () => {
     expect(planCovers({ isRereview: false }, vsMain)).toBe(true)
     // A --commit round at HEAD left the rest unreviewed: not a no-op, not a baseline.
     const partial = [{ ...round(A, '[P2] y'), isCovering: false }]
-    expect(planReviewRound(facts({ rounds: partial, head: A }), policy)).toMatchObject({ isAllowed: true, isRereview: false, tier: CODEX_DEFAULTS.review })
+    expect(planReviewRound(facts({ rounds: partial, head: A }), policy)).toMatchObject({ isAllowed: true, isRereview: false, tier: CODEX_DEFAULTS.rereview })
     const plan = planReviewRound(facts({ rounds: partial }), policy) as { isRereview: boolean; note: string }
     expect(plan.isRereview).toBe(false)
     expect(plan.note).toContain('did not review the whole branch')
@@ -86,7 +101,7 @@ describe('codex review rounds', () => {
     expect(refused.isAllowed).toBe(false)
     expect((refused as { reason: string }).reason).toContain('summarise the remaining findings for the person')
     expect((refused as { reason: string }).reason).toContain('/codex-review --force')
-    expect(planReviewRound(facts({ rounds: three, isPerson: true }), policy)).toMatchObject({ isAllowed: true, round: 4, tier: CODEX_DEFAULTS.review })
+    expect(planReviewRound(facts({ rounds: three, isPerson: true }), policy)).toMatchObject({ isAllowed: true, round: 4, tier: CODEX_DEFAULTS.rereview })
   })
 
   test('nothing new since the last round (same HEAD, clean tree) is refused; uncommitted changes are new', () => {
@@ -103,51 +118,6 @@ describe('codex review rounds', () => {
     const kept = settledLedger(ledger, `j-${B}`, 'x'.repeat(FINDINGS_MAX + 100))
     expect(kept.k![0]!.findings!.length).toBeLessThan(FINDINGS_MAX + 20)
     expect(settledLedger(ledger, `j-${B}`, undefined)).toEqual({})
-  })
-
-  const H = 3_600_000
-  const full = (jobId: string, at: number) => ({ jobId, at })
-  const tenIn5h = (now: number) => Array.from({ length: 10 }, (_, i) => full(`f${i}`, now - (4.5 - i * 0.4) * H)) // oldest 4.5 h ago
-
-  test('the full-review window counts the trailing 5 h only, prunes older ones, and gives a dropped job its slot back', () => {
-    const now = 100 * H
-    const stored = [full('old', now - FULL_WINDOW_MS), full('in', now - FULL_WINDOW_MS + 1), { jobId: 1 }, 'junk']
-    expect(parseFullReviews(stored, now).map(r => r.jobId)).toEqual(['in'])
-    expect(parseFullReviews(undefined, now)).toEqual([])
-    const fulls = [full('a', now), full('b', now)]
-    expect(settledFulls(fulls, [{ jobId: 'a' }, { jobId: 'b', findings: 'kept' }]).map(r => r.jobId)).toEqual(['b'])
-  })
-
-  test('the next slot frees when the oldest full review leaves the window (the cap-th newest, past the cap)', () => {
-    const now = 100 * H
-    const fulls = tenIn5h(now)
-    expect(nextFullSlot(fulls.slice(1), now, 10)).toBeUndefined() // 9 of 10
-    expect(nextFullSlot(fulls, now, 0)).toBeUndefined() // no cap
-    expect(nextFullSlot(fulls, now, 10)).toBe(now - 4.5 * H + FULL_WINDOW_MS)
-    expect(nextFullSlot(fulls, now, 8)).toBe(fulls[2]!.at + FULL_WINDOW_MS) // 10 in the window, cap 8: two must leave
-  })
-
-  test('at the full-review cap a full round is refused (agent, person, forced full) but a re-review runs on the re-review model', () => {
-    const now = 100 * H
-    const capped = { ...policy, maxFullReviews: 10 }
-    const at = (over: Partial<RoundFacts>) => planReviewRound(facts({ now, fullReviews: tenIn5h(now), ...over }), capped)
-    const iso = new Date(now - 4.5 * H + FULL_WINDOW_MS).toISOString()
-    for (const refused of [
-      at({ rounds: [], sinceLast: undefined }), // round 1: not downgraded to Luna
-      at({ isPerson: true }),
-      at({ isFull: true }),
-      at({ sinceLast: { isAncestor: false, changedLines: 0 } }), // rebase
-      at({ sinceLast: { isAncestor: true, changedLines: 401 } }), // size
-    ]) {
-      expect(refused.isAllowed).toBe(false)
-      expect((refused as { reason: string }).reason).toContain(`10 full reviews ran in the last 5 h`)
-      expect((refused as { reason: string }).reason).toContain(`next slot frees at ${iso}`)
-    }
-    expect(at({})).toMatchObject({ isAllowed: true, isRereview: true, tier: CODEX_DEFAULTS.rereview })
-    expect(at({ target: { args: ['--commit', B], label: 'c' } })).toMatchObject({ isAllowed: true, tier: CODEX_DEFAULTS.rereview })
-    // 9 in the window, or no cap: a full round runs
-    expect(planReviewRound(facts({ now, fullReviews: tenIn5h(now).slice(1), isFull: true }), capped).isAllowed).toBe(true)
-    expect(planReviewRound(facts({ now, fullReviews: tenIn5h(now), isFull: true }), { ...policy, maxFullReviews: 0 }).isAllowed).toBe(true)
   })
 
   test('a Codex usage / rate limit failure is matched case-insensitively; other failures are not', () => {
