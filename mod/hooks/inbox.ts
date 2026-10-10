@@ -37,15 +37,15 @@ export function routeLine(id: string, r: RouteDecision, task: string, at: number
   })
 }
 
-/** The finish line of a routed worker; undefined for an unrouted or still-live job. */
+/** The finish line of a routed worker; undefined for an unrouted or still-live job. A rejected one is not done. */
 export function finishedLine(job: Job): string | undefined {
   if (job.route === undefined || job.endedAt === undefined) return undefined
-  if (job.status !== 'done' && job.status !== 'failed') return undefined
+  if (job.status !== 'done' && job.status !== 'failed' && job.status !== 'rejected') return undefined
   return endLine(job.id, job.status, job.startedAt, job.endedAt, job.costUsd)
 }
 
 /** A finished line by id, for a worker job or an Agent call. */
-export function endLine(id: string, status: 'done' | 'failed', startedAt: number, endedAt: number, costUsd?: number): string {
+export function endLine(id: string, status: 'done' | 'rejected' | 'failed', startedAt: number, endedAt: number, costUsd?: number): string {
   return JSON.stringify({
     kind: 'finished',
     job: id,

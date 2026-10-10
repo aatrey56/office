@@ -4,8 +4,8 @@ import type { Effort, Job } from '../types'
 import { EFFORTS } from './router'
 import { projectSlug, SLUG_MAX } from './sessions'
 
-/** Kill handles of the jobs this module environment runs, by job id. */
-export const RUNNING = new Map<string, () => void>()
+/** Kill handles of the jobs this module environment runs, by job id: each resolves true once its worker is confirmed stopped. */
+export const RUNNING = new Map<string, () => Promise<boolean>>()
 
 export const TAIL_MAX = 2048
 export const RESULT_MAX = 64 * 1024
@@ -46,9 +46,9 @@ export function formatElapsed(ms: number): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
 }
 
-/** Running, or a --bg worker paused on a question: either still holds a slot. */
+/** Running, a --bg worker paused on a question, or a worker in its gate: each still holds a slot. */
 export function isLive(job: Pick<Job, 'status'>): boolean {
-  return job.status === 'running' || job.status === 'blocked'
+  return job.status === 'running' || job.status === 'blocked' || job.status === 'checking'
 }
 
 export function withJob(list: Job[], id: string, change: (job: Job) => Job): Job[] {
@@ -66,12 +66,15 @@ export function addJobTo(list: Job[], job: Job): Job[] {
   return next
 }
 
-/** The user-role meta row a finished job leaves for this session's model. */
+/** The user-role meta row a finished job leaves for this session's model; a gated worker's head carries the verdict. */
 export function deliveryText(job: Job, label: string): string {
+  const verdict = job.gate !== undefined ? ` · ${job.gate.head}` : ''
   const head =
     job.status === 'done'
-      ? `${label} finished: ${job.title} (job ${job.id})`
-      : `${label} FAILED: ${job.title} (job ${job.id})`
+      ? `${label} finished: ${job.title} (job ${job.id})${verdict}`
+      : job.status === 'rejected'
+        ? `${label} REJECTED: ${job.gate?.head ?? 'its checks failed'} · ${job.title} (job ${job.id})`
+        : `${label} FAILED: ${job.title} (job ${job.id})`
   const body = (job.result ?? lastLine(job.tail)) || '(no output)'
   return `${head}\n\n${capResult(body)}`
 }
@@ -300,12 +303,17 @@ export function capLockArgv(path: string, waitMs: number): string[] {
 }
 
 export function parseAgentsJson(text: string): BgAgent[] {
+  return parseAgentsListing(text) ?? []
+}
+
+/** `claude agents --json` output as a listing; undefined when it is not one (cut or malformed), so it proves nothing. */
+export function parseAgentsListing(text: string): BgAgent[] | undefined {
   try {
     const raw = JSON.parse(text) as unknown
-    if (!Array.isArray(raw)) return []
+    if (!Array.isArray(raw)) return undefined
     return raw.filter((a): a is BgAgent => typeof a === 'object' && a !== null && typeof (a as BgAgent).id === 'string')
   } catch {
-    return []
+    return undefined
   }
 }
 
@@ -325,10 +333,11 @@ export function transcriptPath(
   return { projects, prefix: `${slug.slice(0, SLUG_MAX)}-` }
 }
 
-/** A transcript's tail: the last assistant text (the result) and a progress tail. */
-export function readTranscript(text: string): { result?: string; tail: string } {
+/** A transcript's tail: the last assistant text (the result), a progress tail, and whether any assistant turn is there. */
+export function readTranscript(text: string): { result?: string; tail: string; hasTurn: boolean } {
   const lines: string[] = []
   let result: string | undefined
+  let hasTurn = false
   for (const line of text.split('\n')) {
     if (!line.trim().startsWith('{')) continue
     let o: { type?: string; message?: { content?: unknown } }
@@ -338,6 +347,7 @@ export function readTranscript(text: string): { result?: string; tail: string } 
       continue // the first line of a cut tail
     }
     if (o.type !== 'assistant') continue
+    hasTurn = true
     const content = o.message?.content
     if (!Array.isArray(content)) continue
     const texts: string[] = []
@@ -350,7 +360,7 @@ export function readTranscript(text: string): { result?: string; tail: string } 
       lines.push(result)
     }
   }
-  return { result, tail: lines.join('\n').slice(-TAIL_MAX) }
+  return { result, tail: lines.join('\n').slice(-TAIL_MAX), hasTurn }
 }
 
 /** `/spawn [--force] [--mode m] [--model x] [--effort e] [--] <task>`; --force starts past the budget's hard limit. */
@@ -405,7 +415,9 @@ export const SPAWN_TOOL = {
   description:
     'Start a background worker on a self-contained task: a `claude --bg` background session (default), a headless `claude -p` process, or a subagent. ' +
     'With no model, the office router picks the cheapest adequate model tier and effort (at most high). Returns a job id at once; ' +
-    'the worker result is appended to this conversation when it finishes (watch it in /jobs).',
+    'the worker result is appended to this conversation when it finishes (watch it in /jobs). ' +
+    'In a git repo the worker already runs on its own branch in its own worktree: never tell it to git switch, check out or create a branch; ' +
+    'name the branch with `branch` and start it from another commit with `base` instead.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -418,6 +430,17 @@ export const SPAWN_TOOL = {
         description: 'Omit to route (low/medium/high). xhigh/max only when the user explicitly asks.',
       },
       cwd: { type: 'string', description: 'Working directory (absolute); default the session cwd.' },
+      base: { type: 'string', description: "Commit or branch the worker's worktree starts from; default the current HEAD." },
+      branch: {
+        type: 'string',
+        description: "Name of the worker's branch; default office/<job>-<title>. Refused if it exists or is checked out elsewhere.",
+      },
+      deliverable: {
+        type: 'string',
+        enum: ['commit', 'report'],
+        description:
+          'commit (default): the result is commits on its branch, gated by .office/checks. report: a read-only task whose answer is its text; no commits is then fine.',
+      },
     },
     required: ['task'],
   },

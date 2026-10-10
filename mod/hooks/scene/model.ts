@@ -15,10 +15,10 @@ export function projectOf(cwd: string, roots: Record<string, string | null>): st
 // Registry status ('busy' | 'idle' | 'waiting' | 'blocked' | ...) or a job status, as a crew state.
 export function stateOf(status: string, role: CrewRole): CrewState {
   if (role === 'worker') {
-    if (status === 'running') return 'working'
+    if (status === 'running' || status === 'checking') return 'working'
     if (status === 'blocked') return 'needs-you'
     if (status === 'done') return 'reporting'
-    if (status === 'failed') return 'failed'
+    if (status === 'failed' || status === 'rejected') return 'failed'
     return 'idle'
   }
   if (status === 'busy') return 'working'

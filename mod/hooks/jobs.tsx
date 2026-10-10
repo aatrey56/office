@@ -1,11 +1,25 @@
 import { atom, read, update } from 'claude-code'
 import type { AgentSpawnInput, EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
-import type { BudgetCaps, Effort, EvalReport, Job, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
+import type { BudgetCaps, Deliverable, Effort, EvalReport, Job, RateWindow, RouteCase, RouteDecision, RouteOutcome } from '../types'
 import type { AgentDef, AgentPin } from './agentguard'
 import { agentGuard, agentRouteText, hardDeny, isManagerSession, needsRoute, parseAgentFile, pinOf } from './agentguard'
 import { budgetVerdict, DEFAULT_CAPS, isOpusTier, isSmallRoute, tierOfModelId } from './budget'
 import { formatSets, parseCases, scoreRoutes } from './evals'
+import {
+  CHECK_ENV,
+  checkArgv,
+  checksMode,
+  checksShowArgv,
+  gateReport,
+  gitVerdict,
+  isDeliverable,
+  isPassed,
+  OUTPUT_KEEP,
+  parseChecks,
+  shouldRerun,
+} from './gates'
+import type { CheckRun, GateResult, GitVerdict } from './gates'
 import { endLine, finishedLine, foldInbox, formatInbox, INBOX_FILE, routeLine, routedLine } from './inbox'
 import {
   CODEX_EXEC_TOOL,
@@ -68,7 +82,7 @@ import {
   liveReservations,
   newestBgSince,
   newJobId,
-  parseAgentsJson,
+  parseAgentsListing,
   parseBgId,
   parseBgIds,
   parseBgModels,
@@ -96,13 +110,24 @@ import type { BgAgent, Reservation, WorkerMode } from './spawn'
 import {
   addWorktreeArgv,
   branchName,
+  checkedOutIn,
   projectRootArgv,
+  refArgError,
   removeWorktreeArgv,
   repoRootFromCommonDir,
+  resolveBaseArgv,
+  WIP_MAX_BYTES,
+  wipAddArgv,
+  wipCandidatesArgv,
+  wipCommitArgv,
+  wipStagedArgv,
+  wipUnstageArgv,
   workerPreamble,
   worktreeDir,
   worktreeReport,
 } from './worktree'
+import { blockedVerdict, deadlineVerdict, isBgStopped, isStalled, nextGrowth, STOP_CONFIRM_MS, STOP_POLL_MS, timeoutText } from './watchdog'
+import type { Growth } from './watchdog'
 
 // Owner: jobs agent. Codex handoff, router, worker spawner, jobs pane.
 // codex.ts, router.ts, spawn.ts and worktree.ts hold the pure halves; every hook and
@@ -186,11 +211,30 @@ let bgPolling = false
 const BG_MISSES = new Map<string, number>()
 /** --bg jobs seen idle with a reply on consecutive polls: two in a row end the job. */
 const BG_IDLE = new Map<string, number>()
-/** Time a job spent blocked (its timeout is paused meanwhile), and when its current block began. */
+/** Time a job spent blocked (its timeout is paused meanwhile), and when its current block began, on $.clock. */
 const PAUSED_MS = new Map<string, number>()
 const BLOCKED_AT = new Map<string, number>()
 /** Max-runtime timers of running jobs, by job id. */
 const TIMERS = new Map<string, Timer>()
+/** When each job started, on $.clock: the clock its deadlines, blocks and stall checks are read on. */
+const CLOCK_START = new Map<string, number>()
+/** What the watchdog last saw of each job's transcript or output: when it last grew. */
+const GROWTH = new Map<string, Growth>()
+/** Jobs whose one extension past jobTimeoutMin is spent. */
+const EXTENDED = new Set<string>()
+/** Jobs already reported to the manager: blocked past blockedTimeoutMin (once per block), stalled before a first turn. */
+const BLOCK_REPORTED = new Set<string>()
+const STALL_REPORTED = new Set<string>()
+/** Jobs being ended past their time: stopped and their work committed before finishJob delivers them. */
+const ENDING = new Set<string>()
+/** A WIP commit runs the repo's hooks, which may run checks. */
+const WIP_COMMIT_TIMEOUT_MS = 120_000
+/** Workers in their gate, by job id: a kill sets isKilled and ends the check under way. */
+type GateRun = { isKilled: boolean; stop?: () => void }
+const GATES = new Map<string, GateRun>()
+/** $.store key: the gate's last verdict per branch, { branch: { sha, verdict, at } } (a merge guard reads it). */
+const GATES_KEY = 'gates'
+const GATES_KEPT = 200
 /** Whether the main loop is mid-turn (an appended row is then read at once). */
 let mainTurnRunning = false
 /** Agent calls the router sized in a manager session, awaiting their turn.complete: agentId → inbox id and start. */
@@ -215,6 +259,15 @@ function codexLine(line: string): LineEvent {
 }
 function describeRoute(d: RouteDecision): string {
   return `${d.model} (${MODEL_IDS[d.model]}) at ${d.effort} effort · confidence ${d.confidence.toFixed(2)} · ${d.backend} in ${d.latencyMs}ms · ${d.reason}`
+}
+/** The jobs pane's glyph and colour per status. */
+const STATUS_LOOK: Record<Job['status'], [string, string]> = {
+  running: ['●', 'yellow'],
+  blocked: ['?', 'magenta'],
+  checking: ['…', 'cyan'],
+  done: ['✓', 'green'],
+  rejected: ['⊘', '#ff8700'],
+  failed: ['✗', 'red'],
 }
 function labelOf(job: Job): string {
   return job.kind === 'codex-review' ? 'Codex review' : job.kind === 'codex-exec' ? 'Codex second opinion' : 'Worker'
@@ -343,7 +396,9 @@ export function installJobs(on: On, options: PluginOptions) {
     const task = str(input.task)
     if (!task) return { deny: 'spawn_worker needs a task.' }
     const mode: WorkerMode = isWorkerMode(input.mode) ? input.mode : 'bg'
-    const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT)
+    if (input.deliverable !== undefined && !isDeliverable(input.deliverable)) return { deny: 'deliverable is commit or report.' }
+    const want = { base: str(input.base), branch: str(input.branch), deliverable: input.deliverable }
+    const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT, want)
     const text = takeAlerts() + msg.text
     return msg.ok ? { result: text } : { deny: text }
   })
@@ -465,7 +520,7 @@ export function installJobs(on: On, options: PluginOptions) {
     const jobId = SUBAGENT_JOBS.get(agentId)
     if (jobId !== undefined) {
       const ok = e.reason === 'answer'
-      await finishJob($, jobId, ok ? 'done' : 'failed', e.answer || `worker ended: ${e.reason}`)
+      await finishJob($, options, jobId, ok ? 'done' : 'failed', e.answer || `worker ended: ${e.reason}`)
     }
     return next(e)
   })
@@ -494,9 +549,7 @@ export function installJobs(on: On, options: PluginOptions) {
           <Text dimColor>No jobs yet. /codex-review, /spawn, or the codex_review / spawn_worker tools start one.</Text>
         )}
         {jobs.slice(0, listRows).map(job => {
-          const glyph = job.status === 'running' ? '●' : job.status === 'blocked' ? '?' : job.status === 'done' ? '✓' : '✗'
-          const color =
-            job.status === 'running' ? 'yellow' : job.status === 'blocked' ? 'magenta' : job.status === 'done' ? 'green' : 'red'
+          const [glyph, color] = STATUS_LOOK[job.status]
           const elapsed = formatElapsed((job.endedAt ?? now) - job.startedAt)
           const me = [job.model?.replace(/^claude-/, ''), job.effort].filter(Boolean).join('/')
           const line = `${job.kind} ${job.title}${me ? ` · ${me}` : ''} · ${elapsed} · ${lastLine(job.result ?? job.tail)}`
@@ -515,7 +568,7 @@ export function installJobs(on: On, options: PluginOptions) {
             {selected.route && <Text dimColor>{clip(describeRoute(selected.route), cols)}</Text>}
             <Box flexDirection="row">
               {isLive(selected) && (
-                <Button key="kill" hotkey="k" onPress={() => void killJob($, selected.id, 'killed')}>
+                <Button key="kill" hotkey="k" onPress={() => void killJob($, options, selected.id, 'killed')}>
                   kill
                 </Button>
               )}
@@ -697,8 +750,18 @@ async function patchJob($: EngineInterface, id: string, change: (job: Job) => Jo
   await update($, JOBS, list => withJob(list, id, change))
 }
 
-/** Ends a running job once (a later finish is a no-op) and delivers it. */
-async function finishJob($: EngineInterface, id: string, status: 'done' | 'failed', result: string): Promise<void> {
+/**
+ * Ends a running job once (a later finish is a no-op) and delivers it. A worker with a worktree
+ * that says it is done is not delivered here: it goes to `checking`, and its gate ends it.
+ */
+async function finishJob($: EngineInterface, options: PluginOptions, id: string, status: 'done' | 'failed', result: string): Promise<void> {
+  // A job being ended past its time is delivered by endJob, once its work is committed.
+  if (ENDING.has(id)) return
+  const before = (await read($, JOBS)).find(j => j.id === id)
+  // A timeout that began while the jobs were read owns the job now (endJob delivers it).
+  if (ENDING.has(id)) return
+  // Only a kill ends a job in its gate; the gate itself ends it otherwise.
+  if (before?.status === 'checking' && status === 'done') return
   TIMERS.get(id)?.cancel()
   TIMERS.delete(id)
   RUNNING.delete(id)
@@ -707,13 +770,39 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
   BG_IDLE.delete(id)
   PAUSED_MS.delete(id)
   BLOCKED_AT.delete(id)
-  const before = (await read($, JOBS)).find(j => j.id === id)
+  CLOCK_START.delete(id)
+  GROWTH.delete(id)
+  EXTENDED.delete(id)
+  BLOCK_REPORTED.delete(id)
+  STALL_REPORTED.delete(id)
+  // A gate still checking is told it was ended, so it never ends the job a second time.
+  const gate = GATES.get(id)
+  if (gate !== undefined) {
+    gate.isKilled = true
+    gate.stop?.()
+  }
+  GATES.delete(id)
   if (before === undefined || !isLive(before)) return
   if (before.agentId !== undefined) SUBAGENT_JOBS.delete(before.agentId)
-  const endedAt = Date.now()
   const capped = capResult(withoutDoneMarker(result))
+  if (status === 'done' && isGated(before)) {
+    // Claimed before the await: a deadline firing meanwhile sees the gate and leaves the job to it.
+    const run = claimGate(id)
+    const checking = await update($, JOBS, jobs =>
+      withJob(jobs, id, j => (j.status === 'running' || j.status === 'blocked' ? { ...j, status: 'checking', result: capped } : j)),
+    )
+    if (checking.find(j => j.id === id)?.status === 'checking' && !run.isKilled) startGate($, options, id, run)
+    else if (GATES.get(id) === run) {
+      GATES.delete(id)
+      RUNNING.delete(id)
+    }
+    return
+  }
+  const endedAt = Date.now()
+  // Killed in its gate: the worker's own report, unchecked, follows why.
+  const text = (j: Job) => (j.status === 'checking' ? capResult(`${capped} during its checks.\n\nWorker's report (unchecked):\n${j.result ?? ''}`) : capped)
   const list = await update($, JOBS, jobs =>
-    withJob(jobs, id, j => (isLive(j) ? { ...j, status, endedAt, result: capped } : j)),
+    withJob(jobs, id, j => (isLive(j) ? { ...j, status, endedAt, result: text(j) } : j)),
   )
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
@@ -725,7 +814,7 @@ async function finishJob($: EngineInterface, id: string, status: 'done' | 'faile
 /** Appends the result for the model; wakes an idle session with a short prompt. */
 async function deliver($: EngineInterface, job: Job): Promise<void> {
   const label = labelOf(job)
-  const verb = job.status === 'done' ? 'finished' : 'failed'
+  const verb = job.status === 'done' ? 'finished' : job.status === 'rejected' ? 'rejected' : 'failed'
   $.ui.toast(`${label} ${verb}: ${job.title}`)
   await notifyModel($, job.id, deliveryText(job, label), `${label} ${job.id} ${verb}: see above.`)
 }
@@ -927,6 +1016,10 @@ async function takeCapLock($: EngineInterface, name = CAP_LOCK.name): Promise<((
   return undefined
 }
 
+/** Consecutive unreadable `claude agents` listings in bgView; a good one resets it. */
+let unreadableListings = 0
+const UNREADABLE_WARN_AT = 3
+
 /** Reads the stored --bg ids, then lists `claude agents`; ids it shows gone are pruned under the lock, when counting. */
 async function bgView($: EngineInterface, options: PluginOptions): Promise<BgView> {
   const before = parseBgIds(await storeGet($, BG_STORE_KEY))
@@ -935,7 +1028,16 @@ async function bgView($: EngineInterface, options: PluginOptions): Promise<BgVie
     .run([opt(options, 'claudePath', 'claude'), 'agents', '--json', '--all'], { timeoutMs: 20000 })
     .catch(() => undefined)
   if (listed === undefined || listed.exitCode !== 0) return { before }
-  return { before, agents: parseAgentsJson(listed.stdout) }
+  // A cut or malformed listing proves nothing: reading it as empty would prune every stored id.
+  const agents = listed.isStdoutTruncated ? undefined : parseAgentsListing(listed.stdout)
+  if (agents !== undefined) {
+    unreadableListings = 0
+    return { before, agents }
+  }
+  if (++unreadableListings % UNREADABLE_WARN_AT === 0) {
+    debugLog($, `office: WARNING ${UNREADABLE_WARN_AT} unreadable \`claude agents\` listings in a row; worker counts are not pruned and may be stale`)
+  }
+  return { before }
 }
 
 /**
@@ -1092,38 +1194,171 @@ async function registerBgLocked($: EngineInterface, slot: Slot, bgId: string, mo
   })
 }
 
-/** Kill (or timeout): stop the work and mark the job failed right away. */
-async function killJob($: EngineInterface, id: string, why: string): Promise<void> {
-  RUNNING.get(id)?.()
-  await finishJob($, id, 'failed', why)
+/** Kill: stop the work (or its gate's check) and mark the job failed right away. */
+async function killJob($: EngineInterface, options: PluginOptions, id: string, why: string): Promise<void> {
+  void RUNNING.get(id)?.()
+  await finishJob($, options, id, 'failed', why)
 }
 
-/** (Re)arms a job's max-runtime timer; time spent blocked does not count. */
-function startTimeout($: EngineInterface, options: PluginOptions, id: string, startedAt: number): void {
-  const minutes = num(options, 'jobTimeoutMin', 30)
-  const left = Math.max(1000, startedAt + (PAUSED_MS.get(id) ?? 0) + minutes * 60_000 - Date.now())
+/** jobTimeoutMin, and jobTimeoutHardMin (never below it): the deadline, and the one extension's. */
+function timeoutMins(options: PluginOptions): { softMin: number; hardMin: number } {
+  const softMin = num(options, 'jobTimeoutMin', 45)
+  return { softMin, hardMin: Math.max(softMin, num(options, 'jobTimeoutHardMin', 60)) }
+}
+
+/**
+ * (Re)arms a job's deadline: jobTimeoutMin of running time, jobTimeoutHardMin once extended; time
+ * spent blocked does not count. A job first armed here starts now (a reload sets CLOCK_START first).
+ */
+async function startTimeout($: EngineInterface, options: PluginOptions, id: string): Promise<void> {
+  const now = await clockNow($)
+  if (!CLOCK_START.has(id)) CLOCK_START.set(id, now)
+  const { softMin, hardMin } = timeoutMins(options)
+  const minutes = EXTENDED.has(id) ? hardMin : softMin
+  const left = Math.max(1000, (CLOCK_START.get(id) ?? now) + (PAUSED_MS.get(id) ?? 0) + minutes * 60_000 - now)
   TIMERS.get(id)?.cancel()
-  TIMERS.set(id, $.clock.after(left, () => void killJob($, id, `timed out after ${minutes} min (jobTimeoutMin)`)))
+  TIMERS.delete(id)
+  if (RUNNING.has(id) && !GATES.has(id)) TIMERS.set(id, $.clock.after(left, () => void onDeadline($, options, id)))
 }
 
-/** Registers a subagent job's kill handle, its answer route and its timeout. */
+/** At a running job's deadline: extend it once while its transcript still grows; otherwise end it. */
+async function onDeadline($: EngineInterface, options: PluginOptions, id: string): Promise<void> {
+  TIMERS.delete(id)
+  // Finished or gone to its gate (RUNNING then holds the gate's handle): no longer the deadline's.
+  const isOver = () => !RUNNING.has(id) || GATES.has(id)
+  const job = (await read($, JOBS)).find(j => j.id === id)
+  if (job?.status !== 'running' || isOver()) return // finished, or blocked (its unblock re-arms it)
+  const { softMin, hardMin } = timeoutMins(options)
+  const isExtended = EXTENDED.has(id)
+  const now = await clockNow($)
+  if (isOver()) return
+  const verdict = deadlineVerdict({ softMin, hardMin, isExtended, grewAt: GROWTH.get(id)?.at, now })
+  if (verdict === 'extend') {
+    EXTENDED.add(id)
+    await patchJob($, id, j => ({ ...j, isExtended: true }))
+    if (isOver()) return
+    $.ui.toast(`Job ${id} still active at ${softMin} min: extended to ${hardMin} min`)
+    await startTimeout($, options, id)
+    return
+  }
+  await endJob($, options, id, timeoutText(softMin, hardMin, isExtended), isExtended ? hardMin : softMin)
+}
+
+/**
+ * Ends a job past its time: stops its worker and waits until it is confirmed stopped, commits a
+ * dirty worktree's work on its branch as WIP, then fails it with `why` and what became of the work.
+ * A worker not confirmed stopped may still be writing: its work is left uncommitted. The worktree
+ * is kept for recovery: finishJob never removes a failed job's.
+ */
+async function endJob($: EngineInterface, options: PluginOptions, id: string, why: string, minutes: number): Promise<void> {
+  // Taken before the first await: pollBg starts it without waiting, and may come round again.
+  // A worker in its gate said it was done: no timeout ends it (only a kill, through finishJob).
+  if (ENDING.has(id) || GATES.has(id)) return
+  ENDING.add(id)
+  let saved = ''
+  let worktree: string | undefined
+  try {
+    const job = (await read($, JOBS)).find(j => j.id === id)
+    if (job === undefined || !isLive(job) || job.status === 'checking' || GATES.has(id)) return
+    worktree = job.worktree
+    const isStopped = (await RUNNING.get(id)?.()) ?? true
+    RUNNING.delete(id) // stopped (or given up on): it no longer counts toward maxWorkers
+    if (!isStopped) {
+      const where = job.worktree !== undefined ? `; its work was left uncommitted in ${job.worktree}` : ''
+      saved = `Could not confirm the worker stopped${where}. It may still be running: check it before reusing its branch.`
+    } else if (job.worktree !== undefined) saved = await commitWip($, job.worktree, minutes)
+  } catch (err) {
+    saved = `Its work was not committed (${String(err).slice(0, 200)}); the worktree is kept at ${worktree}.`
+  } finally {
+    ENDING.delete(id)
+  }
+  await finishJob($, options, id, 'failed', saved ? `${why}\n${saved}` : why)
+}
+
+/**
+ * Commits a stopped worker's uncommitted work on its branch as "WIP: timed out at N min (office)":
+ * all `add -A` takes but files over 5 MB (unstaged if the worker staged them: they stay in the
+ * worktree), the repo's hooks run (never --no-verify). Says what happened, for the job's result;
+ * '' when there was nothing to commit.
+ */
+async function commitWip($: EngineInterface, dir: string, minutes: number): Promise<string> {
+  const status = await git($, ['git', '-C', dir, 'status', '--porcelain'])
+  if (!status.isOk) return `Its work was not committed (git status: ${status.out}); the worktree is kept at ${dir}.`
+  if (status.out.trim() === '') return ''
+  const listed = await git($, wipCandidatesArgv(dir))
+  if (!listed.isOk) return `WIP commit not made (git ls-files: ${listed.out}); the uncommitted work is left in ${dir}.`
+  const staged = await git($, wipStagedArgv(dir))
+  if (!staged.isOk) return `WIP commit not made (git diff --cached: ${staged.out}); the uncommitted work is left in ${dir}.`
+  const skipped: string[] = []
+  for (const path of new Set(`${listed.out}\0${staged.out}`.split('\0').filter(Boolean))) {
+    // A link is committed as the link; a path gone (deleted) is committed as its deletion.
+    const size = await $.fs.stat(`${dir}/${path}`).then(st => (st.isLink ? 0 : st.size), () => 0)
+    if (size > WIP_MAX_BYTES) skipped.push(path)
+  }
+  const left = skipped.length > 0 ? ` Left out, over 5 MB (uncommitted in the worktree): ${skipped.join(', ')}.` : ''
+  if (skipped.length > 0) {
+    const unstaged = await git($, wipUnstageArgv(dir, skipped))
+    if (!unstaged.isOk) return `WIP commit not made (git reset: ${unstaged.out}); the uncommitted work is left in ${dir}.${left}`
+  }
+  const added = await git($, wipAddArgv(dir, skipped))
+  if (!added.isOk) return `WIP commit failed (git add: ${added.out}); the uncommitted work is left in ${dir}.`
+  const committed = await git($, wipCommitArgv(dir, minutes), WIP_COMMIT_TIMEOUT_MS)
+  if (!committed.isOk) return `WIP commit failed (git commit: ${committed.out.slice(0, 500)}); the uncommitted work is left in ${dir}.${left}`
+  return `Its uncommitted work was committed on its branch as "WIP: timed out at ${minutes} min (office)"; the worktree is kept for recovery.${left}`
+}
+
+/**
+ * Asks `isStopped` (given the time left, to bound its own query) until it says yes, for at most
+ * STOP_CONFIRM_MS on the clock, its queries included: whether a worker's stop is confirmed.
+ */
+async function confirmStopped($: EngineInterface, isStopped: (leftMs: number) => Promise<boolean>): Promise<boolean> {
+  const deadline = (await clockNow($)) + STOP_CONFIRM_MS
+  for (;;) {
+    const left = deadline - (await clockNow($))
+    if (left <= 0) return false
+    if (await isStopped(left).catch(() => false)) return true
+    const rest = deadline - (await clockNow($))
+    if (rest <= 0) return false
+    await $.clock.sleep(Math.min(STOP_POLL_MS, rest))
+  }
+}
+
+/** Registers a subagent job's kill handle (TaskStop, then its loop gone from $.agent.list), its answer route and its timeout. */
 function adoptSubagent($: EngineInterface, options: PluginOptions, job: Job, agentId: string): void {
   SUBAGENT_JOBS.set(agentId, job.id)
-  RUNNING.set(job.id, () => {
+  RUNNING.set(job.id, async () => {
     SUBAGENT_JOBS.delete(agentId)
-    void $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(() => undefined)
+    await $.tool.call({ tool: 'TaskStop', task_id: agentId }).catch(() => undefined)
+    return confirmStopped($, async () => {
+      const agent = (await $.agent.list()).find(a => a.id === agentId)
+      return agent === undefined || !['running', 'pending', 'waiting'].includes(agent.status)
+    })
   })
-  startTimeout($, options, job.id, job.startedAt)
+  void startTimeout($, options, job.id)
 }
 
-/** Registers a --bg job's kill handle (`claude stop`), its polling and its timeout. */
+/** `claude stop`, then the session ended in `claude agents`: whether the --bg session's stop is confirmed. */
+async function stopBg($: EngineInterface, options: PluginOptions, bgId: string): Promise<boolean> {
+  const bin = opt(options, 'claudePath', 'claude')
+  // A failed stop may mean the session already ended: the listing decides.
+  await $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
+  return confirmStopped($, async leftMs => {
+    const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: Math.min(20000, leftMs) })
+    // Only a whole listing is evidence: a cut or malformed one would read as "not listed", so stopped.
+    const agents = listed.exitCode === 0 && !listed.isStdoutTruncated ? parseAgentsListing(listed.stdout) : undefined
+    return agents !== undefined && isBgStopped(agents.find(a => a.id === bgId))
+  })
+}
+
+/** Registers a --bg job's kill handle (stopBg), its polling and its timeout. */
 function adoptBg($: EngineInterface, options: PluginOptions, job: Job, bgId: string): void {
   BG_JOBS.set(job.id, bgId)
-  RUNNING.set(job.id, () => {
+  RUNNING.set(job.id, async () => {
     BG_JOBS.delete(job.id)
-    void $.process.run([opt(options, 'claudePath', 'claude'), 'stop', bgId]).catch(() => undefined)
+    return stopBg($, options, bgId)
   })
-  startTimeout($, options, job.id, job.startedAt)
+  // A blocked job's deadline waits for its unblock, which re-arms it (pollBg).
+  if (job.status !== 'blocked') void startTimeout($, options, job.id)
 }
 
 /** One poll of every --bg job: state from `claude agents`, result from the transcript. */
@@ -1132,16 +1367,21 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
   try {
     const bin = opt(options, 'claudePath', 'claude')
     const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: 20000 }).catch(() => undefined)
-    if (listed === undefined || listed.exitCode !== 0) return
-    const agents = parseAgentsJson(listed.stdout)
+    if (listed === undefined || listed.exitCode !== 0 || listed.isStdoutTruncated) return
+    // A malformed listing would count every worker as gone.
+    const agents = parseAgentsListing(listed.stdout)
+    if (agents === undefined) return
     const jobs = await read($, JOBS)
     const configDir = await configDirOf($)
+    const now = await clockNow($)
+    const blockedMin = num(options, 'blockedTimeoutMin', 20)
     for (const [jobId, bgId] of [...BG_JOBS]) {
       const job = jobs.find(j => j.id === jobId)
       if (job === undefined || !isLive(job)) {
         BG_JOBS.delete(jobId)
         continue
       }
+      if (ENDING.has(jobId)) continue
       const agent = agents.find(a => a.id === bgId)
       if (agent === undefined) {
         const misses = (BG_MISSES.get(jobId) ?? 0) + 1
@@ -1152,38 +1392,69 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
           ? await bgSeen($, configDir, job.cwd, job.sessionId).catch(() => ({ tail: '' }) as Seen)
           : { tail: '' }
         if (hasDoneMarker(seen.result)) {
-          await finishJob($, jobId, 'done', seen.result ?? '')
+          await finishJob($, options, jobId, 'done', seen.result ?? '')
           continue
         }
         const last = seen.result ? `\nLast reply:\n${seen.result}` : ''
-        await finishJob($, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)${last}`)
+        await finishJob($, options, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)${last}`)
         continue
       }
       BG_MISSES.delete(jobId)
       const seen = agent.sessionId !== undefined
         ? await bgSeen($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
         : { tail: '' }
+      GROWTH.set(jobId, nextGrowth(GROWTH.get(jobId), seen.mark ?? '', now))
       const phase = bgPhase(agent.state, agent.status)
       const idlePolls = phase === 'idle' && seen.result !== undefined ? (BG_IDLE.get(jobId) ?? 0) + 1 : 0
       BG_IDLE.set(jobId, idlePolls)
       // The marker says the task is complete whatever the state (blocked, idle, even stopped).
       if (phase === 'done' || idlePolls >= 2 || hasDoneMarker(seen.result)) {
-        await finishJob($, jobId, 'done', seen.result ?? '(the session ended without a reply)')
-        // The conversation is kept; the idle ~300 MB process is not needed.
-        if (phase !== 'failed') void $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
+        await finishJob($, options, jobId, 'done', seen.result ?? '(the session ended without a reply)')
+        // The conversation is kept; the idle ~300 MB process is not needed. A gated worker's gate stops it first.
+        if (phase !== 'failed' && !isGated(job)) void $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
         continue
       }
       if (phase === 'failed') {
         const last = seen.result ? `\nLast reply:\n${seen.result}` : ''
-        await finishJob($, jobId, 'failed', `background session ${bgId} ended: ${agent.state}${last}`)
+        await finishJob($, options, jobId, 'failed', `background session ${bgId} ended: ${agent.state}${last}`)
         continue
+      }
+      const sinceStart = now - (CLOCK_START.get(jobId) ?? job.startedAt)
+      // Kept on the job: a later tail read may hold no turn (a big tool result pushed it out).
+      let hasReplied = job.hasReplied === true || seen.hasTurn === true
+      // The tail may miss a turn a big tool result pushed out between polls: look at the whole transcript first.
+      if (isStalled(sinceStart, hasReplied, STALL_REPORTED.has(jobId)) && agent.sessionId !== undefined) {
+        hasReplied = await bgHasTurn($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
+      }
+      if (hasReplied && job.hasReplied !== true) await patchJob($, jobId, j => ({ ...j, hasReplied: true }))
+      if (isStalled(sinceStart, hasReplied, STALL_REPORTED.has(jobId))) {
+        STALL_REPORTED.add(jobId)
+        const text = `Worker ${jobId} (${job.title}) has not replied ${formatElapsed(sinceStart)} after it started: no assistant turn in its transcript, so it may be stalled. Stop it (kill it in /jobs, or \`claude stop ${bgId}\`) and spawn it again.`
+        $.ui.toast(`Worker ${jobId} may be stalled: no reply yet`)
+        await notifyModel($, jobId, text, `Worker ${jobId} may be stalled: see above.`)
+      }
+      if (phase === 'blocked' && job.status === 'blocked') {
+        const since = BLOCKED_AT.get(jobId) ?? now
+        const blocked = blockedVerdict(now - since, blockedMin, BLOCK_REPORTED.has(jobId))
+        if (blocked === 'end') {
+          const why = `ended after ${formatElapsed(now - since)} waiting for approval or input (twice blockedTimeoutMin ${blockedMin})`
+          // Not awaited: confirming the stop takes up to STOP_CONFIRM_MS, and the other workers' polls go on.
+          void endJob($, options, jobId, why, Math.round(sinceStart / 60_000))
+          continue
+        }
+        if (blocked === 'report') {
+          BLOCK_REPORTED.add(jobId)
+          const text = `Worker ${jobId} (${job.title}) has waited ${formatElapsed(now - since)} for approval or input (blockedTimeoutMin ${blockedMin}): \`claude attach ${bgId}\` answers it. Still waiting at ${2 * blockedMin} min, it is ended and its work committed as WIP on its branch.`
+          $.ui.toast(`Worker ${jobId} blocked ${blockedMin}+ min: claude attach ${bgId}`)
+          await notifyModel($, jobId, text, `Worker ${jobId} is still blocked: see above.`)
+        }
       }
       if (phase === 'blocked' && job.status === 'running') {
         // Pause the timeout and tell the model once per block.
         TIMERS.get(jobId)?.cancel()
         TIMERS.delete(jobId)
-        BLOCKED_AT.set(jobId, Date.now())
-        await patchJob($, jobId, j => ({ ...j, status: 'blocked', tail: seen.tail || j.tail, sessionId: agent.sessionId ?? j.sessionId }))
+        BLOCKED_AT.set(jobId, now)
+        await patchJob($, jobId, j => ({ ...j, status: 'blocked', blockedAt: now, tail: seen.tail || j.tail, sessionId: agent.sessionId ?? j.sessionId }))
         const latest = seen.result ? `\n\nLatest reply:\n${seen.result}` : ''
         const text = `Worker ${jobId} (${job.title}) is waiting for input: \`claude attach ${bgId}\`${latest}`
         $.ui.toast(`Worker waiting for input: claude attach ${bgId}`)
@@ -1193,9 +1464,11 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       if ((phase === 'active' || phase === 'idle') && job.status === 'blocked') {
         const since = BLOCKED_AT.get(jobId)
         BLOCKED_AT.delete(jobId)
-        if (since !== undefined) PAUSED_MS.set(jobId, (PAUSED_MS.get(jobId) ?? 0) + Date.now() - since)
-        await patchJob($, jobId, j => ({ ...j, status: 'running' }))
-        startTimeout($, options, jobId, job.startedAt)
+        BLOCK_REPORTED.delete(jobId)
+        if (since !== undefined) PAUSED_MS.set(jobId, (PAUSED_MS.get(jobId) ?? 0) + now - since)
+        const pausedMs = PAUSED_MS.get(jobId)
+        await patchJob($, jobId, j => ({ ...j, status: 'running', pausedMs, blockedAt: undefined }))
+        await startTimeout($, options, jobId)
       }
       const tail = seen.tail.slice(-2048)
       if (tail && (tail !== job.tail || agent.sessionId !== job.sessionId)) {
@@ -1207,7 +1480,8 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
   }
 }
 
-type Seen = { result?: string; tail: string }
+/** `mark`: the transcript's last bytes, which change whenever it grows (it is only ever appended to). */
+type Seen = { result?: string; tail: string; hasTurn?: boolean; mark?: string }
 
 /** The latest reply and tail of a --bg session's transcript (empty when it cannot be read). */
 async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<Seen> {
@@ -1215,7 +1489,15 @@ async function bgSeen($: EngineInterface, configDir: string, cwd: string, sessio
   const t = path
     ? await $.process.run(['tail', '-c', '262144', path], { timeoutMs: 10000 }).catch(() => undefined)
     : undefined
-  return t !== undefined && t.exitCode === 0 ? readTranscript(t.stdout) : { tail: '' }
+  return t !== undefined && t.exitCode === 0 ? { ...readTranscript(t.stdout), mark: t.stdout.slice(-512) } : { tail: '' }
+}
+
+/** Whether a --bg session's transcript holds an assistant turn anywhere (grep stops at the first). */
+async function bgHasTurn($: EngineInterface, configDir: string, cwd: string, sessionId: string): Promise<boolean> {
+  const path = await bgTranscript($, configDir, cwd, sessionId)
+  if (path === undefined) return false
+  const found = await $.process.run(['grep', '-q', '-F', '"type":"assistant"', path], { timeoutMs: 10000 }).catch(() => undefined)
+  return found?.exitCode === 0
 }
 
 /** The transcript of a --bg session; a long (cut + hashed) slug is found by its prefix and the session's file. */
@@ -1241,17 +1523,29 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
     agents.filter(a => a.status === 'running' || a.status === 'pending' || a.status === 'waiting').map(a => a.id),
   )
   const dead = new Set<string>()
+  const now = await clockNow($)
   for (const job of stale) {
-    // A --bg session outlives this process; the poller settles a gone one.
-    if (job.bgId !== undefined) {
-      adoptBg($, options, job, job.bgId)
-      if (job.status === 'blocked') {
-        TIMERS.get(job.id)?.cancel()
-        TIMERS.delete(job.id)
-        BLOCKED_AT.set(job.id, Date.now())
-      }
+    // A worker that said done before the reload is checked again, from the start.
+    if (job.status === 'checking') {
+      startGate($, options, job.id)
+      continue
     }
-    else if (job.agentId !== undefined && live.has(job.agentId)) adoptSubagent($, options, job, job.agentId)
+    // A --bg session outlives this process; the poller settles a gone one.
+    // A re-adopted job's deadlines run from when it really started (outside tests $.clock is the host's),
+    // with the extension and blocked time its record kept.
+    const restore = () => {
+      CLOCK_START.set(job.id, job.startedAt)
+      if (job.isExtended === true) EXTENDED.add(job.id)
+      if (job.pausedMs !== undefined) PAUSED_MS.set(job.id, job.pausedMs)
+    }
+    if (job.bgId !== undefined) {
+      restore()
+      if (job.status === 'blocked') BLOCKED_AT.set(job.id, job.blockedAt ?? now)
+      adoptBg($, options, job, job.bgId)
+    } else if (job.agentId !== undefined && live.has(job.agentId)) {
+      restore()
+      adoptSubagent($, options, job, job.agentId)
+    }
     else dead.add(job.id)
   }
   if (dead.size === 0) return reconcileSettlements($, [])
@@ -1337,12 +1631,15 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   let exit: { code: number | null; signal: string | null } | undefined
   let startError: string | undefined
 
+  let isClosed = false // the loop over the child's output was left: the stream, and so the child, is ended
   const stream = $.process.spawn({ argv: plan.argv, cwd: plan.cwd, input: plan.input, env: WORKER_ENV })
-  RUNNING.set(jobId, () => {
+  RUNNING.set(jobId, async () => {
     killed = true
+    // Not awaited: a return() queued behind a pending read could wait on the child it ends.
     void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+    return confirmStopped($, async () => isClosed)
   })
-  startTimeout($, options, jobId, job.startedAt)
+  void startTimeout($, options, jobId)
 
   const take = (line: string) => {
     const ev = plan.parse(line)
@@ -1368,6 +1665,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
         const text = pending
         pending = ''
         lastFlush = Date.now()
+        GROWTH.set(jobId, { mark: '', at: await clockNow($) })
         await patchJob($, jobId, j => ({ ...j, tail: pushTail(j.tail, text) }))
       }
     }
@@ -1378,6 +1676,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   } catch (err) {
     if (!killed) startError = String(err)
   }
+  isClosed = true
   if (pending !== '') {
     const text = pending
     await patchJob($, jobId, j => ({ ...j, tail: pushTail(j.tail, text) }))
@@ -1423,7 +1722,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   if (plan.codexModel !== undefined && quotaText !== undefined) await markCodexOut($, plan.codexModel, quotaText)
   // Kept before delivery too, so the next round, asked for on reading this one, sees its findings.
   if (plan.isRound) await settleRound($, jobId, status === 'done' ? final : undefined)
-  await finishJob($, jobId, status, final)
+  await finishJob($, options, jobId, status, final)
   if (plan.codexModel !== undefined) void readCodexLimits($, plan.argv[0]!, plan.cwd)
 }
 
@@ -1862,6 +2161,7 @@ async function startWorker(
   effortArg: unknown,
   cwdArg: string | undefined,
   by: SpawnedBy,
+  want: Want = {},
 ): Promise<Started> {
   let ran: { load: Load; view: BgView }
   try {
@@ -1881,8 +2181,12 @@ async function startWorker(
   const atHard = budgetVerdict(windows, caps, { isSmall: false, isExplicit: false, isForced })
   if (!atHard.isAllowed && atHard.zone === 'hard') return { ok: false, text: `${atHard.reason}. /spawn --force (typed by the person) is the only override.` }
   const cwd = await resolveCwd($, cwdArg)
+  // A base or branch the caller named is checked before routing or holding a slot.
+  const placement = await checkPlacement($, options, cwd, want)
+  if (typeof placement === 'string') return { ok: false, text: placement }
   const now = Date.now()
   const routed = modelArg === undefined ? await route($, options, task) : undefined
+  const deliverable = isDeliverable(want.deliverable) ? want.deliverable : undefined
   const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet')
   const effort: Effort = isEffort(effortArg) ? effortArg : (routed?.effort ?? 'medium')
   // Refused, never quietly moved to a cheaper model (checked again with the slot reserved below).
@@ -1903,14 +2207,14 @@ async function startWorker(
   // A slow start (worktree, --bg, a listing) may outlast one reservation: it is renewed until settled.
   const renewal = renewSlot($, slot)
   try {
-    return await launchWorker($, options, slot, task, mode, { modelId, effort, routed, cwd, now, warning: verdict.warning })
+    return await launchWorker($, options, slot, task, mode, { modelId, effort, routed, cwd, now, warning: verdict.warning, placement, deliverable })
   } finally {
     renewal.cancel()
     await releaseSlot($, slot)
   }
 }
 
-type Launch = { modelId: string; effort: Effort; routed?: RouteDecision; cwd: string; now: number; warning?: string }
+type Launch = { modelId: string; effort: Effort; routed?: RouteDecision; cwd: string; now: number; warning?: string; placement: Placement; deliverable?: Deliverable }
 
 /** Starts a worker on a reserved slot; the slot is settled once the worker counts where it runs. */
 async function launchWorker(
@@ -1919,9 +2223,9 @@ async function launchWorker(
   slot: Slot,
   task: string,
   mode: WorkerMode,
-  { modelId, effort, routed, cwd, now, warning }: Launch,
+  { modelId, effort, routed, cwd, now, warning, placement, deliverable }: Launch,
 ): Promise<Started> {
-  const placed = await placeWorker($, options, task, {
+  const placed = await placeWorker($, options, task, placement, {
     id: slot.jobId,
     kind: 'worker',
     title: task.replace(/\s+/g, ' ').slice(0, 60),
@@ -1934,7 +2238,9 @@ async function launchWorker(
     mode,
     tail: '',
   })
-  const job = placed.job
+  if (placed.error !== undefined) return { ok: false, text: `Worker not started: ${placed.error}` }
+  // Gated on its worktree: commits are expected unless the caller said it reports.
+  const job: Job = placed.job.worktree !== undefined ? { ...placed.job, deliverable: deliverable ?? 'commit' } : placed.job
   const workerTask = withDoneRule(placed.task)
   const how = `${modelId} at ${effort} effort${routed ? ` (routed by ${routed.backend}: ${routed.reason})` : ''}${warning ? `. Budget: ${warning}` : ''}`
   const where = `in ${job.cwd}.${placed.note ? ` ${placed.note}` : ''}`
@@ -1974,7 +2280,8 @@ async function launchWorker(
     if (bgId === undefined && r.exitCode === 0) {
       // Started but printed no id we could read: the newest background session here.
       const listed = await $.process.run([claudeBin, 'agents', '--json', '--all'], { timeoutMs: 20000 }).catch(() => undefined)
-      bgId = listed?.exitCode === 0 ? newestBgSince(parseAgentsJson(listed.stdout), job.cwd, spawnedAt)?.id : undefined
+      const agents = listed?.exitCode === 0 && !listed.isStdoutTruncated ? parseAgentsListing(listed.stdout) : undefined
+      bgId = agents !== undefined ? newestBgSince(agents, job.cwd, spawnedAt)?.id : undefined
     }
     if (bgId === undefined) {
       const why = (r.stderr || r.stdout).trim() || `exit ${r.exitCode}`
@@ -2094,41 +2401,83 @@ async function agentDefs($: EngineInterface): Promise<{ defs: AgentDef[]; isComp
 
 // ── worker worktrees ($ halves; the argv and texts are in worktree.ts) ───
 
-async function git($: EngineInterface, argv: string[]): Promise<GitRun> {
+async function git($: EngineInterface, argv: string[], timeoutMs = 30000): Promise<GitRun> {
   const r = await $.process
-    .run(argv, { timeoutMs: 30000 })
+    .run(argv, { timeoutMs })
     .catch((err: unknown) => ({ exitCode: 1, stdout: '', stderr: String(err) }))
   return r.exitCode === 0 ? { isOk: true, out: r.stdout } : { isOk: false, out: (r.stderr || r.stdout).trim() || `exit ${r.exitCode}` }
+}
+
+/** The base commit and branch name a caller asked a worker's worktree for; unset parts take the defaults. */
+type Placement = { base?: string; branch?: string }
+/** What a spawn_worker call asks for beyond the task: the placement, and the deliverable (checked by startWorker). */
+type Want = Placement & { deliverable?: unknown }
+
+/**
+ * A base or branch the caller gave, checked: the base resolved to its commit, the branch a valid
+ * name nobody has (not an existing branch, not checked out in any worktree). A refusal is the text.
+ */
+async function checkPlacement($: EngineInterface, options: PluginOptions, cwd: string, want: Placement): Promise<Placement | string> {
+  if (want.base === undefined && want.branch === undefined) return {}
+  if (opt(options, 'workerWorktree', 'auto') === 'off') return 'base and branch need worker worktrees, and workerWorktree is off.'
+  const common = await git($, projectRootArgv(cwd))
+  const root = common.isOk ? repoRootFromCommonDir(common.out) : null
+  if (root === null) return `${cwd} is not in a git repository: base and branch need one.`
+  let base: string | undefined
+  if (want.base !== undefined) {
+    const bad = refArgError('base', want.base)
+    if (bad !== undefined) return bad
+    const sha = await git($, resolveBaseArgv(cwd, want.base))
+    if (!sha.isOk || sha.out.trim() === '') return `base "${want.base}" names no commit in ${cwd}.`
+    base = sha.out.trim()
+  }
+  const branch = want.branch
+  if (branch !== undefined) {
+    const bad = refArgError('branch', branch)
+    if (bad !== undefined) return bad
+    if (!(await git($, ['git', '-C', root, 'check-ref-format', '--branch', branch])).isOk) return `"${branch}" is not a valid branch name.`
+    const listed = await git($, ['git', '-C', root, 'worktree', 'list', '--porcelain'])
+    const where = listed.isOk ? checkedOutIn(listed.out, branch) : undefined
+    if (where !== undefined) return `Branch ${branch} is checked out in ${where}; pick another name.`
+    if ((await git($, ['git', '-C', root, 'show-ref', '--verify', '--quiet', `refs/heads/${branch}`])).isOk) {
+      return `Branch ${branch} already exists; pick another name, or omit branch for office/<job>-<title>.`
+    }
+  }
+  return { base, branch }
 }
 
 /**
  * Gives a worker started in a git repo its own branch in its own worktree:
  * the job then runs there and the task leads with the git rules. Outside a
  * repo, with workerWorktree off, or when a git step fails, it runs in the
- * cwd it was given; `note` says why for the start message.
+ * cwd it was given; `note` says why for the start message. A worker asked
+ * for a base or branch never falls back: `error` says why it cannot start.
  */
 async function placeWorker(
   $: EngineInterface,
   options: PluginOptions,
   task: string,
+  want: Placement,
   job: Job,
-): Promise<{ job: Job; task: string; note: string }> {
+): Promise<{ job: Job; task: string; note: string; error?: string }> {
   const here = { job, task, note: '' }
   if (opt(options, 'workerWorktree', 'auto') === 'off') return here
   const common = await git($, projectRootArgv(job.cwd))
   const root = common.isOk ? repoRootFromCommonDir(common.out) : null
   if (root === null) return here
-  const fallback = (why: string) => ({ ...here, note: `No worktree of its own (${why}): it shares this checkout.` })
+  // A worker asked for a base or branch never shares the checkout: it is not started.
+  const isAsked = want.base !== undefined || want.branch !== undefined
+  const fallback = (why: string) => (isAsked ? { ...here, error: why } : { ...here, note: `No worktree of its own (${why}): it shares this checkout.` })
   // From the commit the caller is on: a manager in a linked worktree hands out its own branch.
-  const head = await git($, ['git', '-C', job.cwd, 'rev-parse', 'HEAD'])
+  const head = want.base !== undefined ? { isOk: true, out: want.base } : await git($, ['git', '-C', job.cwd, 'rev-parse', 'HEAD'])
   if (!head.isOk) return fallback(`git rev-parse HEAD: ${head.out}`)
   const base = head.out.trim()
   const dir = worktreeDir(await configDirOf($), root, job.id)
-  const branch = branchName(job.id, job.title)
+  const branch = want.branch ?? branchName(job.id, job.title)
   const added = await git($, addWorktreeArgv(root, dir, branch, base))
   if (!added.isOk) {
-    // `add -b` may have made the branch before failing; its name holds the new job id, so it is ours.
-    await git($, ['git', '-C', root, 'branch', '-d', branch])
+    // `add -b` may have made the branch before failing; a default name holds the new job id, so it is ours.
+    if (want.branch === undefined) await git($, ['git', '-C', root, 'branch', '-d', branch])
     return fallback(`git worktree add: ${added.out}`)
   }
   const status = await git($, ['git', '-C', job.cwd, 'status', '--porcelain'])
@@ -2188,5 +2537,182 @@ async function settleWorktree($: EngineInterface, job: Job, canRemove: boolean):
   } catch (err) {
     $.ui.log(`office: worktree report for job ${job.id} failed: ${String(err)}`, { to: 'debug' })
     return job
+  }
+}
+
+// ── worker gates ($ halves; the rules and texts are in gates.ts) ─────────
+
+/** A worker the gate checks: one with its own worktree, branch and base commit. */
+function isGated(job: Job): boolean {
+  return job.kind === 'worker' && job.worktree !== undefined && job.project !== undefined && job.branch !== undefined && job.baseRef !== undefined
+}
+
+/**
+ * Runs a `checking` worker's gate off the caller's path (pollBg awaits finishJob, and checks take
+ * minutes). The job holds its slot in RUNNING meanwhile, and a kill there ends the check under way.
+ */
+function startGate($: EngineInterface, options: PluginOptions, id: string, run = claimGate(id)): void {
+  $.clock.after(0, () => void gateWorker($, options, id, run))
+}
+
+/** Makes the job its gate's, synchronously: GATES says so (no timeout ends it), and RUNNING holds the gate's kill. */
+function claimGate(id: string): GateRun {
+  const run: GateRun = { isKilled: false }
+  GATES.set(id, run)
+  RUNNING.set(id, async () => {
+    run.isKilled = true
+    run.stop?.()
+    return true
+  })
+  return run
+}
+
+/**
+ * The gate's verdict ends the job: done (its worktree removed when clean and not red) or rejected (kept).
+ * A --bg worker not confirmed stopped is never checked or accepted: failed, its worktree kept. Never twice.
+ */
+async function gateWorker($: EngineInterface, options: PluginOptions, id: string, run: GateRun): Promise<void> {
+  const job = (await read($, JOBS)).find(j => j.id === id)
+  if (job?.status !== 'checking' || run.isKilled) return
+  // Nothing may write in the worktree while it is checked, and a live worker's worktree is never
+  // removed: a --bg worker is stopped first, whatever workerChecks says (pollBg leaves it to the gate).
+  if (job.bgId !== undefined && !(await stopBg($, options, job.bgId))) {
+    if (run.isKilled) return
+    const why = `Could not confirm the worker stopped: its result was not checked or accepted, and its worktree is kept at ${job.worktree}. It may still be running: check it before reusing its branch.`
+    await endGate($, id, run, { status: 'failed', block: why, canRemove: false })
+    return
+  }
+  if (run.isKilled) return
+  let gate: { report: GateResult; sha?: string }
+  try {
+    gate = await checkWorker($, options, job, run)
+  } catch (err) {
+    // The gate's own failure is the one case that fails open: UNVERIFIED, never a pass.
+    const opts = { mode: checksMode(options.workerChecks), budgetSec: 0, timeoutMin: 0, runs: [] }
+    gate = { report: gateReport({ ...opts, error: String(err).slice(0, 200) }) }
+  }
+  if (run.isKilled) return
+  const { report, sha } = gate
+  const status = report.isRejected ? 'rejected' : 'done'
+  // A red branch keeps its worktree, enforced or not: someone will look at it.
+  const canRemove = status === 'done' && report.verdict !== 'fail'
+  await endGate($, id, run, { status, block: report.block, canRemove, gate: { verdict: report.verdict, head: report.head, ...(sha !== undefined ? { sha } : {}) } })
+}
+
+/** Ends a `checking` job with the gate's outcome, once, and delivers it; `block` leads the worker's report. */
+async function endGate(
+  $: EngineInterface,
+  id: string,
+  run: GateRun,
+  end: { status: 'done' | 'rejected' | 'failed'; block: string; canRemove: boolean; gate?: NonNullable<Job['gate']> },
+): Promise<void> {
+  if (GATES.get(id) === run) {
+    GATES.delete(id)
+    RUNNING.delete(id)
+  }
+  const { status, block, canRemove, gate } = end
+  const endedAt = Date.now()
+  const report = status === 'failed' ? "Worker's report (unchecked)" : "Worker's report"
+  const list = await update($, JOBS, jobs =>
+    withJob(jobs, id, j =>
+      j.status === 'checking'
+        ? { ...j, status, endedAt, ...(gate !== undefined ? { gate } : {}), result: capResult(`${block}\n\n${report}:\n${j.result ?? ''}`) }
+        : j,
+    ),
+  )
+  const finished = list.find(j => j.id === id)
+  if (finished === undefined || finished.endedAt !== endedAt) return
+  logInbox($, finishedLine(finished))
+  if (gate?.sha !== undefined && finished.branch !== undefined) await recordGate($, finished.branch, gate.sha, gate.verdict, endedAt)
+  await deliver($, await settleWorktree($, finished, canRemove))
+}
+
+/** Git first (clean, on its branch, commits), then each line of the base commit's .office/checks, a red one re-run once. */
+async function checkWorker($: EngineInterface, options: PluginOptions, job: Job, run: GateRun): Promise<{ report: GateResult; sha?: string }> {
+  const mode = checksMode(options.workerChecks)
+  const timeoutMin = num(options, 'checkTimeoutMin', 10)
+  const opts = { mode, budgetSec: num(options, 'checkBudgetSec', 120), timeoutMin, base: job.baseRef, runs: [] as CheckRun[] }
+  const { project: root, worktree: dir, branch, baseRef: base } = job
+  if (root === undefined || dir === undefined || branch === undefined || base === undefined) throw new Error('no worktree')
+  if (mode === 'off') return { report: gateReport(opts) }
+  // Commits are counted to the worktree's HEAD: a branch the worker renamed leaves no job ref to count to.
+  const [status, head, count, tip] = await Promise.all([
+    git($, ['git', '-C', dir, 'status', '--porcelain']),
+    git($, ['git', '-C', dir, 'branch', '--show-current']),
+    git($, ['git', '-C', dir, 'rev-list', '--count', `${base}..HEAD`]),
+    git($, ['git', '-C', dir, 'rev-parse', 'HEAD']),
+  ])
+  const sha = tip.isOk ? tip.out.trim() : undefined
+  const facts = { branch, commits: 0, deliverable: job.deliverable ?? 'commit' }
+  // A dirty tree or a HEAD off its branch that git did show is a verdict, whatever else git failed at.
+  const isDirty = status.isOk && status.out.trim() !== ''
+  const headBranch = head.isOk ? head.out.trim() : undefined
+  if (isDirty || (headBranch !== undefined && headBranch !== branch)) {
+    return { report: gateReport({ ...opts, git: gitVerdict({ ...facts, isDirty, headBranch: headBranch ?? '' }) }), sha }
+  }
+  for (const [what, r] of [['status', status], ['branch', head], ['rev-list', count]] as const) {
+    if (!r.isOk) throw new Error(`git ${what}: ${r.out.slice(0, 160)}`)
+  }
+  const git1: GitVerdict = gitVerdict({ ...facts, isDirty, headBranch: branch, commits: Number.parseInt(count.out.trim(), 10) || 0 })
+  if (git1.verdict !== 'ok') return { report: gateReport({ ...opts, git: git1 }), sha }
+  // From the base commit, never the worktree: a worker cannot edit its own gate.
+  const shown = await git($, checksShowArgv(root, base))
+  const checks = shown.isOk ? parseChecks(shown.out) : undefined
+  for (const line of checks ?? []) {
+    if (run.isKilled) break
+    let r = await runCheck($, run, line, dir, timeoutMin * 60_000)
+    if (shouldRerun(r) && !run.isKilled) r = { ...r, rerun: await runCheck($, run, line, dir, timeoutMin * 60_000) }
+    opts.runs.push(r)
+    if (!isPassed(r)) break
+  }
+  return { report: gateReport({ ...opts, git: git1, checks }), sha }
+}
+
+/** One check line, `sh -c` in the worktree, to its end, its timeout or a kill (both end the child). */
+async function runCheck($: EngineInterface, run: GateRun, line: string, dir: string, timeoutMs: number): Promise<CheckRun> {
+  const t0 = await clockNow($)
+  let output = ''
+  let isTimedOut = false
+  let isEnded = false
+  let exitCode: number | null = null
+  // Killed while the clock was read: never started (and the gate never delivers after a kill).
+  if (run.isKilled) return { cmd: line, exitCode, isTimedOut, ms: 0, output }
+  // No await from here to run.stop: a kill always finds the child it must end.
+  const stream = $.process.spawn({ argv: checkArgv(line), cwd: dir, env: CHECK_ENV })
+  const end = () => {
+    if (isEnded) return
+    isEnded = true
+    // Not awaited: a return() queued behind a pending read could wait on the child it ends.
+    void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+  }
+  run.stop = end
+  const timer = $.clock.after(timeoutMs, () => {
+    isTimedOut = true
+    end()
+  })
+  try {
+    for await (const chunk of stream) {
+      output = (output + chunk.text).slice(-OUTPUT_KEEP)
+      if (isEnded) break
+    }
+    if (!isEnded) exitCode = (await stream.result).code
+  } catch (err) {
+    output = `${output}\n${String(err)}`.slice(-OUTPUT_KEEP)
+  } finally {
+    timer.cancel()
+    if (run.stop === end) run.stop = undefined
+  }
+  return { cmd: line, exitCode, isTimedOut, ms: (await clockNow($)) - t0, output }
+}
+
+/** Keeps the branch's verdict at its tip in $.store; best effort. */
+async function recordGate($: EngineInterface, branch: string, sha: string, verdict: string, at: number): Promise<void> {
+  try {
+    const stored = await storeGet($, GATES_KEY)
+    const old = typeof stored === 'object' && stored !== null && !Array.isArray(stored) ? (stored as Record<string, unknown>) : {}
+    const kept = Object.entries(old).filter(([b]) => b !== branch).slice(-(GATES_KEPT - 1))
+    await $.store.set(GATES_KEY, Object.fromEntries([...kept, [branch, { sha, verdict, at }]]))
+  } catch (err) {
+    debugLog($, `office: gate of ${branch} not recorded: ${String(err)}`)
   }
 }

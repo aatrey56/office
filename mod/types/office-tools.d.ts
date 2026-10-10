@@ -37,6 +37,8 @@ declare module 'claude-code' {
       model?: string
       effort?: "low" | "medium" | "high" | "xhigh" | "max"
       cwd?: string
+      base?: string
+      branch?: string
     }
     mcp__office__route_task: {
       task: string

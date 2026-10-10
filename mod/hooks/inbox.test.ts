@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { foldInbox } from './inbox'
+import { finishedLine, foldInbox } from './inbox'
 
 const RUN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 const OPTIONS = { options: { routerBackend: 'rules', workerWorktree: 'off' } }
@@ -74,6 +74,13 @@ describe('routing inbox', () => {
     await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', cwd: '/r' })
     await clock.settle()
     expect(inbox()).toHaveLength(0)
+  })
+
+  test('a rejected worker is logged rejected, never done; one still in its gate logs nothing', () => {
+    const route = { model: 'sonnet' as const, effort: 'low' as const, confidence: 0.6, reason: 'x', backend: 'rules' as const, latencyMs: 1 }
+    const job = { id: 'a1', kind: 'worker' as const, title: 't', cwd: '/r', startedAt: 0, endedAt: 60_000, tail: '', route }
+    expect(JSON.parse(finishedLine({ ...job, status: 'rejected' }) ?? '{}')).toMatchObject({ kind: 'finished', job: 'a1', status: 'rejected' })
+    expect(finishedLine({ ...job, status: 'checking' })).toBeUndefined()
   })
 
   test('the fold joins by job id and counts a task already in the labels as labelled', () => {

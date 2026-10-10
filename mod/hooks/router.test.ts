@@ -189,7 +189,7 @@ describe('--bg workers', () => {
       '{"type":"assistant","message":{"content":[{"type":"text","text":"OK"}]}}',
       '{"type":"system","subtype":"turn_duration"}',
     ].join('\n')
-    expect(readTranscript(jsonl)).toEqual({ result: 'OK', tail: '[tool Read]\nOK' })
+    expect(readTranscript(jsonl)).toEqual({ result: 'OK', tail: '[tool Read]\nOK', hasTurn: true })
   })
   test('a finished worker left at state working, status idle reads as idle (regression, 2026-10-05)', () => {
     expect(bgPhase('working', 'idle')).toBe('idle')
