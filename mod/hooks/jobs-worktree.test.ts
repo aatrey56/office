@@ -649,6 +649,15 @@ describe('the worker gate', () => {
     expect(checksRun(runs)).toEqual(['tsc', 'npm test'])
     expect(removed(runs)).toBe(false)
   })
+
+  test('with workerChecks off the --bg worker is still stopped before its worktree is removed (regression)', { options: { workerChecks: 'off' } }, async ($, on) => {
+    const { runs, text } = await finish($, on, { checksFile: CHECKS })
+    expect(text()).toContain('· UNVERIFIED: workerChecks is off')
+    const at = (pred: (a: string[]) => boolean) => runs.findIndex(r => pred(r.argv))
+    expect(at(a => a.join(' ').endsWith('stop 5ac0f0df'))).toBeGreaterThan(-1)
+    expect(at(a => a.join(' ').endsWith('stop 5ac0f0df'))).toBeLessThan(at(a => a.includes('worktree') && a.includes('remove')))
+    expect(checksRun(runs)).toEqual([])
+  })
 })
 
 describe('maxOpusWorkers', () => {

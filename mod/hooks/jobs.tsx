@@ -2277,11 +2277,12 @@ async function checkWorker($: EngineInterface, options: PluginOptions, job: Job,
   const opts = { mode, budgetSec: num(options, 'checkBudgetSec', 120), timeoutMin, base: job.baseRef, runs: [] as CheckRun[] }
   const { project: root, worktree: dir, branch, baseRef: base } = job
   if (root === undefined || dir === undefined || branch === undefined || base === undefined) throw new Error('no worktree')
-  if (mode === 'off') return { report: gateReport(opts) }
-  // Nothing may write in the worktree while it is checked: a --bg worker is stopped first.
+  // Nothing may write in the worktree while it is checked, and a live worker's worktree is never
+  // removed: a --bg worker is stopped first, whatever workerChecks says (pollBg leaves it to the gate).
   if (job.bgId !== undefined) {
     await $.process.run([opt(options, 'claudePath', 'claude'), 'stop', job.bgId], { timeoutMs: 20000 }).catch(() => undefined)
   }
+  if (mode === 'off') return { report: gateReport(opts) }
   const [status, head, count, tip] = await Promise.all([
     git($, ['git', '-C', dir, 'status', '--porcelain']),
     git($, ['git', '-C', dir, 'branch', '--show-current']),
