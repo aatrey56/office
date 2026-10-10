@@ -63,6 +63,30 @@
       "description": "Scarce model used only by /codex-review --deep or deep: true (effort high); never chosen automatically.",
       "default": "gpt-6-astra"
     },
+    "codexRereviewModel": {
+      "type": "string",
+      "title": "Codex re-review model",
+      "description": "Model for an agent's later codex_review rounds, which check the changes since the last reviewed commit (effort medium).",
+      "default": "gpt-6-luna"
+    },
+    "codexRereviewMaxLines": {
+      "type": "number",
+      "title": "Codex re-review: max changed lines",
+      "description": "More lines changed than this since the last reviewed commit makes an agent's next round a full review on the review model.",
+      "default": 400
+    },
+    "codexMaxRounds": {
+      "type": "number",
+      "title": "Codex review rounds per branch",
+      "description": "Reviews an agent may start on one branch, the first included; then codex_review is refused. Your own /codex-review is never refused, and counts.",
+      "default": 3
+    },
+    "usageAlertPct": {
+      "type": "number",
+      "title": "Usage alert percent",
+      "description": "Alert you once when your Claude or Codex 5-hour or weekly usage window reaches this percent (a toast, repeated to the manager on its next session_usage, spawn_worker or codex_review result). Once per window, across all sessions. 0 = off.",
+      "default": 90
+    },
     "claudePath": {
       "type": "string",
       "title": "claude executable",

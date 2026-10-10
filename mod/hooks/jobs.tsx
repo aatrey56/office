@@ -47,6 +47,11 @@ import {
 } from './codex-budget'
 import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
 import {
+  branchKey, CODEX_OUT_FALLBACK_TEXT, isUsageLimit, parseLedger, parsePending, planCovers, planReviewRound, roundOf, roundTiers,
+  roundTitle, settledAll, SETTLE_PREFIX, shortstatLines, textLines, UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
+} from './codex-rounds'
+import type { PendingSettle, RoundFacts, RoundLedger, RoundPlan, RoundPolicy } from './codex-rounds'
+import {
   CLAUDE_SYSTEM,
   claudePrompt,
   isEffort,
@@ -58,6 +63,7 @@ import {
   rulesRoute,
 } from './router'
 import type { Routed } from './router'
+import { alertKeysSeen, alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
 import {
   addJobTo,
   bgArgv,
@@ -169,6 +175,15 @@ const CAP_LOCK_TIMEOUT_CODE = 1
 const CODEX_LIMITS_KEY = 'codexLimits'
 const CODEX_OUT_KEY = 'codexOut'
 const CODEX_LIMITS_TIMEOUT_MS = 6000
+/** $.store key: the Codex review rounds per branch (codex-rounds.ts), shared by every session. */
+const ROUNDS_KEY = 'codexRounds'
+/** How many times a review's settlement waits out a busy ledger lock before it is kept as a pending record. */
+const SETTLE_ATTEMPTS = 3
+const SETTLE_BACKOFF_MS = 2000
+/** How many times a booking measures the diff again when another session added a round meanwhile. */
+const MEASURE_ATTEMPTS = 3
+const ROUNDS_BUSY_TEXT = 'office review ledger lock busy; try again in a moment.'
+const ROUNDS_UNRECORDED_TEXT = 'office could not record the review round; try again in a moment.'
 /** $.store key manage.tsx keeps: project root → its manager session. */
 const MANAGERS_KEY = 'managers'
 
@@ -182,6 +197,7 @@ type RunPlan = {
   parse: (line: string) => LineEvent
   outFile?: string
   codexModel?: string // set for codex runs: names the model in a quota failure
+  isRound?: boolean // a review recorded in the rounds ledger: settled when the job ends
 }
 type Started = { ok: boolean; text: string }
 type GitRun = { isOk: boolean; out: string } // out: stdout, or why it failed
@@ -344,12 +360,27 @@ export function installJobs(on: On, options: PluginOptions) {
     return spawned
   })
 
+  // The engine pushes the account's limits as a window moves a whole point: Claude's alert needs no poll.
+  on('session.measure', async ($, e, next) => {
+    if (e.changed.includes('rateLimits')) await alertUsage($, options, 'Claude', e.rateLimits)
+    return next(e)
+  })
+
   // ── tools ───────────────────────────────────────────────────────────────
   on('tool.call', { tool: 'mcp__office__codex_review' }, async ($, e) => {
     const input = e as unknown as Input
     const deep = input.deep === true
-    const msg = await startCodexReview($, options, str(input.target), str(input.instructions), str(input.cwd), deep, BY_AGENT_CODEX)
-    return msg.ok ? { result: msg.text } : { deny: msg.text }
+    const ask = { ...BY_AGENT_CODEX, isFull: input.full === true }
+    const msg = await startCodexReview($, options, str(input.target), str(input.instructions), str(input.cwd), deep, ask)
+    const text = takeAlerts() + msg.text
+    return msg.ok ? { result: text } : { deny: text }
+  })
+
+  // session_usage reads the account's limits anyway: the same read checks them for the alert.
+  on('tool.call', { tool: 'mcp__office__session_usage' }, async $ => {
+    const { startedAt, context, rateLimits, cost } = await $.session.usage()
+    await alertUsage($, options, 'Claude', rateLimits)
+    return { result: takeAlerts() + JSON.stringify({ startedAt, context, rateLimits, cost }, null, 2) }
   })
 
   on('tool.call', { tool: 'mcp__office__codex_exec' }, async ($, e) => {
@@ -368,7 +399,8 @@ export function installJobs(on: On, options: PluginOptions) {
     if (input.deliverable !== undefined && !isDeliverable(input.deliverable)) return { deny: 'deliverable is commit or report.' }
     const want = { base: str(input.base), branch: str(input.branch), deliverable: input.deliverable }
     const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT, want)
-    return msg.ok ? { result: msg.text } : { deny: msg.text }
+    const text = takeAlerts() + msg.text
+    return msg.ok ? { result: text } : { deny: text }
   })
 
   on('tool.call', { tool: 'mcp__office__route_task' }, async ($, e) => {
@@ -380,7 +412,7 @@ export function installJobs(on: On, options: PluginOptions) {
   // ── commands ────────────────────────────────────────────────────────────
   on('command.run', { command: 'codex-review' }, async ($, e) => {
     const { deep, force, model, rest } = parseCodexReviewArgs(e.args)
-    const msg = await startCodexReview($, options, str(rest), undefined, undefined, deep, { isForced: force, model })
+    const msg = await startCodexReview($, options, str(rest), undefined, undefined, deep, { isPerson: true, isForced: force, model })
     return { text: msg.text }
   })
 
@@ -848,8 +880,13 @@ async function clockNow($: EngineInterface): Promise<number> {
   return $.clock.now().catch(() => Date.now())
 }
 
-/** Serializes this process's capacity updates; the lock file serializes them across sessions. */
-let capChain: Promise<unknown> = Promise.resolve()
+/** A lock every session sharing this store takes (its file is `<name>.lock`); `chain` serializes this process's own holds. */
+type FileLock = { name: string; chain: Promise<unknown> }
+const CAP_LOCK: FileLock = { name: 'capacity', chain: Promise.resolve() }
+/** The Codex review ledger's: kept apart so a slow git run under it never holds up a worker's start. */
+const ROUNDS_LOCK: FileLock = { name: 'codex-rounds', chain: Promise.resolve() }
+/** The usage alerts' (usage-alert.ts): the first session to write an alert's key shows it. */
+const ALERT_LOCK: FileLock = { name: 'usage-alerts', chain: Promise.resolve() }
 
 /** The capacity lock stayed held by another session past LOCK_WAIT_MS: the transaction was not run. */
 class CapLockBusy extends Error {
@@ -863,16 +900,60 @@ class CapLockBusy extends Error {
  * Throws CapLockBusy, never running `fn`, when another session holds the lock past LOCK_WAIT_MS.
  */
 async function withCapLock<T>($: EngineInterface, fn: () => Promise<T>): Promise<T> {
-  const run = capChain.then(async () => {
-    const release = await takeCapLock($)
+  return withLock($, CAP_LOCK, fn)
+}
+
+/** Runs `fn` holding `lock`; throws CapLockBusy, never running `fn`, when another session holds it past LOCK_WAIT_MS. */
+async function withLock<T>($: EngineInterface, lock: FileLock, fn: () => Promise<T>): Promise<T> {
+  const run = lock.chain.then(async () => {
+    const release = await takeCapLock($, lock.name)
     try {
       return await fn()
     } finally {
       await release?.()
     }
   })
-  capChain = run.catch(() => undefined)
+  lock.chain = run.catch(() => undefined)
   return run
+}
+
+const ALERT_TOAST_MS = 15_000
+/** Alerts this session raised and the manager has not yet been told of: they lead the next session_usage, spawn_worker or codex_review result. */
+const PENDING_ALERTS: string[] = []
+
+/** The pending alerts as a lead for a manager-facing result, and forgotten; '' with none. */
+function takeAlerts(): string {
+  const text = PENDING_ALERTS.splice(0).join('\n')
+  return text === '' ? '' : `${text}\n\n`
+}
+
+/**
+ * Alerts the person once when `provider`'s 5-hour or weekly window reaches usageAlertPct (0 = off): a toast, and a
+ * lead on the manager's next result. Deduped across sessions by a store key per provider, window and reset, written
+ * under a lock so only the first session shows it. A worker never alerts (nobody reads its toasts). A busy lock or
+ * unreadable store skips quietly: the next read tries again.
+ */
+async function alertUsage($: EngineInterface, options: PluginOptions, provider: 'Claude' | 'Codex', windows: readonly RateWindow[]): Promise<void> {
+  try {
+    const pct = alertPctOf(options.usageAlertPct)
+    const alerts = usageAlerts(provider, windows, pct, Date.now())
+    if (alerts.length === 0 || (await $.env.get('OFFICE_WORKER')) === '1') return
+    for (const a of alerts) {
+      const seen = async () => { for (const k of alertKeysSeen(a.key)) if ((await storeGet($, k)) !== undefined) return true; return false }
+      if (await seen()) continue // the cheap check: no lock for a window already alerted
+      const isFirst = await withLock($, ALERT_LOCK, async () => {
+        if (await seen()) return false
+        await $.store.set(a.key, { at: Date.now() })
+        for (const stale of staleAlertKeys(await $.store.keys().catch(() => [] as string[]), Date.now())) await $.store.delete(stale).catch(() => undefined)
+        return true
+      })
+      if (!isFirst) continue
+      PENDING_ALERTS.push(a.text)
+      $.ui.toast(a.text, { timeoutMs: ALERT_TOAST_MS })
+    }
+  } catch (err) {
+    debugLog($, `office: usage alert skipped: ${String(err)}`)
+  }
 }
 
 /** Like withCapLock, but a busy lock is `undefined` for a caller whose work can wait or lapse (a renewal, a release). */
@@ -890,7 +971,7 @@ async function withCapLockIfFree<T>($: EngineInterface, what: string, fn: () => 
 let hasWarnedNoCapLock = false
 
 /**
- * The capacity lock every session sharing this store takes: the kernel's flock on a file beside
+ * A lock every session sharing this store takes (the capacity lock, or `name`'s): the kernel's flock on a file beside
  * it, held by a perl child (capLockArgv) until `release` ends it. Only the process holding an
  * flock can drop it, and its death always does, so a crashed holder needs no takeover and no
  * session can ever remove another's lock.
@@ -901,14 +982,14 @@ let hasWarnedNoCapLock = false
  * with only this process's chain to serialize it (logged loudly once), when no lock is possible
  * at all: no config dir, or perl missing or unable to open the lock file.
  */
-async function takeCapLock($: EngineInterface): Promise<(() => Promise<void>) | undefined> {
+async function takeCapLock($: EngineInterface, name = CAP_LOCK.name): Promise<(() => Promise<void>) | undefined> {
   let holder: ReturnType<EngineInterface['process']['spawn']> | undefined
   const release = async () => {
     await holder?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
   }
   let isTimedOut = false
   try {
-    const path = `${(await configDirOf($)).replace(/\/+$/, '')}/office/locks/capacity.lock`
+    const path = `${(await configDirOf($)).replace(/\/+$/, '')}/office/locks/${name}.lock`
     holder = $.process.spawn({ argv: capLockArgv(path, LOCK_WAIT_MS) })
     void holder.result.catch(() => undefined)
     let out = ''
@@ -925,7 +1006,7 @@ async function takeCapLock($: EngineInterface): Promise<(() => Promise<void>) | 
   }
   await release()
   if (isTimedOut) {
-    debugLog($, `office: capacity lock held past ${LOCK_WAIT_MS} ms; start refused`)
+    debugLog($, `office: ${name} lock held past ${LOCK_WAIT_MS} ms; refused`)
     throw new CapLockBusy()
   }
   if (!hasWarnedNoCapLock) {
@@ -1436,7 +1517,7 @@ async function bgTranscript($: EngineInterface, configDir: string, cwd: string, 
 async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promise<void> {
   const jobs = await read($, JOBS)
   const stale = jobs.filter(j => isLive(j) && !RUNNING.has(j.id))
-  if (stale.length === 0) return
+  if (stale.length === 0) return reconcileSettlements($, [])
   const agents = stale.some(j => j.agentId !== undefined) ? await $.agent.list().catch(() => []) : []
   const live = new Set(
     agents.filter(a => a.status === 'running' || a.status === 'pending' || a.status === 'waiting').map(a => a.id),
@@ -1467,7 +1548,7 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
     }
     else dead.add(job.id)
   }
-  if (dead.size === 0) return
+  if (dead.size === 0) return reconcileSettlements($, [])
   const at = Date.now()
   const list = await update($, JOBS, jobs =>
     jobs.map(j =>
@@ -1476,6 +1557,8 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
         : j,
     ),
   )
+  // A review the reload interrupted is a failed round: it stops counting toward the cap and no longer blocks its HEAD.
+  await reconcileSettlements($, list.filter(j => dead.has(j.id) && j.endedAt === at && j.kind === 'codex-review').map(j => j.id))
   // Whether the worker still runs is unknown: its worktree is kept and reported.
   for (const job of list) {
     if (dead.has(job.id) && job.endedAt === at && job.worktree !== undefined) await settleWorktree($, job, false)
@@ -1608,7 +1691,11 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     }
     void $.process.run(['rm', '-f', plan.outFile]).catch(() => undefined)
   }
-  if (killed) return // killJob already marked and delivered it
+  if (killed) {
+    // killJob already marked and delivered it; a killed review gave no findings to keep.
+    if (plan.isRound) await settleRound($, jobId, undefined)
+    return
+  }
 
   let status: 'done' | 'failed' = 'done'
   let final = result ?? ''
@@ -1623,6 +1710,8 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     const hint = plan.codexModel !== undefined ? codexFailureHint(`${why}\n${stderr}`) : ''
     final = quota ?? [`exit ${exit?.code ?? exit?.signal ?? '?'}: ${why}`, hint, result ?? ''].filter(Boolean).join('\n')
     if (quota !== undefined) quotaText = `${why}\n${stderr}`
+    // A review the plan's usage limit stopped: the manager's fallback, not a bare error.
+    if (job.kind === 'codex-review' && isUsageLimit(`${why}\n${stderr}`)) final = `${final}\n${CODEX_OUT_FALLBACK_TEXT}`
   }
   if (!final) final = lastLine(stderr) || '(no output)'
   if (costUsd !== undefined) {
@@ -1631,6 +1720,8 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   }
   // Marked before delivery, so a job started on reading the result already meets the guard.
   if (plan.codexModel !== undefined && quotaText !== undefined) await markCodexOut($, plan.codexModel, quotaText)
+  // Kept before delivery too, so the next round, asked for on reading this one, sees its findings.
+  if (plan.isRound) await settleRound($, jobId, status === 'done' ? final : undefined)
   await finishJob($, options, jobId, status, final)
   if (plan.codexModel !== undefined) void readCodexLimits($, plan.argv[0]!, plan.cwd)
 }
@@ -1646,9 +1737,9 @@ async function codexNotReady($: EngineInterface, bin: string, cwd: string): Prom
   }
 }
 
-/** Who asked for a Codex job: only the person's typed /codex-review sets `isForced` or `model`. */
-type CodexAsk = { isForced: boolean; model?: string }
-const BY_AGENT_CODEX: CodexAsk = { isForced: false }
+/** Who asked for a Codex job: only the person's typed /codex-review sets `isPerson`, `isForced` or `model`; `isFull` is codex_review's full. */
+type CodexAsk = { isPerson: boolean; isForced: boolean; model?: string; isFull?: boolean }
+const BY_AGENT_CODEX: CodexAsk = { isPerson: false, isForced: false }
 
 /**
  * Codex's rate limits, read live through `codex app-server` (no message spent)
@@ -1689,16 +1780,17 @@ async function markCodexOut($: EngineInterface, model: string, errorText: string
 }
 
 /** The budget guard before a Codex job: a live read of the limits, else the last one kept. */
-async function codexGuard($: EngineInterface, bin: string, cwd: string, model: string, isForced: boolean): Promise<CodexVerdict> {
+async function codexGuard($: EngineInterface, options: PluginOptions, bin: string, cwd: string, model: string, isForced: boolean): Promise<CodexVerdict> {
   const out = await storedCodexOut($)
-  const limits =
-    (await readCodexLimits($, bin, cwd)) ??
-    ((await $.store.get(CODEX_LIMITS_KEY).catch(() => undefined)) as CodexLimits | undefined)
+  const live = await readCodexLimits($, bin, cwd)
+  // The live read is the only one that costs a call, so it is the only one that can alert (the stored read may be old).
+  if (live) await alertUsage($, options, 'Codex', live.buckets.flatMap(b => b.windows))
+  const limits = live ?? ((await $.store.get(CODEX_LIMITS_KEY).catch(() => undefined)) as CodexLimits | undefined)
   return codexGuardVerdict(model, Date.now(), { limits: Array.isArray(limits?.buckets) ? limits : undefined, out }, isForced)
 }
 
 function refusedText(verdict: { reason: string }, ask: CodexAsk): string {
-  return `${verdict.reason} ${ask === BY_AGENT_CODEX ? 'Only the person can override, with /codex-review --force.' : '/codex-review --force overrides.'}`
+  return `${verdict.reason} ${!ask.isPerson ? 'Only the person can override, with /codex-review --force.' : '/codex-review --force overrides.'}`
 }
 
 async function failedJob($: EngineInterface, job: Job, why: string): Promise<Started> {
@@ -1719,29 +1811,58 @@ async function startCodexReview(
   if (full) return { ok: false, text: full }
   const cwd = await resolveCwd($, cwdArg)
   const bin = opt(options, 'codexPath', 'codex')
-  const base: CodexTier = deep
-    ? { model: opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model), effort: CODEX_DEFAULTS.deep.effort }
-    : { model: opt(options, 'codexReviewModel', CODEX_DEFAULTS.review.model), effort: CODEX_DEFAULTS.review.effort }
-  const tier: CodexTier = ask.model !== undefined ? { ...base, model: ask.model } : base
-  const verdict = await codexGuard($, bin, cwd, tier.model, ask.isForced)
-  if (!verdict.isAllowed) return { ok: false, text: refusedText(verdict, ask) }
-  const now = Date.now()
-  let target: ReviewTarget | undefined = parseReviewTarget(targetArg)
-  if (targetArg && !target) return { ok: false, text: `Unknown review target "${targetArg}".` }
-  if (target === undefined) {
-    const status = await $.process.run(['git', 'status', '--porcelain'], { cwd }).catch(() => undefined)
-    if (status === undefined || status.exitCode !== 0) {
-      return { ok: false, text: `${cwd} is not a git repository; codex review needs one.` }
-    }
+  const asked = parseReviewTarget(targetArg)
+  if (targetArg && !asked) return { ok: false, text: `Unknown review target "${targetArg}".` }
+  const policy: RoundPolicy = {
+    maxRounds: num(options, 'codexMaxRounds', 3),
+    maxLines: num(options, 'codexRereviewMaxLines', 400),
+    // Sol reviews a branch's first round only; deep and the person's own --model pin every round of the call
+    ...roundTiers({
+      review: { model: opt(options, 'codexReviewModel', CODEX_DEFAULTS.review.model), effort: CODEX_DEFAULTS.review.effort },
+      rereview: { model: opt(options, 'codexRereviewModel', CODEX_DEFAULTS.rereview.model), effort: CODEX_DEFAULTS.rereview.effort },
+      deep: deep ? { model: opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model), effort: CODEX_DEFAULTS.deep.effort } : undefined,
+      model: ask.model,
+    }),
+  }
+  const status = await $.process.run(['git', 'status', '--porcelain'], { cwd }).catch(() => undefined)
+  const isRepo = status !== undefined && status.exitCode === 0
+  if (!isRepo && asked === undefined) return { ok: false, text: `${cwd} is not a git repository; codex review needs one.` }
+  let fallback = asked
+  if (isRepo && fallback === undefined) {
     const branches = await $.process
       .run(['git', 'branch', '--list', 'main', 'master', '--format=%(refname:short)'], { cwd })
       .catch(() => undefined)
-    target = defaultReviewTarget(status.stdout, (branches?.stdout ?? '').split('\n').map(s => s.trim()))
+    fallback = defaultReviewTarget(status.stdout, (branches?.stdout ?? '').split('\n').map(s => s.trim()))
+  }
+  const now = Date.now()
+  const jobId = newJobId(now)
+  const facts = {
+    isDirty: isRepo && status.stdout.trim() !== '',
+    isPerson: ask.isPerson,
+    target: asked,
+    isFull: ask.isFull === true || deep,
+    instructions,
+  }
+  const booked = isRepo ? await bookRound($, cwd, jobId, now, policy, facts, fallback!) : undefined
+  if (typeof booked === 'string') return { ok: false, text: booked }
+  // Outside a repo (an explicit target only) no round is kept; codex reports the rest.
+  const plan = booked ?? planReviewRound({ ...facts, rounds: [], head: '' }, policy)
+  if (!plan.isAllowed) return { ok: false, text: plan.reason }
+  const isRound = booked !== undefined
+  const drop = async () => {
+    if (isRound) await settleRound($, jobId, undefined)
+  }
+  const tier = plan.tier
+  const target: ReviewTarget = plan.target ?? fallback!
+  const verdict = await codexGuard($, options, bin, cwd, tier.model, ask.isForced)
+  if (!verdict.isAllowed) {
+    await drop()
+    return { ok: false, text: `${refusedText(verdict, ask)} ${CODEX_OUT_FALLBACK_TEXT}` }
   }
   const job: Job = {
-    id: newJobId(now),
+    id: jobId,
     kind: 'codex-review',
-    title: `codex review ${target.label}${deep ? ' (deep)' : ''}`,
+    title: roundTitle(plan, policy.maxRounds, target.label),
     cwd,
     status: 'running',
     startedAt: now,
@@ -1749,23 +1870,213 @@ async function startCodexReview(
     tail: '',
   }
   const notReady = await codexNotReady($, bin, cwd)
-  if (notReady) return failedJob($, job, notReady)
+  if (notReady) {
+    await drop()
+    return failedJob($, job, notReady)
+  }
   const outFile = await tempFile($, cwd)
-  if (!outFile) return failedJob($, job, 'Could not create a temp file for the review output (mktemp failed).')
+  if (!outFile) {
+    await drop()
+    return failedJob($, job, 'Could not create a temp file for the review output (mktemp failed).')
+  }
   await addJob($, job)
-  const plan: RunPlan = {
-    argv: codexReviewArgv(bin, target, outFile, tier, instructions !== undefined),
+  const runPlan: RunPlan = {
+    argv: codexReviewArgv(bin, target, outFile, tier, plan.instructions !== undefined),
     cwd,
-    input: instructions !== undefined ? codexReviewPrompt(target, instructions) : undefined,
+    input: plan.instructions !== undefined ? codexReviewPrompt(target, plan.instructions) : undefined,
     label: 'Codex review',
     parse: codexLine,
     outFile,
     codexModel: tier.model,
+    isRound,
   }
-  $.clock.after(0, () => void runJob($, options, job, plan))
+  $.clock.after(0, () => void runJob($, options, job, runPlan))
+  const kind = plan.isRereview ? 're-review' : 'review'
+  const isLast = isRound && !ask.isPerson && plan.round >= policy.maxRounds
+  const notes = [
+    plan.note !== undefined ? `This is a ${plan.note}.` : '',
+    isLast ? 'It is the last round an agent can start on this branch.' : '',
+    verdict.warning ? `Budget: ${verdict.warning}` : '',
+    booked?.isUnrecorded ? 'The round was not recorded (the review ledger could not be written), so it does not count toward the cap.' : '',
+  ].filter(Boolean)
   return {
     ok: true,
-    text: `Started Codex review job ${job.id} (${target.label}, ${tier.model}) in ${cwd}. It runs in the background; the review is appended to this conversation when it finishes. /jobs shows progress.${verdict.warning ? ` Budget: ${verdict.warning}` : ''}`,
+    text: `Started Codex ${kind} job ${job.id}, round ${roundOf(plan.round, policy.maxRounds)} (${target.label}, ${tier.model}) in ${cwd}. It runs in the background; the review is appended to this conversation when it finishes. /jobs shows progress.${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`,
+  }
+}
+
+/** stdout of a git command in `cwd`, trimmed; undefined when it fails. */
+async function gitOut($: EngineInterface, cwd: string, args: string[]): Promise<string | undefined> {
+  const r = await $.process.run(['git', ...args], { cwd, timeoutMs: 30000 }).catch(() => undefined)
+  return r !== undefined && r.exitCode === 0 ? r.stdout.trim() : undefined
+}
+
+/**
+ * Decides this call's round from the branch's ledger and records it, in one hold of the rounds
+ * lock: a call racing it, here or in another session, sees the round. Undefined when the branch
+ * has no commit to key it by (no round is kept); a string when the lock stayed busy.
+ *
+ * The slow git runs (size since the last sha) happen before the lock, against the last round as
+ * read then; if another session added a round meanwhile, the lock is taken again and it is measured
+ * anew (a few times; then the plan goes on without a measure, which makes it a full review).
+ */
+async function bookRound(
+  $: EngineInterface,
+  cwd: string,
+  jobId: string,
+  now: number,
+  policy: RoundPolicy,
+  facts: Omit<RoundFacts, 'rounds' | 'head' | 'sinceLast'>,
+  fallback: ReviewTarget,
+): Promise<(RoundPlan & { isUnrecorded?: true }) | string | undefined> {
+  const head = await gitOut($, cwd, ['rev-parse', 'HEAD'])
+  const commonDir = await gitOut($, cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+  if (!head || !commonDir) return undefined
+  const key = branchKey(commonDir, (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD'])) ?? '')
+  const isIncremental = !facts.isPerson && facts.target === undefined && !facts.isFull
+  const measureLast = async () => {
+    const last = (await readLedgerLocked($, now)).ledger[key]?.at(-1) // the reconciled ledger, as the lock will see it
+    return last !== undefined && last.isCovering === true && isIncremental
+      ? { sha: last.sha, since: await sinceSha($, cwd, last.sha) }
+      : undefined
+  }
+  let measured = await measureLast()
+  try {
+    for (let attempt = 1; ; attempt++) {
+      const booked = await withLock($, ROUNDS_LOCK, async () => {
+        const { stored, ledger, pending } = await readLedgerLocked($, now)
+        const rounds = ledger[key] ?? []
+        const last = rounds.at(-1)
+        const isMeasured = measured !== undefined && measured.sha === last?.sha
+        const needsMeasure = last !== undefined && last.isCovering === true && isIncremental
+        if (needsMeasure && !isMeasured && attempt < MEASURE_ATTEMPTS) return undefined // the last round changed: measure again
+        const plan = planReviewRound({ ...facts, rounds, head, sinceLast: isMeasured ? measured!.since : undefined }, policy)
+        if (!plan.isAllowed) {
+          await saveLedgerLocked($, stored, ledger, pending)
+          return plan
+        }
+        const target = plan.target ?? fallback
+        const base = target.args[0] === '--base' ? target.args[1]! : target.label
+        const round = {
+          sha: head, base, model: plan.tier.model, jobId, at: now,
+          isCovering: planCovers(plan, fallback),
+          ...(facts.isPerson ? { isPerson: true } : {}),
+        }
+        const isRecorded = await saveLedgerLocked($, stored, { ...ledger, [key]: [...rounds, round] }, pending)
+        if (isRecorded) return plan
+        // never recorded, so the cap could not count it: an agent waits, the person's review runs and says so
+        return facts.isPerson ? { ...plan, isUnrecorded: true as const } : ROUNDS_UNRECORDED_TEXT
+      })
+      if (booked !== undefined) return booked
+      measured = await measureLast()
+    }
+  } catch (err) {
+    if (err instanceof CapLockBusy) return ROUNDS_BUSY_TEXT
+    throw err
+  }
+}
+
+/** The ledger as stored, with the pending settlements applied. Only reads: safe with or without the rounds lock. */
+async function readLedgerLocked($: EngineInterface, now: number) {
+  const stored = await storeGet($, ROUNDS_KEY)
+  const pending: (PendingSettle & { key: string })[] = []
+  for (const key of await $.store.keys().catch(() => [] as string[])) {
+    if (!key.startsWith(SETTLE_PREFIX)) continue
+    const p = parsePending(await storeGet($, key))
+    if (p !== undefined) pending.push({ ...p, key })
+  }
+  return { stored, ledger: settledAll(parseLedger(stored, now), pending), pending }
+}
+
+/**
+ * Writes the ledger when it changed, then clears the pending settlements it applied (call holding
+ * the rounds lock). A write that fails keeps them pending, for the next ledger access to apply, and
+ * returns false: the caller's own changes are then only in memory and it must park them.
+ */
+async function saveLedgerLocked(
+  $: EngineInterface,
+  stored: unknown,
+  ledger: RoundLedger,
+  pending: readonly { key: string }[],
+): Promise<boolean> {
+  if (JSON.stringify(ledger) !== JSON.stringify(stored)) {
+    const isWritten = await $.store.set(ROUNDS_KEY, ledger).then(() => true, () => false)
+    if (!isWritten) return false
+  }
+  for (const p of pending) await $.store.delete(p.key).catch(() => undefined)
+  return true
+}
+
+/** Keeps a settlement under its own store key, for the next ledger access to apply (best effort). */
+async function parkSettlement($: EngineInterface, jobId: string, findings?: string): Promise<void> {
+  const record: PendingSettle = { jobId, at: Date.now(), ...(findings !== undefined ? { findings } : {}) }
+  await $.store.set(`${SETTLE_PREFIX}${jobId}`, record).catch(() => undefined)
+}
+
+/** Whether `sha` is still an ancestor of HEAD, and the lines changed since it (committed or not). */
+async function sinceSha($: EngineInterface, cwd: string, sha: string): Promise<{ isAncestor: boolean; changedLines: number }> {
+  const isAncestor = (await gitOut($, cwd, ['merge-base', '--is-ancestor', sha, 'HEAD'])) !== undefined
+  if (!isAncestor) return { isAncestor, changedLines: 0 }
+  const stat = await gitOut($, cwd, ['diff', '--shortstat', sha])
+  if (stat === undefined) return { isAncestor, changedLines: Number.POSITIVE_INFINITY }
+  return { isAncestor, changedLines: shortstatLines(stat) + (await untrackedLines($, cwd)) }
+}
+
+/** Lines in the files git does not track yet (`git diff` skips them); Infinity when they cannot be measured or are too many. */
+async function untrackedLines($: EngineInterface, cwd: string): Promise<number> {
+  const top = (await gitOut($, cwd, ['rev-parse', '--show-toplevel'])) || cwd
+  const listed = await gitOut($, top, ['ls-files', '--others', '--exclude-standard', '-z'])
+  if (listed === undefined) return Number.POSITIVE_INFINITY
+  const files = listed.split('\0').filter(Boolean)
+  if (files.length > UNTRACKED_MAX_FILES) return Number.POSITIVE_INFINITY
+  let lines = 0
+  for (const file of files) {
+    lines += textLines(await $.fs.read(`${top}/${file}`).catch(() => '\0'))
+    if (lines > UNTRACKED_MAX_LINES) return Number.POSITIVE_INFINITY
+  }
+  return lines
+}
+
+/**
+ * A review job's end: its final text kept on its round (the next round checks it), or the round
+ * dropped when it failed. A busy ledger lock is retried with a backoff; still busy, the settlement
+ * is kept under its own store key and applied by the next ledger access (reconcileSettlements).
+ */
+async function settleRound($: EngineInterface, jobId: string, findings: string | undefined): Promise<void> {
+  for (let attempt = 1; attempt <= SETTLE_ATTEMPTS; attempt++) {
+    try {
+      await withLock($, ROUNDS_LOCK, () => settleLocked($, jobId, findings))
+      return
+    } catch (err) {
+      if (!(err instanceof CapLockBusy)) throw err
+    }
+    if (attempt < SETTLE_ATTEMPTS) await new Promise<void>(resolve => void $.clock.after(SETTLE_BACKOFF_MS * attempt, resolve))
+  }
+  debugLog($, `office: review ledger lock busy; round of job ${jobId} settles on the next ledger access`)
+  await parkSettlement($, jobId, findings)
+}
+
+async function settleLocked($: EngineInterface, jobId: string, findings: string | undefined): Promise<void> {
+  const { stored, ledger, pending } = await readLedgerLocked($, Date.now())
+  if (!(await saveLedgerLocked($, stored, settledAll(ledger, [{ jobId, findings, at: Date.now() }]), pending))) {
+    await parkSettlement($, jobId, findings)
+  }
+}
+
+/** At load: applies the settlements a busy lock left pending, and drops the rounds of Codex reviews the reload interrupted. */
+async function reconcileSettlements($: EngineInterface, interruptedJobIds: readonly string[]): Promise<void> {
+  try {
+    await withLock($, ROUNDS_LOCK, async () => {
+      const { stored, ledger, pending } = await readLedgerLocked($, Date.now())
+      const dropped = interruptedJobIds.map(jobId => ({ jobId, at: Date.now() }))
+      if (!(await saveLedgerLocked($, stored, settledAll(ledger, dropped), pending))) {
+        for (const { jobId } of dropped) await parkSettlement($, jobId)
+      }
+    })
+  } catch (err) {
+    if (!(err instanceof CapLockBusy)) throw err
+    // an interrupted job's round has no findings to keep: park its drop where the next access finds it
+    for (const jobId of interruptedJobIds) await parkSettlement($, jobId)
   }
 }
 
@@ -1781,7 +2092,7 @@ async function startCodexExec(
   const bin = opt(options, 'codexPath', 'codex')
   const tier: CodexTier = { model: opt(options, 'codexExecModel', CODEX_DEFAULTS.exec.model), effort: CODEX_DEFAULTS.exec.effort }
   // codex_exec is only ever an agent's call: the guard holds, with no override.
-  const verdict = await codexGuard($, bin, cwd, tier.model, false)
+  const verdict = await codexGuard($, options, bin, cwd, tier.model, false)
   if (!verdict.isAllowed) return { ok: false, text: refusedText(verdict, BY_AGENT_CODEX) }
   const now = Date.now()
   const job: Job = {
@@ -1822,12 +2133,15 @@ type SpawnedBy = { isPerson: boolean; isForced: boolean }
 const BY_AGENT: SpawnedBy = { isPerson: false, isForced: false }
 
 /** The account's rate-limit windows; none when they cannot be read, which leaves the guard open. */
-async function rateWindows($: EngineInterface): Promise<RateWindow[]> {
+async function rateWindows($: EngineInterface, options: PluginOptions): Promise<RateWindow[]> {
+  let windows: RateWindow[]
   try {
-    return (await $.session.usage()).rateLimits
+    windows = (await $.session.usage()).rateLimits
   } catch {
     return []
   }
+  await alertUsage($, options, 'Claude', windows)
+  return windows
 }
 
 function budgetCaps(options: PluginOptions): BudgetCaps {
@@ -1861,7 +2175,7 @@ async function startWorker(
   if (full) return { ok: false, text: full }
   // The budget guard, in two looks: past the hard limit nothing starts, so no routing call
   // is spent finding out the task's size; in the soft zone the route decides.
-  const windows = await rateWindows($)
+  const windows = await rateWindows($, options)
   const caps = budgetCaps(options)
   const isForced = by.isPerson && by.isForced
   const atHard = budgetVerdict(windows, caps, { isSmall: false, isExplicit: false, isForced })
@@ -2030,7 +2344,7 @@ function debugLog($: EngineInterface, text: string): void {
 async function planAgent($: EngineInterface, options: PluginOptions, e: AgentSpawnInput): Promise<AgentPlan> {
   if ((await $.env.get('OFFICE_WORKER')) !== undefined) return {}
   if (!isManagerSession(await $.store.get(MANAGERS_KEY), await $.session.id())) return {}
-  const windows = await rateWindows($)
+  const windows = await rateWindows($, options)
   const caps = budgetCaps(options)
   const hard = hardDeny(windows, caps)
   if (hard !== undefined) return { deny: hard }

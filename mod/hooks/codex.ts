@@ -37,6 +37,7 @@ export function defaultReviewTarget(porcelain: string, branches: readonly string
 export type CodexTier = { model: string; effort: string }
 export const CODEX_DEFAULTS = {
   review: { model: 'gpt-6.1-sol', effort: 'high' }, // /codex-review, codex_review
+  rereview: { model: 'gpt-6-luna', effort: 'medium' }, // codex_review's later rounds (codex-rounds.ts)
   exec: { model: 'gpt-6-luna', effort: 'medium' }, // codex_exec second opinions
   deep: { model: 'gpt-6-astra', effort: 'high' }, // only `--deep` / deep: true; scarce quota
 } as const satisfies Record<string, CodexTier>
@@ -77,9 +78,11 @@ export function codexReviewPrompt(target: ReviewTarget, instructions: string): s
   const what =
     flag === '--commit'
       ? `Review the changes introduced by commit ${value} (see \`git show ${value}\`).`
-      : flag === '--base'
-        ? `Review the changes on the current branch against the base branch ${value} (see \`git diff ${value}...HEAD\`).`
-        : 'Review the uncommitted changes in this repository: staged, unstaged and untracked files (see `git status` and `git diff HEAD`).'
+      : flag === '--base' && /^[0-9a-f]{7,40}$/.test(value ?? '')
+        ? `Review the changes made since commit ${value}, committed or not (see \`git log ${value}..HEAD\`, \`git diff ${value}\` and \`git status\`).`
+        : flag === '--base'
+          ? `Review the changes on the current branch against the base branch ${value} (see \`git diff ${value}...HEAD\`).`
+          : 'Review the uncommitted changes in this repository: staged, unstaged and untracked files (see `git status` and `git diff HEAD`).'
   return `${what}\n\nAdditional review instructions:\n${instructions}`
 }
 
@@ -156,7 +159,20 @@ export const CODEX_REVIEW_TOOL = {
   name: 'codex_review',
   description:
     'Hand the current repo\'s changes to OpenAI Codex for an independent code review (`codex exec review`). ' +
-    'Returns a job id at once; the review runs in the background (minutes) and its text is appended to this conversation when done.',
+    'Returns a job id at once; the review runs in the background (minutes) and its text is appended to this conversation when done. ' +
+    'Rounds per branch are enforced in code. Round 1 is a full review on the review model (Sol); every later round runs on the cheaper re-review model (Luna), ' +
+    'given the earlier rounds\' findings in its instructions (the first Codex session is not resumed). ' +
+    'A later call with no target re-reviews only the changes since the last reviewed commit, ' +
+    'checking that the previous findings are fixed and that the fixes broke nothing; ' +
+    'it becomes a full re-review of the whole branch (still on the cheaper model) after a rebase, when the diff since then is large, or with full: true. ' +
+    'Later rounds with an explicit target run that target as given, also on the cheaper model; they still count as rounds. ' +
+    'deep: true (only when the person asks) runs the deep model on every round. ' +
+    'A call with nothing new since the last round is refused. At codexMaxRounds rounds (default 3) calls are refused: ' +
+    'then stop, summarise the remaining findings and ask the person. ' +
+    'If Codex is out of usage (the result says so), run an Opus review via a subagent instead: it is a same-model-family review with lower trust, ' +
+    'since Claude also wrote the code and may confirm its own bias, so verify each finding, do not count a clean Opus review as evidence the branch is correct, ' +
+    'and say "reviewed by Opus (Codex out of usage), not independent" in the PR description. ' +
+    'A result that begins "Usage alert:" is for the person: pass that line on.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -166,6 +182,11 @@ export const CODEX_REVIEW_TOOL = {
           '"--uncommitted", "--commit <sha>", "--base <branch>" or a branch name. Default: uncommitted if the tree is dirty, else vs main/master.',
       },
       instructions: { type: 'string', description: 'Custom review focus for Codex.' },
+      full: {
+        type: 'boolean',
+        description:
+          'A full review instead of a re-review of the new changes (still a round): after a large rework or a rebase, or when a finding was about the overall design.',
+      },
       deep: {
         type: 'boolean',
         description: 'Use the scarce deep-review model (gpt-6-astra). Only when the user explicitly asks for a deep review.',

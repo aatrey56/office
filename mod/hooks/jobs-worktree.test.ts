@@ -24,11 +24,11 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `sh -c` line (default exit 0), `head` is the worktree's branch (default the one it was made on), `commits` counts base..branch (1);
 // `renamed` is the name the worker renamed its branch to: HEAD is on it, and the branch it was made on is gone (a range to it fails).
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
-type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
+type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock }
 type Check = (line: string) => { code: number; out?: string } | Promise<{ code: number; out?: string }>
-type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
+type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string; untracked?: string; failSet?: string; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
-  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
+  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock() }) as Runs
   const { store, flock } = runs
   let isDirty = fake.dirty === true
   const stopped = new Set<string>()
@@ -37,8 +37,14 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
   let madeBranch = ''
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
+    if (e.key === fake.failSet) throw new Error('disk full')
     runs.sets.push(e.key)
     store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('store.delete', (_$, e) => {
+    store.delete(e.key)
     return { value: undefined }
   })
   on('process.spawn', async function* (_$, e, next) {
@@ -54,6 +60,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
       return { value: { code: 0, signal: null } }
     }
     if (fake.perl === 'missing') throw new Error('spawn perl ENOENT')
+    const flock = e.argv.some(a => a.includes('codex-rounds')) ? runs.roundsFlock : runs.flock // one lock file each
     const drop = await flock.take(flock.expired)
     if (drop === undefined) return { value: { code: 1, signal: null } }
     try {
@@ -65,7 +72,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     }
   })
   mock.env(on, { HOME: '/home/me', CLAUDE_CONFIG_DIR: '/cfg' })
-  on('session.usage', () => NO_LIMITS)
+  on('session.usage', () => (fake.rateLimits ? { value: { ...NO_LIMITS.value, rateLimits: fake.rateLimits } } : NO_LIMITS))
   on('session.cwd', () => ({ value: '/r/src' }))
   on('process.run', async (_$, e) => {
     const argv = [...e.argv]
@@ -82,7 +89,9 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     if (cmd.endsWith('^{commit}')) return out(`${OTHER}\n`)
     if (argv.includes('show-ref')) return out('', fake.branches?.some(b => cmd.endsWith(`refs/heads/${b}`)) ? 0 : 1)
     if (cmd.endsWith('worktree list --porcelain')) return out(fake.worktrees ?? '')
+    if (cmd.includes('symbolic-ref')) return out('feature\n')
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
+    if (cmd.includes('ls-files') && !argv.includes('--modified')) return out(fake.untracked ?? '') // the re-review's untracked count; the WIP commit's listing is below
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
     if (argv.includes('--bg')) {
       await fake.bgGate
@@ -995,6 +1004,195 @@ describe('maxOpusWorkers', () => {
     await clock.settle()
     drop()
     expect(await next).toContain('Started background worker')
+  })
+})
+
+describe('codex review rounds', () => {
+  const KEY = '/r/.git#feature'
+  const OLD = 'f00d'.repeat(10)
+  const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
+  const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings, isCovering: true })
+  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }, failSet?: string) => {
+    const reviews: { argv: readonly string[]; input?: string }[] = []
+    const fake: Fake = {
+      store,
+      failSet,
+      untracked: untracked && `${untracked.path}\0`,
+      async *spawn(e) {
+        if (e.argv[0] === 'codex') reviews.push(e)
+      },
+    }
+    const runs = fakeRepo(on, fake)
+    on('fs.read', (_$, e) => ({ value: untracked && e.path.endsWith(untracked.path) ? 'x\n'.repeat(untracked.lines) : 'No P1/P2 left.' }))
+    collectDelivery(on)
+    return { runs, reviews, fake }
+  }
+
+  test('round 2 from the tool re-reviews vs the last sha on luna with its findings; its own are kept', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x.ts:3 off by one')] } })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', instructions: 'focus on auth', cwd: '/r/src' })
+    expect(String(r.result)).toContain('Started Codex re-review job')
+    expect(String(r.result)).toContain('round 2/3 (vs f00df00, gpt-6-luna)')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    expect(reviews[0]!.argv).toContain('model_reasoning_effort="medium"')
+    expect(reviews[0]!.input).toContain(`git diff ${OLD}`)
+    expect(reviews[0]!.input).toContain('[P1] x.ts:3 off by one')
+    expect(reviews[0]!.input).toContain('focus on auth')
+    const rounds = (runs.store.get('codexRounds') as Record<string, { sha: string; base: string; findings?: string }[]>)[KEY]!
+    expect(rounds.map(x => [x.sha, x.base, x.findings])).toEqual([
+      [OLD, 'main', '[P1] x.ts:3 off by one'],
+      [BASE, OLD, 'No P1/P2 left.'],
+    ])
+  })
+
+  test('a --commit round is not a baseline: the next automatic round is a full review vs main, on luna, with the earlier findings (coverage)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [{ ...round(OLD, '[P2] y'), isCovering: false }] } })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6-luna)')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    expect(reviews[0]!.input).toContain('[P2] y')
+    const rounds = (runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!
+    expect(rounds.map(x => x.isCovering)).toEqual([false, true])
+    await $.command.run({ command: 'codex-review', args: '--commit abc1234', ...TYPED })
+    expect((runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!.map(x => x.isCovering)).toEqual([false, true, false])
+  })
+
+  test('untracked files count toward the re-review size limit (a large new file makes it a full review)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x')] } }, { path: 'new.ts', lines: 401 })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 2/3 (vs main, gpt-6-luna)')
+    expect(String(r.result)).toContain('401 lines changed')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+  })
+
+  test('a settlement the busy ledger lock holds up is kept pending, then applied by the next ledger access', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, {})
+    const clock = mock.clock(on)
+    const started = String((await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })).result)
+    const id = /job (\S+),/.exec(started)![1]!
+    const drop = await runs.roundsFlock.take() // another session holds the ledger lock
+    await clock.advance(0)
+    runs.roundsFlock.expire() // perl's wait runs out, for every attempt
+    await clock.advance(10_000)
+    await clock.settle()
+    expect(reviews).toHaveLength(1)
+    expect(runs.store.get(`codexSettle:${id}`)).toMatchObject({ jobId: id, findings: 'No P1/P2 left.' })
+    drop()
+    // The next call (nothing new: refused) still reads the ledger, so the findings land and the record goes.
+    const next = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(next.deny ?? '').toContain('Nothing new since round 1')
+    const rounds = (runs.store.get('codexRounds') as Record<string, { findings?: string }[]>)[KEY]!
+    expect(rounds.map(x => x.findings)).toEqual(['No P1/P2 left.'])
+    expect(runs.store.has(`codexSettle:${id}`)).toBe(false)
+  })
+
+  test('the diff since the last sha is measured before the ledger lock is taken, not under it', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs } = reviewRuns(on, { codexRounds: { [KEY]: [round(OLD, '[P1] x')] } })
+    mock.clock(on)
+    const drop = await runs.roundsFlock.take() // another session holds the ledger lock
+    const queued = runs.roundsFlock.queued()
+    const call = $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    await queued // the call waits on the lock...
+    expect(runs.some(r => r.argv.join(' ') === `git diff --shortstat ${OLD}`)).toBe(true) // ...with its git runs done
+    drop()
+    expect(String((await call).result)).toContain('re-review')
+  })
+
+  test('a round dropped by a reload (parked while the lock was busy) no longer counts or blocks its HEAD', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, {
+      codexRounds: { [KEY]: [{ ...round(BASE), jobId: 'j-dead' }] },
+      'codexSettle:j-dead': { jobId: 'j-dead', at: Date.now() },
+    })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 1/3')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    expect((runs.store.get('codexRounds') as Record<string, unknown[]>)[KEY]).toHaveLength(1)
+  })
+
+  test('a pending settlement is kept when the ledger write fails, so its findings are not lost (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs } = reviewRuns(on, {
+      codexRounds: { [KEY]: [round(OLD)] },
+      'codexSettle:j-old': { jobId: `j-${OLD}`, at: Date.now(), findings: '[P1] kept' },
+    }, undefined, 'codexRounds')
+    mock.clock(on)
+    await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(runs.store.get('codexSettle:j-old')).toMatchObject({ findings: '[P1] kept' })
+  })
+
+  test('a settlement whose own ledger write fails is parked, so its findings are not lost (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, fake } = reviewRuns(on, {})
+    const clock = mock.clock(on)
+    const id = /job (\S+),/.exec(String((await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })).result))![1]!
+    fake.failSet = 'codexRounds' // the booking was written; the settlement's write now fails
+    await clock.advance(0)
+    await clock.settle()
+    expect(runs.store.get(`codexSettle:${id}`)).toMatchObject({ jobId: id, findings: 'No P1/P2 left.' })
+  })
+
+  test('a round whose ledger write fails is refused for the agent; the person\'s review runs and says it was not recorded (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { reviews } = reviewRuns(on, {}, undefined, 'codexRounds')
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(r.deny ?? String(r.result)).toContain('could not record the review round')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(0)
+    const typed = await $.command.run({ command: 'codex-review', args: '', ...TYPED })
+    expect(JSON.stringify(typed)).toContain('round was not recorded')
+    await clock.advance(0)
+    await clock.settle()
+    expect(reviews).toHaveLength(1)
+  })
+
+  test('a drop pending for the newest of two covering rounds leaves the other as the baseline of an incremental review (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const NEWER = 'b'.repeat(40)
+    const { runs } = reviewRuns(on, {
+      codexRounds: { [KEY]: [round(OLD, '[P1] x'), round(NEWER)] },
+      'codexSettle:j-newer': { jobId: `j-${NEWER}`, at: Date.now() },
+    })
+    mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(String(r.result)).toContain('round 2/3 (vs f00df00, gpt-6-luna)')
+    expect(runs.some(x => x.argv.join(' ') === `git diff --shortstat ${OLD}`)).toBe(true)
+  })
+
+  test('at the cap the tool is refused; the person\'s /codex-review still runs, on luna (a later round), and counts', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs, reviews } = reviewRuns(on, { codexRounds: { [KEY]: [round('a'.repeat(40)), round('b'.repeat(40)), round('c'.repeat(40))] } })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    expect(r.deny ?? '').toContain('Codex review cap reached: 3 rounds')
+    const typed = await $.command.run({ command: 'codex-review', args: '', ...TYPED })
+    expect(JSON.stringify(typed)).toContain('round 4 (vs main, gpt-6-luna)')
+    await clock.advance(0)
+    expect(reviews).toHaveLength(1)
+    const rounds = (runs.store.get('codexRounds') as Record<string, { isPerson?: boolean }[]>)[KEY]!
+    expect(rounds).toHaveLength(4)
+    expect(rounds[3]!.isPerson).toBe(true)
+  })
+})
+
+describe('usage alerts', () => {
+  test('a window at 90% alerts once across two reads, in the toast and on the next manager result, then stays quiet', async ($, on) => {
+    const toasts: string[] = []
+    const resetsAt = new Date(Date.now() + 2 * 3_600_000).toISOString()
+    const runs = fakeRepo(on, { rateLimits: [{ kind: 'five_hour', percentUsed: 93, resetsAt }] })
+    on('ui.toast', (_$, e) => {
+      toasts.push(e.text)
+      return { value: undefined }
+    })
+    const first = String((await $.tool.call({ tool: 'mcp__office__session_usage' })).result)
+    expect(first).toMatch(/^Usage alert: Claude 5-hour window at 93% \(resets .+\)\.\n\n\{/)
+    const second = String((await $.tool.call({ tool: 'mcp__office__session_usage' })).result)
+    expect(second.startsWith('{')).toBe(true)
+    expect(toasts).toHaveLength(1)
+    expect([...runs.store.keys()].filter(k => k.startsWith('usageAlert:Claude:five_hour:'))).toHaveLength(1)
   })
 })
 

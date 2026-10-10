@@ -339,11 +339,6 @@ export function installBoard(on: On, options: PluginOptions) {
     return { result: JSON.stringify(await read($, sessions), null, 2) }
   })
 
-  on('tool.call', { tool: 'mcp__office__session_usage' }, async $ => {
-    const { startedAt, context, rateLimits, cost } = await $.session.usage()
-    return { result: JSON.stringify({ startedAt, context, rateLimits, cost }, null, 2) }
-  })
-
   on('tool.call', { tool: SEND_TOOL }, async ($, e) => {
     if (await isWorker($)) return { deny: 'message_session is not available to office workers' }
     if (typeof e.sessionId !== 'string' || typeof e.text !== 'string') {

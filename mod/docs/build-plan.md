@@ -22,7 +22,7 @@ Checked against the code in `mod/hooks`. The rest of this document is the origin
 | `spawn_worker` `base` and `branch` (worker told it is already on its branch, never to switch) | Built, tested |
 | Worker watchdog: progress-aware timeout with one extension (`jobTimeoutMin` 45, `jobTimeoutHardMin` 60), WIP commit of a timed-out worker's work, blocked limit (`blockedTimeoutMin` 20: report, end at 2x), stalled report (no reply 5 min after start) | Built, tested; subagent workers have no growth signal, so they are never extended |
 | Worker gate, phase 1: git rules and `.office/checks` from the base commit, `rejected` status, `deliverable`, `workerChecks` / `checkTimeoutMin` / `checkBudgetSec` | Built, tested; merge guard, retries, Stop gate and scope checks not built |
-| Codex review (`/codex-review`) | Built |
+| Codex review (`/codex-review`) | Built; an agent's `codex_review` rounds are capped per branch (§3.5, 2026-10-08) |
 | Worker git worktrees (option `workerWorktree`) | Partly built, in progress on `feat/worker-worktrees` |
 | Every subagent of a conversation drawn as a character | Partly built, in progress on `feat/worker-worktrees` |
 | Lobby view with one door per project | Not built; only a fallback lobby room (`h`/`l` switch offices) |
@@ -138,6 +138,48 @@ existing `maxWorkers` check (and `maxOpusWorkers`, a separate cap on workers run
   warning; spawns started by an agent follow the table.
 - Settings: `budgetSoftFiveHourPct` (80), `budgetSoftSevenDayPct` (85), `budgetHardPct` (95).
 - Shown in the scene footer as two bars.
+
+### 3.5 Codex review rounds (built 2026-10-08)
+
+Managers re-ran `codex_review` on the same branch until no P1/P2 was left; each full Sol
+review of a branch costs ~4% of the ChatGPT plan's 5-hour Codex limit. The rules are now in
+code (`codex-rounds.ts`, wired in `jobs.tsx`):
+
+| Call | What runs |
+| --- | --- |
+| Round 1 of a branch | A full review on `codexReviewModel` (Sol), as before |
+| A later round, no target | Only the changes since the last reviewed commit, on `codexRereviewModel` (Luna, effort medium), told the earlier rounds' findings: check each is fixed, look for problems the fixes added |
+| A later round after a rebase, more than `codexRereviewMaxLines` (400) changed lines or `full: true` | A full re-review of the whole branch scope, still on Luna, told the earlier rounds' findings; still a round |
+| A later round with an explicit target | That target as given, on Luna, told the earlier findings |
+| Same HEAD as the last round, clean tree | Refused: nothing new |
+| `codexMaxRounds` (3) rounds already | Refused: the manager summarises the open findings and asks you |
+
+- The ledger lives in `$.store` (`codexRounds`), keyed by the repo's git common dir and the
+  branch: each round's HEAD, base, model, job id, time, and its final text (first 4 KB) once
+  done. A failed or killed round is dropped; rounds older than 14 days are pruned. Writes take
+  their own cross-session flock (`codex-rounds.lock`), as the capacity lock does.
+- **Sol only for a branch's first round.** Every later round, including yours (`/codex-review`)
+  and a full re-review, runs on Luna. Exceptions: `deep` (the deep model, only when you ask) and
+  your own `--model` keep their model on every round (`roundTiers`). Luna "has context" from the
+  earlier rounds' findings in its instructions (the last 3, 4 KB each); the first Codex session is
+  not resumed, as that re-reads the whole first review and costs more. There is no cap on full
+  reviews per window.
+- **Codex out of usage:** a codex run failing on "usage limit", "rate limit" or "hit your limit"
+  (`isUsageLimit`), and a budget-guard refusal, add a fallback to the result: run an Opus review via
+  a subagent; it is a same-model-family review with lower trust (Claude also wrote the code), so
+  verify each finding, a clean one is no evidence the branch is correct, and the PR description
+  says "reviewed by Opus (Codex out of usage), not independent".
+- Your `/codex-review` is never refused by the round cap and runs as typed (`--force` still passes the budget
+  guard); it is recorded, so it counts toward an agent's cap.
+- **Usage alerts** (`usageAlertPct`, 90; 0 = off): when your Claude or Codex 5-hour or weekly window
+  reaches that percent, you get one toast, `Usage alert: <Claude|Codex> <5-hour|weekly> window at N%
+  (resets <local time>).`, and the same line leads that session's next `session_usage`,
+  `spawn_worker` or `codex_review` result so a manager relays it. Once per window per reset, across
+  sessions: the first to write the `$.store` key `usageAlert:<provider>:<window>:<reset>` (under the
+  `usage-alerts` flock) shows it; workers never alert. Claude's windows are checked where the plugin
+  already reads them (`session.measure`, `session_usage`, the spawn budget guard); Codex's only on the
+  live read the Codex budget guard already makes. The budget guards (80% / 95%) are unchanged.
+- The job title and the start message show the round: `codex re-review 2/3 vs a1b2c3d (luna)`.
 
 ## 4. Routing
 
