@@ -46,9 +46,9 @@ export function formatElapsed(ms: number): string {
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
 }
 
-/** Running, or a --bg worker paused on a question: either still holds a slot. */
+/** Running, a --bg worker paused on a question, or a worker in its gate: each still holds a slot. */
 export function isLive(job: Pick<Job, 'status'>): boolean {
-  return job.status === 'running' || job.status === 'blocked'
+  return job.status === 'running' || job.status === 'blocked' || job.status === 'checking'
 }
 
 export function withJob(list: Job[], id: string, change: (job: Job) => Job): Job[] {
@@ -66,12 +66,15 @@ export function addJobTo(list: Job[], job: Job): Job[] {
   return next
 }
 
-/** The user-role meta row a finished job leaves for this session's model. */
+/** The user-role meta row a finished job leaves for this session's model; a gated worker's head carries the verdict. */
 export function deliveryText(job: Job, label: string): string {
+  const verdict = job.gate !== undefined ? ` · ${job.gate.head}` : ''
   const head =
     job.status === 'done'
-      ? `${label} finished: ${job.title} (job ${job.id})`
-      : `${label} FAILED: ${job.title} (job ${job.id})`
+      ? `${label} finished: ${job.title} (job ${job.id})${verdict}`
+      : job.status === 'rejected'
+        ? `${label} REJECTED: ${job.gate?.head ?? 'its checks failed'} · ${job.title} (job ${job.id})`
+        : `${label} FAILED: ${job.title} (job ${job.id})`
   const body = (job.result ?? lastLine(job.tail)) || '(no output)'
   return `${head}\n\n${capResult(body)}`
 }
@@ -431,6 +434,12 @@ export const SPAWN_TOOL = {
       branch: {
         type: 'string',
         description: "Name of the worker's branch; default office/<job>-<title>. Refused if it exists or is checked out elsewhere.",
+      },
+      deliverable: {
+        type: 'string',
+        enum: ['commit', 'report'],
+        description:
+          'commit (default): the result is commits on its branch, gated by .office/checks. report: a read-only task whose answer is its text; no commits is then fine.',
       },
     },
     required: ['task'],

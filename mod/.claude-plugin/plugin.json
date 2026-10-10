@@ -122,6 +122,29 @@
       "description": "A background worker waiting on approval or input this long is reported to its manager once; at twice this it is ended, its work committed as WIP on its branch.",
       "default": 20
     },
+    "workerChecks": {
+      "type": "string",
+      "title": "Worker checks",
+      "description": "When a worker with its own worktree says it is done, the office checks its branch: a clean tree, HEAD on its branch, commits (unless spawned with deliverable report), then each line of .office/checks as the base commit has it (sh -c, from the worktree root). enforce: a red result rejects the job and keeps its worktree; report: it is shown, the job stays done; off: no checks.",
+      "options": [
+        "enforce",
+        "report",
+        "off"
+      ],
+      "default": "enforce"
+    },
+    "checkTimeoutMin": {
+      "type": "number",
+      "title": "Check timeout (minutes)",
+      "description": "Hard limit for one .office/checks command; one that runs longer is ended and counts as red.",
+      "default": 10
+    },
+    "checkBudgetSec": {
+      "type": "number",
+      "title": "Check budget (seconds)",
+      "description": ".office/checks holds fast gate checks only. When they pass but take longer than this in all, the delivery says so.",
+      "default": 120
+    },
     "messageApproval": {
       "type": "string",
       "title": "Message approval",
