@@ -658,6 +658,17 @@ describe('the worker gate', () => {
     expect(at(a => a.join(' ').endsWith('stop 5ac0f0df'))).toBeLessThan(at(a => a.includes('worktree') && a.includes('remove')))
     expect(checksRun(runs)).toEqual([])
   })
+
+  test('a --bg worker not confirmed stopped is never checked or accepted: failed, its worktree kept (regression)', async ($, on) => {
+    const { runs, clock, id, text } = await finish($, on, { checksFile: CHECKS, stopIgnored: true })
+    expect(text()).not.toContain(`(job ${id})`) // still waiting to see it stop
+    await clock.advance(30_000)
+    expect(text()).toContain(`Worker FAILED: rename x to y (job ${id})`)
+    expect(text()).toContain("Could not confirm the worker stopped: its result was not checked or accepted")
+    expect(text()).toContain("Worker's report (unchecked):\nRenamed it.")
+    expect(checksRun(runs)).toEqual([])
+    expect(removed(runs)).toBe(false)
+  })
 })
 
 describe('maxOpusWorkers', () => {

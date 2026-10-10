@@ -1242,20 +1242,25 @@ function adoptSubagent($: EngineInterface, options: PluginOptions, job: Job, age
   void startTimeout($, options, job.id)
 }
 
-/** Registers a --bg job's kill handle (`claude stop`, then the session ended in `claude agents`), its polling and its timeout. */
+/** `claude stop`, then the session ended in `claude agents`: whether the --bg session's stop is confirmed. */
+async function stopBg($: EngineInterface, options: PluginOptions, bgId: string): Promise<boolean> {
+  const bin = opt(options, 'claudePath', 'claude')
+  // A failed stop may mean the session already ended: the listing decides.
+  await $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
+  return confirmStopped($, async leftMs => {
+    const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: Math.min(20000, leftMs) })
+    // Only a whole listing is evidence: a cut or malformed one would read as "not listed", so stopped.
+    const agents = listed.exitCode === 0 && !listed.isStdoutTruncated ? parseAgentsListing(listed.stdout) : undefined
+    return agents !== undefined && isBgStopped(agents.find(a => a.id === bgId))
+  })
+}
+
+/** Registers a --bg job's kill handle (stopBg), its polling and its timeout. */
 function adoptBg($: EngineInterface, options: PluginOptions, job: Job, bgId: string): void {
   BG_JOBS.set(job.id, bgId)
   RUNNING.set(job.id, async () => {
     BG_JOBS.delete(job.id)
-    const bin = opt(options, 'claudePath', 'claude')
-    // A failed stop may mean the session already ended: the listing decides.
-    await $.process.run([bin, 'stop', bgId], { timeoutMs: 20000 }).catch(() => undefined)
-    return confirmStopped($, async leftMs => {
-      const listed = await $.process.run([bin, 'agents', '--json', '--all'], { timeoutMs: Math.min(20000, leftMs) })
-      // Only a whole listing is evidence: a cut or malformed one would read as "not listed", so stopped.
-      const agents = listed.exitCode === 0 && !listed.isStdoutTruncated ? parseAgentsListing(listed.stdout) : undefined
-      return agents !== undefined && isBgStopped(agents.find(a => a.id === bgId))
-    })
+    return stopBg($, options, bgId)
   })
   // A blocked job's deadline waits for its unblock, which re-arms it (pollBg).
   if (job.status !== 'blocked') void startTimeout($, options, job.id)
@@ -2229,10 +2234,22 @@ function startGate($: EngineInterface, options: PluginOptions, id: string): void
   $.clock.after(0, () => void gateWorker($, options, id, run))
 }
 
-/** The gate's verdict ends the job: done (its worktree removed when clean and not red) or rejected (kept). Never twice. */
+/**
+ * The gate's verdict ends the job: done (its worktree removed when clean and not red) or rejected (kept).
+ * A --bg worker not confirmed stopped is never checked or accepted: failed, its worktree kept. Never twice.
+ */
 async function gateWorker($: EngineInterface, options: PluginOptions, id: string, run: GateRun): Promise<void> {
   const job = (await read($, JOBS)).find(j => j.id === id)
   if (job?.status !== 'checking' || run.isKilled) return
+  // Nothing may write in the worktree while it is checked, and a live worker's worktree is never
+  // removed: a --bg worker is stopped first, whatever workerChecks says (pollBg leaves it to the gate).
+  if (job.bgId !== undefined && !(await stopBg($, options, job.bgId))) {
+    if (run.isKilled) return
+    const why = `Could not confirm the worker stopped: its result was not checked or accepted, and its worktree is kept at ${job.worktree}. It may still be running: check it before reusing its branch.`
+    await endGate($, id, run, { status: 'failed', block: why, canRemove: false })
+    return
+  }
+  if (run.isKilled) return
   let gate: { report: GateResult; sha?: string }
   try {
     gate = await checkWorker($, options, job, run)
@@ -2242,32 +2259,39 @@ async function gateWorker($: EngineInterface, options: PluginOptions, id: string
     gate = { report: gateReport({ ...opts, error: String(err).slice(0, 200) }) }
   }
   if (run.isKilled) return
+  const { report, sha } = gate
+  const status = report.isRejected ? 'rejected' : 'done'
+  // A red branch keeps its worktree, enforced or not: someone will look at it.
+  const canRemove = status === 'done' && report.verdict !== 'fail'
+  await endGate($, id, run, { status, block: report.block, canRemove, gate: { verdict: report.verdict, head: report.head, ...(sha !== undefined ? { sha } : {}) } })
+}
+
+/** Ends a `checking` job with the gate's outcome, once, and delivers it; `block` leads the worker's report. */
+async function endGate(
+  $: EngineInterface,
+  id: string,
+  run: GateRun,
+  end: { status: 'done' | 'rejected' | 'failed'; block: string; canRemove: boolean; gate?: NonNullable<Job['gate']> },
+): Promise<void> {
   if (GATES.get(id) === run) {
     GATES.delete(id)
     RUNNING.delete(id)
   }
-  const { report, sha } = gate
-  const status = report.isRejected ? 'rejected' : 'done'
+  const { status, block, canRemove, gate } = end
   const endedAt = Date.now()
+  const report = status === 'failed' ? "Worker's report (unchecked)" : "Worker's report"
   const list = await update($, JOBS, jobs =>
     withJob(jobs, id, j =>
       j.status === 'checking'
-        ? {
-            ...j,
-            status,
-            endedAt,
-            gate: { verdict: report.verdict, head: report.head, ...(sha !== undefined ? { sha } : {}) },
-            result: capResult(`${report.block}\n\nWorker's report:\n${j.result ?? ''}`),
-          }
+        ? { ...j, status, endedAt, ...(gate !== undefined ? { gate } : {}), result: capResult(`${block}\n\n${report}:\n${j.result ?? ''}`) }
         : j,
     ),
   )
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
   logInbox($, finishedLine(finished))
-  if (sha !== undefined && finished.branch !== undefined) await recordGate($, finished.branch, sha, report.verdict, endedAt)
-  // A red branch keeps its worktree, enforced or not: someone will look at it.
-  await deliver($, await settleWorktree($, finished, status === 'done' && report.verdict !== 'fail'))
+  if (gate?.sha !== undefined && finished.branch !== undefined) await recordGate($, finished.branch, gate.sha, gate.verdict, endedAt)
+  await deliver($, await settleWorktree($, finished, canRemove))
 }
 
 /** Git first (clean, on its branch, commits), then each line of the base commit's .office/checks, a red one re-run once. */
@@ -2277,11 +2301,6 @@ async function checkWorker($: EngineInterface, options: PluginOptions, job: Job,
   const opts = { mode, budgetSec: num(options, 'checkBudgetSec', 120), timeoutMin, base: job.baseRef, runs: [] as CheckRun[] }
   const { project: root, worktree: dir, branch, baseRef: base } = job
   if (root === undefined || dir === undefined || branch === undefined || base === undefined) throw new Error('no worktree')
-  // Nothing may write in the worktree while it is checked, and a live worker's worktree is never
-  // removed: a --bg worker is stopped first, whatever workerChecks says (pollBg leaves it to the gate).
-  if (job.bgId !== undefined) {
-    await $.process.run([opt(options, 'claudePath', 'claude'), 'stop', job.bgId], { timeoutMs: 20000 }).catch(() => undefined)
-  }
   if (mode === 'off') return { report: gateReport(opts) }
   const [status, head, count, tip] = await Promise.all([
     git($, ['git', '-C', dir, 'status', '--porcelain']),
