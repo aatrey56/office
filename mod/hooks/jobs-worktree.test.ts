@@ -659,6 +659,46 @@ describe('the worker gate', () => {
     expect(removed(runs)).toBe(false)
   })
 
+  test('a deadline already firing when the worker goes to its gate leaves the job to the gate (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    let transcript = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Renaming x.' }] } })
+    let release = () => {}
+    const hung = new Promise<{ code: number }>(r => { release = () => r({ code: 0 }) })
+    const busy = listing.replace('"idle"', '"busy"')
+    const runs = fakeRepo(on, { agents: () => busy, transcript: () => transcript, checksFile: CHECKS, check: line => (line === 'tsc' ? hung : { code: 0 }) })
+    const clock = mock.clock(on)
+    // Once armed, the next read of the jobs (the deadline's) answers what it read only when `held` is called.
+    let isArmed = false
+    let held: (() => void) | undefined
+    on('state.get', async (_$, e, next) => {
+      if (!isArmed || held !== undefined || e.key !== 'jobs') return next(e)
+      const read = await next(e)
+      await new Promise<void>(r => { held = r })
+      return read
+    })
+    const delivered = collectDelivery(on)
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+    await clock.advance(1_000) // the deadline (61 s) falls between two polls
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(59_000)
+    isArmed = true
+    await clock.advance(1_000) // the deadline fires: it reads the job running, and waits
+    expect(held).toBeDefined()
+    transcript = reply
+    await clock.advance(4_000) // the poll sees it done: to its gate, its first check under way
+    expect(runs.filter(r => r.argv[0] === 'sh').map(r => r.argv[2])).toEqual(['tsc'])
+    held?.()
+    await clock.advance(1_000)
+    expect(delivered.join('\n')).not.toContain('timed out')
+    release()
+    await clock.advance(1_000)
+    expect(delivered.join('\n')).toContain('Worker finished: rename x to y')
+    expect(delivered.join('\n')).toContain('CHECKS PASSED (3/3')
+  })
+
   test('with workerChecks off the --bg worker is still stopped before its worktree is removed (regression)', { options: { workerChecks: 'off' } }, async ($, on) => {
     const { runs, text } = await finish($, on, { checksFile: CHECKS })
     expect(text()).toContain('· UNVERIFIED: workerChecks is off')

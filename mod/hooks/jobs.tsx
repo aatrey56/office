@@ -726,6 +726,8 @@ async function finishJob($: EngineInterface, options: PluginOptions, id: string,
   // A job being ended past its time is delivered by endJob, once its work is committed.
   if (ENDING.has(id)) return
   const before = (await read($, JOBS)).find(j => j.id === id)
+  // A timeout that began while the jobs were read owns the job now (endJob delivers it).
+  if (ENDING.has(id)) return
   // Only a kill ends a job in its gate; the gate itself ends it otherwise.
   if (before?.status === 'checking' && status === 'done') return
   TIMERS.get(id)?.cancel()
@@ -752,10 +754,16 @@ async function finishJob($: EngineInterface, options: PluginOptions, id: string,
   if (before.agentId !== undefined) SUBAGENT_JOBS.delete(before.agentId)
   const capped = capResult(withoutDoneMarker(result))
   if (status === 'done' && isGated(before)) {
+    // Claimed before the await: a deadline firing meanwhile sees the gate and leaves the job to it.
+    const run = claimGate(id)
     const checking = await update($, JOBS, jobs =>
       withJob(jobs, id, j => (j.status === 'running' || j.status === 'blocked' ? { ...j, status: 'checking', result: capped } : j)),
     )
-    if (checking.find(j => j.id === id)?.status === 'checking') startGate($, options, id)
+    if (checking.find(j => j.id === id)?.status === 'checking' && !run.isKilled) startGate($, options, id, run)
+    else if (GATES.get(id) === run) {
+      GATES.delete(id)
+      RUNNING.delete(id)
+    }
     return
   }
   const endedAt = Date.now()
@@ -1129,20 +1137,25 @@ async function startTimeout($: EngineInterface, options: PluginOptions, id: stri
   const left = Math.max(1000, (CLOCK_START.get(id) ?? now) + (PAUSED_MS.get(id) ?? 0) + minutes * 60_000 - now)
   TIMERS.get(id)?.cancel()
   TIMERS.delete(id)
-  if (RUNNING.has(id)) TIMERS.set(id, $.clock.after(left, () => void onDeadline($, options, id)))
+  if (RUNNING.has(id) && !GATES.has(id)) TIMERS.set(id, $.clock.after(left, () => void onDeadline($, options, id)))
 }
 
 /** At a running job's deadline: extend it once while its transcript still grows; otherwise end it. */
 async function onDeadline($: EngineInterface, options: PluginOptions, id: string): Promise<void> {
   TIMERS.delete(id)
+  // Finished or gone to its gate (RUNNING then holds the gate's handle): no longer the deadline's.
+  const isOver = () => !RUNNING.has(id) || GATES.has(id)
   const job = (await read($, JOBS)).find(j => j.id === id)
-  if (job?.status !== 'running') return // finished, or blocked (its unblock re-arms it)
+  if (job?.status !== 'running' || isOver()) return // finished, or blocked (its unblock re-arms it)
   const { softMin, hardMin } = timeoutMins(options)
   const isExtended = EXTENDED.has(id)
-  const verdict = deadlineVerdict({ softMin, hardMin, isExtended, grewAt: GROWTH.get(id)?.at, now: await clockNow($) })
+  const now = await clockNow($)
+  if (isOver()) return
+  const verdict = deadlineVerdict({ softMin, hardMin, isExtended, grewAt: GROWTH.get(id)?.at, now })
   if (verdict === 'extend') {
     EXTENDED.add(id)
     await patchJob($, id, j => ({ ...j, isExtended: true }))
+    if (isOver()) return
     $.ui.toast(`Job ${id} still active at ${softMin} min: extended to ${hardMin} min`)
     await startTimeout($, options, id)
     return
@@ -1158,13 +1171,14 @@ async function onDeadline($: EngineInterface, options: PluginOptions, id: string
  */
 async function endJob($: EngineInterface, options: PluginOptions, id: string, why: string, minutes: number): Promise<void> {
   // Taken before the first await: pollBg starts it without waiting, and may come round again.
-  if (ENDING.has(id)) return
+  // A worker in its gate said it was done: no timeout ends it (only a kill, through finishJob).
+  if (ENDING.has(id) || GATES.has(id)) return
   ENDING.add(id)
   let saved = ''
   let worktree: string | undefined
   try {
     const job = (await read($, JOBS)).find(j => j.id === id)
-    if (job === undefined || !isLive(job)) return
+    if (job === undefined || !isLive(job) || job.status === 'checking' || GATES.has(id)) return
     worktree = job.worktree
     const isStopped = (await RUNNING.get(id)?.()) ?? true
     RUNNING.delete(id) // stopped (or given up on): it no longer counts toward maxWorkers
@@ -2223,7 +2237,12 @@ function isGated(job: Job): boolean {
  * Runs a `checking` worker's gate off the caller's path (pollBg awaits finishJob, and checks take
  * minutes). The job holds its slot in RUNNING meanwhile, and a kill there ends the check under way.
  */
-function startGate($: EngineInterface, options: PluginOptions, id: string): void {
+function startGate($: EngineInterface, options: PluginOptions, id: string, run = claimGate(id)): void {
+  $.clock.after(0, () => void gateWorker($, options, id, run))
+}
+
+/** Makes the job its gate's, synchronously: GATES says so (no timeout ends it), and RUNNING holds the gate's kill. */
+function claimGate(id: string): GateRun {
   const run: GateRun = { isKilled: false }
   GATES.set(id, run)
   RUNNING.set(id, async () => {
@@ -2231,7 +2250,7 @@ function startGate($: EngineInterface, options: PluginOptions, id: string): void
     run.stop?.()
     return true
   })
-  $.clock.after(0, () => void gateWorker($, options, id, run))
+  return run
 }
 
 /**
