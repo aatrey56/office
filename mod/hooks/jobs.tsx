@@ -49,7 +49,7 @@ import {
   rulesRoute,
 } from './router'
 import type { Routed } from './router'
-import { alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
+import { alertKeysSeen, alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
 import {
   addJobTo,
   bgArgv,
@@ -850,9 +850,10 @@ async function alertUsage($: EngineInterface, options: PluginOptions, provider: 
     const alerts = usageAlerts(provider, windows, pct, Date.now())
     if (alerts.length === 0 || (await $.env.get('OFFICE_WORKER')) === '1') return
     for (const a of alerts) {
-      if ((await storeGet($, a.key)) !== undefined) continue // the cheap check: no lock for a window already alerted
+      const seen = async () => { for (const k of alertKeysSeen(a.key)) if ((await storeGet($, k)) !== undefined) return true; return false }
+      if (await seen()) continue // the cheap check: no lock for a window already alerted
       const isFirst = await withLock($, ALERT_LOCK, async () => {
-        if ((await storeGet($, a.key)) !== undefined) return false
+        if (await seen()) return false
         await $.store.set(a.key, { at: Date.now() })
         for (const stale of staleAlertKeys(await $.store.keys().catch(() => [] as string[]), Date.now())) await $.store.delete(stale).catch(() => undefined)
         return true

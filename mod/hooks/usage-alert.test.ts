@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
+import { alertKeysSeen, alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
 
 const NOW = Date.parse('2026-10-09T12:00:00Z')
 const HOUR = 3_600_000
@@ -32,7 +32,21 @@ describe('usage alert', () => {
   test('a window with no usable reset time, or one already past, does not alert; keys of reset windows are stale', () => {
     expect(usageAlerts('Claude', [{ kind: 'five_hour', percentUsed: 95 }, win('five_hour', 95, 'soon'), win('five_hour', 95, new Date(NOW - HOUR).toISOString())], 90, NOW)).toEqual([])
     const live = usageAlerts('Claude', [win('five_hour', 95)], 90, NOW)[0]!.key
-    const old = usageAlerts('Claude', [win('five_hour', 95, new Date(NOW - HOUR).toISOString())], 90, NOW - 3 * HOUR)[0]!.key // its reset has passed
+    const old = usageAlerts('Claude', [win('five_hour', 95, new Date(NOW - 2 * HOUR).toISOString())], 90, NOW - 5 * HOUR)[0]!.key // its reset passed long ago
     expect(staleAlertKeys([live, old, 'codexRounds'], NOW)).toEqual([old])
+  })
+
+  test('a key whose bucket rounded down is not stale just after the bucket time', () => {
+    const grain = 5 * 60_000
+    const reset = 1000 * grain + 2 * 60_000 // rounds down to bucket 1000, so bucket time is 2 min before the reset
+    const key = usageAlerts('Claude', [win('five_hour', 95, new Date(reset).toISOString())], 90, reset - HOUR)[0]!.key
+    expect(key.endsWith(':1000')).toBe(true)
+    expect(staleAlertKeys([key], 1000 * grain + 1000)).toEqual([])
+    expect(staleAlertKeys([key], reset + 2 * HOUR)).toEqual([key])
+  })
+
+  test('a neighbour-bucket key counts as already shown', () => {
+    const key = 'usageAlert:Claude:five_hour:1000'
+    expect(alertKeysSeen(key)).toEqual([key, 'usageAlert:Claude:five_hour:999', 'usageAlert:Claude:five_hour:1001'])
   })
 })

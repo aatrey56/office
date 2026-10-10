@@ -44,7 +44,17 @@ export function usageAlerts(provider: 'Claude' | 'Codex', windows: readonly Rate
     })
 }
 
-/** The stored alert keys whose window has reset: they can never recur, so they are deleted. */
+/** How long past its bucket a key lives: rounding puts a bucket up to half a grain before the real reset. */
+const STALE_MARGIN_MS = 60 * 60_000
+
+/** The stored alert keys whose window has long reset: they can never recur, so they are deleted. */
 export function staleAlertKeys(keys: readonly string[], now: number): string[] {
-  return keys.filter(k => k.startsWith(ALERT_KEY_PREFIX) && Number(k.split(':').at(-1)) * RESET_GRAIN_MS < now)
+  return keys.filter(k => k.startsWith(ALERT_KEY_PREFIX) && (Number(k.split(':').at(-1)) + 1) * RESET_GRAIN_MS + STALE_MARGIN_MS < now)
+}
+
+/** The key itself and its two neighbour buckets: drift across a bucket edge must not alert a window twice. */
+export function alertKeysSeen(key: string): string[] {
+  const at = key.lastIndexOf(':')
+  const bucket = Number(key.slice(at + 1))
+  return [key, `${key.slice(0, at + 1)}${bucket - 1}`, `${key.slice(0, at + 1)}${bucket + 1}`]
 }
