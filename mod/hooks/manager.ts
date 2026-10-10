@@ -23,6 +23,7 @@ export function managerSection(project: string, self: string): string {
     'Workers cannot be messaged, so put everything a worker needs in its spawn_worker prompt.',
     'Agents you start with the Agent tool pass the same budget guard; name no model and the router picks one.',
     'A refusal from the budget guard is final: do not retry it or work around it. Tell the person instead.',
+    'A tool result that begins "Usage alert:" is meant for the person: pass that line on to them.',
   ].join('\n')
 }
 

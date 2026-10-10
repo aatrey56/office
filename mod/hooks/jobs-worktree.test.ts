@@ -16,7 +16,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; untracked?: string; failSet?: string }
+type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string; bgExit?: number; bgGate?: Promise<void>; agents?: () => string; transcript?: () => string; store?: Record<string, unknown>; untracked?: string; failSet?: string; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock() }) as Runs
   const { store } = runs
@@ -51,7 +51,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     }
   })
   mock.env(on, { HOME: '/home/me', CLAUDE_CONFIG_DIR: '/cfg' })
-  on('session.usage', () => NO_LIMITS)
+  on('session.usage', () => (fake.rateLimits ? { value: { ...NO_LIMITS.value, rateLimits: fake.rateLimits } } : NO_LIMITS))
   on('session.cwd', () => ({ value: '/r/src' }))
   on('process.run', async (_$, e) => {
     const argv = [...e.argv]
@@ -663,6 +663,24 @@ describe('codex review rounds', () => {
     const rounds = (runs.store.get('codexRounds') as Record<string, { isPerson?: boolean }[]>)[KEY]!
     expect(rounds).toHaveLength(4)
     expect(rounds[3]!.isPerson).toBe(true)
+  })
+})
+
+describe('usage alerts', () => {
+  test('a window at 90% alerts once across two reads, in the toast and on the next manager result, then stays quiet', async ($, on) => {
+    const toasts: string[] = []
+    const resetsAt = new Date(Date.now() + 2 * 3_600_000).toISOString()
+    const runs = fakeRepo(on, { rateLimits: [{ kind: 'five_hour', percentUsed: 93, resetsAt }] })
+    on('ui.toast', (_$, e) => {
+      toasts.push(e.text)
+      return { value: undefined }
+    })
+    const first = String((await $.tool.call({ tool: 'mcp__office__session_usage' })).result)
+    expect(first).toMatch(/^Usage alert: Claude 5-hour window at 93% \(resets .+\)\.\n\n\{/)
+    const second = String((await $.tool.call({ tool: 'mcp__office__session_usage' })).result)
+    expect(second.startsWith('{')).toBe(true)
+    expect(toasts).toHaveLength(1)
+    expect([...runs.store.keys()].filter(k => k.startsWith('usageAlert:Claude:five_hour:'))).toHaveLength(1)
   })
 })
 

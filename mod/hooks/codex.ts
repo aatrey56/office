@@ -160,19 +160,19 @@ export const CODEX_REVIEW_TOOL = {
   description:
     'Hand the current repo\'s changes to OpenAI Codex for an independent code review (`codex exec review`). ' +
     'Returns a job id at once; the review runs in the background (minutes) and its text is appended to this conversation when done. ' +
-    'Rounds per branch are enforced in code. Round 1 is a full review on the review model. ' +
-    'A later call with no target re-reviews only the changes since the last reviewed commit, on a cheaper model, ' +
-    'checking that the previous round\'s findings are fixed and that the fixes broke nothing; ' +
-    'it becomes a full review after a rebase, when the diff since then is large, or with full: true. ' +
-    'Later rounds with an explicit target run that target as given, also on the cheaper model, unless full: true or deep: true; they still count as rounds. ' +
+    'Rounds per branch are enforced in code. Round 1 is a full review on the review model (Sol); every later round runs on the cheaper re-review model (Luna), ' +
+    'given the earlier rounds\' findings in its instructions (the first Codex session is not resumed). ' +
+    'A later call with no target re-reviews only the changes since the last reviewed commit, ' +
+    'checking that the previous findings are fixed and that the fixes broke nothing; ' +
+    'it becomes a full re-review of the whole branch (still on the cheaper model) after a rebase, when the diff since then is large, or with full: true. ' +
+    'Later rounds with an explicit target run that target as given, also on the cheaper model; they still count as rounds. ' +
+    'deep: true (only when the person asks) runs the deep model on every round. ' +
     'A call with nothing new since the last round is refused. At codexMaxRounds rounds (default 3) calls are refused: ' +
     'then stop, summarise the remaining findings and ask the person. ' +
-    'Full reviews are also capped across all sessions and branches at codexFullReviewsPer5h (default 10) in any 5 hours, each about 4% of the owner\'s 5-hour Codex limit: ' +
-    'at the cap a call that needs a full review (round 1, a rebase, a large diff, full: true, deep: true) is refused with the time the next slot frees, ' +
-    'while a re-review of new commits still runs on the cheaper model; do not retry before that time. ' +
     'If Codex is out of usage (the result says so), run an Opus review via a subagent instead: it is a same-model-family review with lower trust, ' +
     'since Claude also wrote the code and may confirm its own bias, so verify each finding, do not count a clean Opus review as evidence the branch is correct, ' +
-    'and say "reviewed by Opus (Codex out of usage), not independent" in the PR description.',
+    'and say "reviewed by Opus (Codex out of usage), not independent" in the PR description. ' +
+    'A result that begins "Usage alert:" is for the person: pass that line on.',
   inputSchema: {
     type: 'object',
     properties: {

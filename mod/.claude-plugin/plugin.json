@@ -81,6 +81,12 @@
       "description": "Reviews an agent may start on one branch, the first included; then codex_review is refused. Your own /codex-review is never refused, and counts.",
       "default": 3
     },
+    "usageAlertPct": {
+      "type": "number",
+      "title": "Usage alert percent",
+      "description": "Alert you once when your Claude or Codex 5-hour or weekly usage window reaches this percent (a toast, repeated to the manager on its next session_usage, spawn_worker or codex_review result). Once per window, across all sessions. 0 = off.",
+      "default": 90
+    },
     "claudePath": {
       "type": "string",
       "title": "claude executable",

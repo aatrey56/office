@@ -49,6 +49,7 @@ import {
   rulesRoute,
 } from './router'
 import type { Routed } from './router'
+import { alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
 import {
   addJobTo,
   bgArgv,
@@ -306,13 +307,27 @@ export function installJobs(on: On, options: PluginOptions) {
     return spawned
   })
 
+  // The engine pushes the account's limits as a window moves a whole point: Claude's alert needs no poll.
+  on('session.measure', async ($, e, next) => {
+    if (e.changed.includes('rateLimits')) await alertUsage($, options, 'Claude', e.rateLimits)
+    return next(e)
+  })
+
   // ── tools ───────────────────────────────────────────────────────────────
   on('tool.call', { tool: 'mcp__office__codex_review' }, async ($, e) => {
     const input = e as unknown as Input
     const deep = input.deep === true
     const ask = { ...BY_AGENT_CODEX, isFull: input.full === true }
     const msg = await startCodexReview($, options, str(input.target), str(input.instructions), str(input.cwd), deep, ask)
-    return msg.ok ? { result: msg.text } : { deny: msg.text }
+    const text = takeAlerts() + msg.text
+    return msg.ok ? { result: text } : { deny: text }
+  })
+
+  // session_usage reads the account's limits anyway: the same read checks them for the alert.
+  on('tool.call', { tool: 'mcp__office__session_usage' }, async $ => {
+    const { startedAt, context, rateLimits, cost } = await $.session.usage()
+    await alertUsage($, options, 'Claude', rateLimits)
+    return { result: takeAlerts() + JSON.stringify({ startedAt, context, rateLimits, cost }, null, 2) }
   })
 
   on('tool.call', { tool: 'mcp__office__codex_exec' }, async ($, e) => {
@@ -329,7 +344,8 @@ export function installJobs(on: On, options: PluginOptions) {
     if (!task) return { deny: 'spawn_worker needs a task.' }
     const mode: WorkerMode = isWorkerMode(input.mode) ? input.mode : 'bg'
     const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT)
-    return msg.ok ? { result: msg.text } : { deny: msg.text }
+    const text = takeAlerts() + msg.text
+    return msg.ok ? { result: text } : { deny: text }
   })
 
   on('tool.call', { tool: 'mcp__office__route_task' }, async ($, e) => {
@@ -780,6 +796,8 @@ type FileLock = { name: string; chain: Promise<unknown> }
 const CAP_LOCK: FileLock = { name: 'capacity', chain: Promise.resolve() }
 /** The Codex review ledger's: kept apart so a slow git run under it never holds up a worker's start. */
 const ROUNDS_LOCK: FileLock = { name: 'codex-rounds', chain: Promise.resolve() }
+/** The usage alerts' (usage-alert.ts): the first session to write an alert's key shows it. */
+const ALERT_LOCK: FileLock = { name: 'usage-alerts', chain: Promise.resolve() }
 
 /** The capacity lock stayed held by another session past LOCK_WAIT_MS: the transaction was not run. */
 class CapLockBusy extends Error {
@@ -808,6 +826,44 @@ async function withLock<T>($: EngineInterface, lock: FileLock, fn: () => Promise
   })
   lock.chain = run.catch(() => undefined)
   return run
+}
+
+const ALERT_TOAST_MS = 15_000
+/** Alerts this session raised and the manager has not yet been told of: they lead the next session_usage, spawn_worker or codex_review result. */
+const PENDING_ALERTS: string[] = []
+
+/** The pending alerts as a lead for a manager-facing result, and forgotten; '' with none. */
+function takeAlerts(): string {
+  const text = PENDING_ALERTS.splice(0).join('\n')
+  return text === '' ? '' : `${text}\n\n`
+}
+
+/**
+ * Alerts the person once when `provider`'s 5-hour or weekly window reaches usageAlertPct (0 = off): a toast, and a
+ * lead on the manager's next result. Deduped across sessions by a store key per provider, window and reset, written
+ * under a lock so only the first session shows it. A worker never alerts (nobody reads its toasts). A busy lock or
+ * unreadable store skips quietly: the next read tries again.
+ */
+async function alertUsage($: EngineInterface, options: PluginOptions, provider: 'Claude' | 'Codex', windows: readonly RateWindow[]): Promise<void> {
+  try {
+    const pct = alertPctOf(options.usageAlertPct)
+    const alerts = usageAlerts(provider, windows, pct, Date.now())
+    if (alerts.length === 0 || (await $.env.get('OFFICE_WORKER')) === '1') return
+    for (const a of alerts) {
+      if ((await storeGet($, a.key)) !== undefined) continue // the cheap check: no lock for a window already alerted
+      const isFirst = await withLock($, ALERT_LOCK, async () => {
+        if ((await storeGet($, a.key)) !== undefined) return false
+        await $.store.set(a.key, { at: Date.now() })
+        for (const stale of staleAlertKeys(await $.store.keys().catch(() => [] as string[]), Date.now())) await $.store.delete(stale).catch(() => undefined)
+        return true
+      })
+      if (!isFirst) continue
+      PENDING_ALERTS.push(a.text)
+      $.ui.toast(a.text, { timeoutMs: ALERT_TOAST_MS })
+    }
+  } catch (err) {
+    debugLog($, `office: usage alert skipped: ${String(err)}`)
+  }
 }
 
 /** Like withCapLock, but a busy lock is `undefined` for a caller whose work can wait or lapse (a renewal, a release). */
@@ -1424,11 +1480,12 @@ async function markCodexOut($: EngineInterface, model: string, errorText: string
 }
 
 /** The budget guard before a Codex job: a live read of the limits, else the last one kept. */
-async function codexGuard($: EngineInterface, bin: string, cwd: string, model: string, isForced: boolean): Promise<CodexVerdict> {
+async function codexGuard($: EngineInterface, options: PluginOptions, bin: string, cwd: string, model: string, isForced: boolean): Promise<CodexVerdict> {
   const out = await storedCodexOut($)
-  const limits =
-    (await readCodexLimits($, bin, cwd)) ??
-    ((await $.store.get(CODEX_LIMITS_KEY).catch(() => undefined)) as CodexLimits | undefined)
+  const live = await readCodexLimits($, bin, cwd)
+  // The live read is the only one that costs a call, so it is the only one that can alert (the stored read may be old).
+  if (live) await alertUsage($, options, 'Codex', live.buckets.flatMap(b => b.windows))
+  const limits = live ?? ((await $.store.get(CODEX_LIMITS_KEY).catch(() => undefined)) as CodexLimits | undefined)
   return codexGuardVerdict(model, Date.now(), { limits: Array.isArray(limits?.buckets) ? limits : undefined, out }, isForced)
 }
 
@@ -1497,7 +1554,7 @@ async function startCodexReview(
   }
   const tier = plan.tier
   const target: ReviewTarget = plan.target ?? fallback!
-  const verdict = await codexGuard($, bin, cwd, tier.model, ask.isForced)
+  const verdict = await codexGuard($, options, bin, cwd, tier.model, ask.isForced)
   if (!verdict.isAllowed) {
     await drop()
     return { ok: false, text: `${refusedText(verdict, ask)} ${CODEX_OUT_FALLBACK_TEXT}` }
@@ -1735,7 +1792,7 @@ async function startCodexExec(
   const bin = opt(options, 'codexPath', 'codex')
   const tier: CodexTier = { model: opt(options, 'codexExecModel', CODEX_DEFAULTS.exec.model), effort: CODEX_DEFAULTS.exec.effort }
   // codex_exec is only ever an agent's call: the guard holds, with no override.
-  const verdict = await codexGuard($, bin, cwd, tier.model, false)
+  const verdict = await codexGuard($, options, bin, cwd, tier.model, false)
   if (!verdict.isAllowed) return { ok: false, text: refusedText(verdict, BY_AGENT_CODEX) }
   const now = Date.now()
   const job: Job = {
@@ -1776,12 +1833,15 @@ type SpawnedBy = { isPerson: boolean; isForced: boolean }
 const BY_AGENT: SpawnedBy = { isPerson: false, isForced: false }
 
 /** The account's rate-limit windows; none when they cannot be read, which leaves the guard open. */
-async function rateWindows($: EngineInterface): Promise<RateWindow[]> {
+async function rateWindows($: EngineInterface, options: PluginOptions): Promise<RateWindow[]> {
+  let windows: RateWindow[]
   try {
-    return (await $.session.usage()).rateLimits
+    windows = (await $.session.usage()).rateLimits
   } catch {
     return []
   }
+  await alertUsage($, options, 'Claude', windows)
+  return windows
 }
 
 function budgetCaps(options: PluginOptions): BudgetCaps {
@@ -1814,7 +1874,7 @@ async function startWorker(
   if (full) return { ok: false, text: full }
   // The budget guard, in two looks: past the hard limit nothing starts, so no routing call
   // is spent finding out the task's size; in the soft zone the route decides.
-  const windows = await rateWindows($)
+  const windows = await rateWindows($, options)
   const caps = budgetCaps(options)
   const isForced = by.isPerson && by.isForced
   const atHard = budgetVerdict(windows, caps, { isSmall: false, isExplicit: false, isForced })
@@ -1976,7 +2036,7 @@ function debugLog($: EngineInterface, text: string): void {
 async function planAgent($: EngineInterface, options: PluginOptions, e: AgentSpawnInput): Promise<AgentPlan> {
   if ((await $.env.get('OFFICE_WORKER')) !== undefined) return {}
   if (!isManagerSession(await $.store.get(MANAGERS_KEY), await $.session.id())) return {}
-  const windows = await rateWindows($)
+  const windows = await rateWindows($, options)
   const caps = budgetCaps(options)
   const hard = hardDeny(windows, caps)
   if (hard !== undefined) return { deny: hard }
