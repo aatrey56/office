@@ -21,11 +21,12 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // is perl's wait running out: every holder still waiting exits 1, printing nothing, and never takes the lock.
 // `fake.perl: 'missing'` makes the holder fail to run at all.
 // The gate: `checksFile` is .office/checks in the base commit (absent: `git show` fails), `check(line)` answers each
-// `sh -c` line (default exit 0), `head` is the worktree's branch (default the one it was made on), `commits` counts base..branch (1).
+// `sh -c` line (default exit 0), `head` is the worktree's branch (default the one it was made on), `commits` counts base..branch (1);
+// `renamed` is the name the worker renamed its branch to: HEAD is on it, and the branch it was made on is gone (a range to it fails).
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
 type Check = (line: string) => { code: number; out?: string } | Promise<{ code: number; out?: string }>
-type Fake = { checksFile?: string; check?: Check; head?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
+type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -73,7 +74,8 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
     if (cmd.includes('--git-common-dir')) return out('/r/.git\n')
     if (argv.includes('worktree') && argv.includes('add')) madeBranch = argv[argv.indexOf('-b') + 1] ?? ''
-    if (argv.includes('--show-current')) return out(`${fake.head ?? madeBranch}\n`)
+    if (argv.includes('--show-current')) return out(`${fake.renamed ?? fake.head ?? madeBranch}\n`)
+    if (fake.renamed !== undefined && madeBranch !== '' && argv.some(a => a.endsWith(`..${madeBranch}`))) return out('', 128)
     if (argv.includes('rev-list')) return out(`${fake.commits ?? 1}\n`)
     if (argv[3] === 'show') return fake.checksFile === undefined ? out('', 128) : out(fake.checksFile)
     if (cmd.endsWith('rev-parse HEAD')) return fake.noHead ? out('', 128) : out(`${BASE}\n`)
@@ -582,6 +584,13 @@ describe('the worker gate', () => {
   test('a dirty worktree is rejected as uncommitted, before any check runs', async ($, on) => {
     const { runs, text } = await finish($, on, { checksFile: CHECKS, dirty: true })
     expect(text()).toContain('Worker REJECTED: uncommitted changes in the worktree · rename x to y')
+    expect(checksRun(runs)).toEqual([])
+    expect(removed(runs)).toBe(false)
+  })
+
+  test('a worker that renamed its branch is rejected as off its branch, its worktree kept (regression)', async ($, on) => {
+    const { runs, text } = await finish($, on, { checksFile: CHECKS, renamed: 'feat/renamed' })
+    expect(text()).toContain('Worker REJECTED: worker left its branch: HEAD is on feat/renamed, not office/')
     expect(checksRun(runs)).toEqual([])
     expect(removed(runs)).toBe(false)
   })

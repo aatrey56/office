@@ -2302,23 +2302,25 @@ async function checkWorker($: EngineInterface, options: PluginOptions, job: Job,
   const { project: root, worktree: dir, branch, baseRef: base } = job
   if (root === undefined || dir === undefined || branch === undefined || base === undefined) throw new Error('no worktree')
   if (mode === 'off') return { report: gateReport(opts) }
+  // Commits are counted to the worktree's HEAD: a branch the worker renamed leaves no job ref to count to.
   const [status, head, count, tip] = await Promise.all([
     git($, ['git', '-C', dir, 'status', '--porcelain']),
     git($, ['git', '-C', dir, 'branch', '--show-current']),
-    git($, ['git', '-C', root, 'rev-list', '--count', `${base}..${branch}`]),
+    git($, ['git', '-C', dir, 'rev-list', '--count', `${base}..HEAD`]),
     git($, ['git', '-C', dir, 'rev-parse', 'HEAD']),
   ])
+  const sha = tip.isOk ? tip.out.trim() : undefined
+  const facts = { branch, commits: 0, deliverable: job.deliverable ?? 'commit' }
+  // A dirty tree or a HEAD off its branch that git did show is a verdict, whatever else git failed at.
+  const isDirty = status.isOk && status.out.trim() !== ''
+  const headBranch = head.isOk ? head.out.trim() : undefined
+  if (isDirty || (headBranch !== undefined && headBranch !== branch)) {
+    return { report: gateReport({ ...opts, git: gitVerdict({ ...facts, isDirty, headBranch: headBranch ?? '' }) }), sha }
+  }
   for (const [what, r] of [['status', status], ['branch', head], ['rev-list', count]] as const) {
     if (!r.isOk) throw new Error(`git ${what}: ${r.out.slice(0, 160)}`)
   }
-  const sha = tip.isOk ? tip.out.trim() : undefined
-  const git1: GitVerdict = gitVerdict({
-    isDirty: status.out.trim() !== '',
-    headBranch: head.out.trim(),
-    branch,
-    commits: Number.parseInt(count.out.trim(), 10) || 0,
-    deliverable: job.deliverable ?? 'commit',
-  })
+  const git1: GitVerdict = gitVerdict({ ...facts, isDirty, headBranch: branch, commits: Number.parseInt(count.out.trim(), 10) || 0 })
   if (git1.verdict !== 'ok') return { report: gateReport({ ...opts, git: git1 }), sha }
   // From the base commit, never the worktree: a worker cannot edit its own gate.
   const shown = await git($, checksShowArgv(root, base))
