@@ -21,6 +21,7 @@ Checked against the code in `mod/hooks`. The rest of this document is the origin
 | `/spawn` workers in `bg`, `headless` and `subagent` modes | Built, tested |
 | `spawn_worker` `base` and `branch` (worker told it is already on its branch, never to switch) | Built, tested |
 | Worker watchdog: progress-aware timeout with one extension (`jobTimeoutMin` 45, `jobTimeoutHardMin` 60), WIP commit of a timed-out worker's work, blocked limit (`blockedTimeoutMin` 20: report, end at 2x), stalled report (no reply 5 min after start) | Built, tested; subagent workers have no growth signal, so they are never extended |
+| Worker gate, phase 1: git rules and `.office/checks` from the base commit, `rejected` status, `deliverable`, `workerChecks` / `checkTimeoutMin` / `checkBudgetSec` | Built, tested; merge guard, retries, Stop gate and scope checks not built |
 | Codex review (`/codex-review`) | Built |
 | Worker git worktrees (option `workerWorktree`) | Partly built, in progress on `feat/worker-worktrees` |
 | Every subagent of a conversation drawn as a character | Partly built, in progress on `feat/worker-worktrees` |

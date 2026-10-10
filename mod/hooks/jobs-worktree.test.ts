@@ -20,9 +20,13 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // the lock dropped when the holder's stream ends; `flock.take()` is another session's hold. `flock.expire()`
 // is perl's wait running out: every holder still waiting exits 1, printing nothing, and never takes the lock.
 // `fake.perl: 'missing'` makes the holder fail to run at all.
+// The gate: `checksFile` is .office/checks in the base commit (absent: `git show` fails), `check(line)` answers each
+// `sh -c` line (default exit 0), `head` is the worktree's branch (default the one it was made on), `commits` counts base..branch (1);
+// `renamed` is the name the worker renamed its branch to: HEAD is on it, and the branch it was made on is gone (a range to it fails).
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock }
-type Fake = { perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
+type Check = (line: string) => { code: number; out?: string } | Promise<{ code: number; out?: string }>
+type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock() }) as Runs
   const { store, flock } = runs
@@ -30,6 +34,7 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
   const stopped = new Set<string>()
   let isStopAsked = false
   let isSlowDone = false
+  let madeBranch = ''
   on('store.get', (_$, e) => ({ value: store.get(e.key) }))
   on('store.set', (_$, e) => {
     runs.sets.push(e.key)
@@ -37,6 +42,12 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     return { value: undefined }
   })
   on('process.spawn', async function* (_$, e, next) {
+    if (e.argv[0] === 'sh' && e.argv[1] === '-c') {
+      runs.push({ argv: [...e.argv], cwd: e.cwd })
+      const r: { code: number; out?: string } = await (fake.check ?? (() => ({ code: 0 })))(e.argv[2] ?? '')
+      if (r.out) yield { stream: 'stdout' as const, text: r.out }
+      return { value: { code: r.code, signal: null } }
+    }
     if (e.argv[0] !== 'perl') {
       if (fake.spawn === undefined) return yield* next(e)
       yield* fake.spawn(e)
@@ -62,6 +73,11 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     const cmd = argv.join(' ')
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
     if (cmd.includes('--git-common-dir')) return out('/r/.git\n')
+    if (argv.includes('worktree') && argv.includes('add')) madeBranch = argv[argv.indexOf('-b') + 1] ?? ''
+    if (argv.includes('--show-current')) return out(`${fake.renamed ?? fake.head ?? madeBranch}\n`)
+    if (fake.renamed !== undefined && madeBranch !== '' && argv.some(a => a.endsWith(`..${madeBranch}`))) return out('', 128)
+    if (argv.includes('rev-list')) return out(`${fake.commits ?? 1}\n`)
+    if (argv[3] === 'show') return fake.checksFile === undefined ? out('', 128) : out(fake.checksFile)
     if (cmd.endsWith('rev-parse HEAD')) return fake.noHead ? out('', 128) : out(`${BASE}\n`)
     if (cmd.endsWith('^{commit}')) return out(`${OTHER}\n`)
     if (argv.includes('show-ref')) return out('', fake.branches?.some(b => cmd.endsWith(`refs/heads/${b}`)) ? 0 : 1)
@@ -516,6 +532,238 @@ describe('--bg worker finish: the [office: done] marker', () => {
     expect(text).toContain('is waiting for input')
     expect(text).toContain('Rename x in tests too?')
     expect(text).not.toContain('Worker finished')
+  })
+})
+
+describe('the worker gate', () => {
+  const reply = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Renamed it.\n[office: done]' }] } })
+  const listing = '[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"working","status":"idle"}]'
+  const CHECKS = '# fast gate checks\ntsc\nnpm test\nlint\n'
+  // A --bg worker that says it is done on the first poll; the gate runs in the timer that poll arms.
+  async function finish($: Engine, on: On, fake: Fake = {}, input: Record<string, unknown> = {}) {
+    const runs = fakeRepo(on, { agents: () => listing, transcript: () => reply, ...fake })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+    const started = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', ...input })
+    const id = /job (\w+)/.exec(JSON.stringify(started))?.[1] ?? ''
+    await clock.advance(5_000)
+    return { runs, clock, id, text: () => delivered.join('\n') }
+  }
+  const checksRun = (runs: Runs) => runs.filter(r => r.argv[0] === 'sh').map(r => r.argv[2])
+  const removed = (runs: Runs) => runs.some(r => r.argv.includes('worktree') && r.argv.includes('remove'))
+
+  test('green checks: done, CHECKS PASSED in the head, the worktree removed; the session stopped before the checks', async ($, on) => {
+    const { runs, id, text } = await finish($, on, { checksFile: CHECKS })
+    expect(text()).toContain(`Worker finished: rename x to y (job ${id}) · CHECKS PASSED (3/3, 0s)`)
+    expect(checksRun(runs)).toEqual(['tsc', 'npm test', 'lint'])
+    expect(runs.find(r => r.argv[0] === 'sh')?.cwd).toMatch(/^\/cfg\/office\/worktrees\//)
+    const at = (pred: (a: string[]) => boolean) => runs.findIndex(r => pred(r.argv))
+    expect(at(a => a.join(' ').endsWith('stop 5ac0f0df'))).toBeLessThan(at(a => a[0] === 'sh'))
+    expect(removed(runs)).toBe(true)
+    expect(runs.store.get('gates')).toMatchObject({ [`office/${id}-rename-x-to-y`]: { sha: BASE, verdict: 'pass' } })
+  })
+
+  test('a red check, red again on its re-run: rejected with the command and output tail, the worktree kept, the slot freed', { options: { maxWorkers: 1 } }, async ($, on) => {
+    const check: Check = line => (line === 'npm test' ? { code: 1, out: 'ok 1\nnot ok 2 login fails\n' } : { code: 0 })
+    const { runs, id, text } = await finish($, on, { checksFile: CHECKS, check })
+    expect(text()).toContain(`Worker REJECTED: CHECKS FAILED: \`npm test\` exit 1 · rename x to y (job ${id})`)
+    expect(text()).toContain('$ npm test\nexit 1 after 0s (and again on its re-run)\nok 1\nnot ok 2 login fails')
+    expect(text()).toContain("Worker's report:\nRenamed it.")
+    expect(checksRun(runs)).toEqual(['tsc', 'npm test', 'npm test']) // lint never runs
+    expect(removed(runs)).toBe(false)
+    expect(text()).toMatch(/Worktree kept at \/cfg\/office\/worktrees\//)
+    const next = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'tidy it', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    expect(JSON.stringify(next)).toContain('Started background worker')
+  })
+
+  test('a dirty worktree is rejected as uncommitted, before any check runs', async ($, on) => {
+    const { runs, text } = await finish($, on, { checksFile: CHECKS, dirty: true })
+    expect(text()).toContain('Worker REJECTED: uncommitted changes in the worktree · rename x to y')
+    expect(checksRun(runs)).toEqual([])
+    expect(removed(runs)).toBe(false)
+  })
+
+  test('a worker that renamed its branch is rejected as off its branch, its worktree kept (regression)', async ($, on) => {
+    const { runs, text } = await finish($, on, { checksFile: CHECKS, renamed: 'feat/renamed' })
+    expect(text()).toContain('Worker REJECTED: worker left its branch: HEAD is on feat/renamed, not office/')
+    expect(checksRun(runs)).toEqual([])
+    expect(removed(runs)).toBe(false)
+  })
+
+  test('the checks are read from the base commit, never from the worktree', async ($, on) => {
+    const read: string[] = []
+    on('fs.read', (_$, e) => {
+      read.push(e.path)
+      return { value: '' }
+    })
+    const { runs } = await finish($, on, { checksFile: CHECKS })
+    expect(runs.some(r => r.argv.join(' ') === `git -C /r show ${BASE}:.office/checks`)).toBe(true)
+    expect(read.some(path => path.endsWith('.office/checks'))).toBe(false)
+  })
+
+  test('no checks file in the base commit: done, UNVERIFIED in the head', async ($, on) => {
+    const { runs, text } = await finish($, on)
+    expect(text()).toContain('· UNVERIFIED: no .office/checks in the base commit abc1234')
+    expect(checksRun(runs)).toEqual([])
+  })
+
+  test('a report deliverable with no commits is done: no code changes, checks not run', async ($, on) => {
+    const { runs, text } = await finish($, on, { checksFile: CHECKS, commits: 0 }, { deliverable: 'report' })
+    expect(text()).toContain('Worker finished: rename x to y')
+    expect(text()).toContain('· no code changes, checks not run')
+    expect(checksRun(runs)).toEqual([])
+  })
+
+  test('a headless worker exiting 0 still goes through the gate (regression)', async ($, on) => {
+    const runs = fakeRepo(on, {
+      checksFile: CHECKS,
+      check: line => ({ code: line === 'tsc' ? 2 : 0 }),
+      async *spawn() {
+        yield { stream: 'stdout', text: '{"type":"result","subtype":"success","result":"All tests pass."}\n' }
+      },
+    })
+    const clock = mock.clock(on)
+    const delivered = collectDelivery(on)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.settle()
+    expect(delivered.join('\n')).toContain('Worker REJECTED: CHECKS FAILED: `tsc` exit 2')
+    expect(removed(runs)).toBe(false)
+  })
+
+  test('a kill during the checks fails the job once; the gate never delivers after it', async ($, on) => {
+    let release = () => {}
+    const hung = new Promise<{ code: number }>(r => { release = () => r({ code: 0 }) })
+    const { runs, clock, id, text } = await finish($, on, { checksFile: CHECKS, check: line => (line === 'npm test' ? hung : { code: 0 }) })
+    expect(text()).not.toContain('Worker finished')
+    const ui = await $.ui.mount({
+      plugin: 'office',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'jobs',
+      props: { title: 'Jobs', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 30 } },
+    } as Parameters<typeof $.ui.mount>[0])
+    await ui.press({ key: `job-${id}` })
+    await ui.press({ key: 'kill' })
+    release() // the check under way ends now: its gate must not finish the job again
+    await clock.advance(10_000)
+    await ui.unmount()
+    const heads = text().split('\n').filter(l => l.startsWith('Worker '))
+    expect(heads.filter(l => l.includes(`(job ${id})`))).toEqual([`Worker FAILED: rename x to y (job ${id})`])
+    expect(text()).toContain("killed during its checks.\n\nWorker's report (unchecked):\nRenamed it.")
+    expect(checksRun(runs)).toEqual(['tsc', 'npm test'])
+    expect(removed(runs)).toBe(false)
+  })
+
+  test('a kill while a check is about to start: the check never runs (regression)', async ($, on) => {
+    // A clock of the test's own: `after(0)` (the gate's start) runs at once, longer waits never; once armed by the
+    // read of the checks file, the next read of the time (the first check's start) waits until `held` is called.
+    let isArmed = false
+    let held: (() => void) | undefined
+    let onHeld = () => {}
+    const reached = new Promise<void>(r => { onHeld = r })
+    on('clock.now', async () => {
+      if (isArmed && held === undefined) {
+        const wait = new Promise<void>(r => { held = r })
+        onHeld()
+        await wait
+      }
+      return { value: 0 }
+    })
+    on('clock.after', (_$, e) => (e.ms === 0 ? { value: undefined } : new Promise<never>(() => {})))
+    on('clock.sleep', () => ({ value: undefined }))
+    const runs = fakeRepo(on, {
+      get checksFile() {
+        isArmed = true
+        return CHECKS
+      },
+      async *spawn() {
+        yield { stream: 'stdout', text: '{"type":"result","subtype":"success","result":"Renamed it."}\n' }
+      },
+    })
+    const delivered = collectDelivery(on)
+    const started = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    const id = /job (\w+)/.exec(JSON.stringify(started))?.[1] ?? ''
+    await reached
+    const ui = await $.ui.mount({
+      plugin: 'office',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'jobs',
+      props: { title: 'Jobs', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 30 } },
+    } as Parameters<typeof $.ui.mount>[0])
+    await ui.press({ key: `job-${id}` })
+    await ui.press({ key: 'kill' })
+    held?.()
+    // The host's timers, to let the gate run on past the clock read.
+    await new Promise(r => (globalThis as unknown as { setTimeout: (f: () => void, ms: number) => void }).setTimeout(() => r(undefined), 20))
+    await ui.unmount()
+    expect(delivered.join('\n')).toContain(`Worker FAILED: rename x to y (job ${id})`)
+    expect(checksRun(runs)).toEqual([])
+  })
+
+  test('a deadline already firing when the worker goes to its gate leaves the job to the gate (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
+    let transcript = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Renaming x.' }] } })
+    let release = () => {}
+    const hung = new Promise<{ code: number }>(r => { release = () => r({ code: 0 }) })
+    const busy = listing.replace('"idle"', '"busy"')
+    const runs = fakeRepo(on, { agents: () => busy, transcript: () => transcript, checksFile: CHECKS, check: line => (line === 'tsc' ? hung : { code: 0 }) })
+    const clock = mock.clock(on)
+    // Once armed, the next read of the jobs (the deadline's) answers what it read only when `held` is called.
+    let isArmed = false
+    let held: (() => void) | undefined
+    on('state.get', async (_$, e, next) => {
+      if (!isArmed || held !== undefined || e.key !== 'jobs') return next(e)
+      const read = await next(e)
+      await new Promise<void>(r => { held = r })
+      return read
+    })
+    const delivered = collectDelivery(on)
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+    await clock.advance(1_000) // the deadline (61 s) falls between two polls
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await clock.advance(59_000)
+    isArmed = true
+    await clock.advance(1_000) // the deadline fires: it reads the job running, and waits
+    expect(held).toBeDefined()
+    transcript = reply
+    await clock.advance(4_000) // the poll sees it done: to its gate, its first check under way
+    expect(runs.filter(r => r.argv[0] === 'sh').map(r => r.argv[2])).toEqual(['tsc'])
+    held?.()
+    await clock.advance(1_000)
+    expect(delivered.join('\n')).not.toContain('timed out')
+    release()
+    await clock.advance(1_000)
+    expect(delivered.join('\n')).toContain('Worker finished: rename x to y')
+    expect(delivered.join('\n')).toContain('CHECKS PASSED (3/3')
+  })
+
+  test('with workerChecks off the --bg worker is still stopped before its worktree is removed (regression)', { options: { workerChecks: 'off' } }, async ($, on) => {
+    const { runs, text } = await finish($, on, { checksFile: CHECKS })
+    expect(text()).toContain('· UNVERIFIED: workerChecks is off')
+    const at = (pred: (a: string[]) => boolean) => runs.findIndex(r => pred(r.argv))
+    expect(at(a => a.join(' ').endsWith('stop 5ac0f0df'))).toBeGreaterThan(-1)
+    expect(at(a => a.join(' ').endsWith('stop 5ac0f0df'))).toBeLessThan(at(a => a.includes('worktree') && a.includes('remove')))
+    expect(checksRun(runs)).toEqual([])
+  })
+
+  test('a --bg worker not confirmed stopped is never checked or accepted: failed, its worktree kept (regression)', async ($, on) => {
+    const { runs, clock, id, text } = await finish($, on, { checksFile: CHECKS, stopIgnored: true })
+    expect(text()).not.toContain(`(job ${id})`) // still waiting to see it stop
+    await clock.advance(30_000)
+    expect(text()).toContain(`Worker FAILED: rename x to y (job ${id})`)
+    expect(text()).toContain("Could not confirm the worker stopped: its result was not checked or accepted")
+    expect(text()).toContain("Worker's report (unchecked):\nRenamed it.")
+    expect(checksRun(runs)).toEqual([])
+    expect(removed(runs)).toBe(false)
   })
 })
 

@@ -36,7 +36,10 @@ export type Job = {
   kind: 'codex-review' | 'codex-exec' | 'worker'
   title: string
   cwd: string
-  status: 'running' | 'blocked' | 'done' | 'failed' // blocked: a --bg worker waits on a person
+  // blocked: a --bg worker waits on a person. checking: a worker that said done, in its gate (gates.ts).
+  // rejected: it said done, but the gate disagreed (a red check, a dirty tree, HEAD off its branch,
+  // no commits); failed: a crash, a timeout or a kill.
+  status: 'running' | 'blocked' | 'checking' | 'done' | 'rejected' | 'failed'
   startedAt: number
   endedAt?: number
   model?: string
@@ -59,7 +62,16 @@ export type Job = {
   pausedMs?: number // time spent blocked in finished blocks (it does not count toward the deadline)
   blockedAt?: number // when the current block began
   hasReplied?: boolean // bg-mode worker: an assistant turn was seen in its transcript (never reported stalled after)
+  deliverable?: Deliverable // worker with a worktree: what its result is (default commit)
+  gate?: JobGate // worker with a worktree: its gate's verdict, once checked
 }
+// commit: the result is commits on the worker's branch; report: text alone (no commits is fine).
+export type Deliverable = 'commit' | 'report'
+// pass: every check green. fail: a red check or a git rule broken. unverified: nothing checked
+// (no .office/checks, workerChecks off, or the gate itself could not run). no-change: a report
+// job with no commits, so nothing to check.
+export type GateVerdict = 'pass' | 'fail' | 'unverified' | 'no-change'
+export type JobGate = { verdict: GateVerdict; head: string; sha?: string } // head: the delivery head's words
 
 // ── manga (manga.tsx) ────────────────────────────────────────────────────
 // pages: the PNG name each page shows from `dir` (a chapter folder, or a cbz's cache dir);

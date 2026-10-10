@@ -1,0 +1,6 @@
+# Fast gate checks for office workers: one shell command per line, run with `sh -c` from the
+# repo root (the worker's worktree) after the worker says it is done. All must exit 0.
+# The office reads this file from the worker's base commit, never from its worktree.
+cp -R "$HOME/Coding/office/mod/.claude-plugin/types" mod/.claude-plugin/ 2>/dev/null; cd mod && npx -y -p typescript tsc -p . --pretty false
+cd mod && claude plugin validate .
+cd mod && claude plugin test .
