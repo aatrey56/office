@@ -659,6 +659,53 @@ describe('the worker gate', () => {
     expect(removed(runs)).toBe(false)
   })
 
+  test('a kill while a check is about to start: the check never runs (regression)', async ($, on) => {
+    // A clock of the test's own: `after(0)` (the gate's start) runs at once, longer waits never; once armed by the
+    // read of the checks file, the next read of the time (the first check's start) waits until `held` is called.
+    let isArmed = false
+    let held: (() => void) | undefined
+    let onHeld = () => {}
+    const reached = new Promise<void>(r => { onHeld = r })
+    on('clock.now', async () => {
+      if (isArmed && held === undefined) {
+        const wait = new Promise<void>(r => { held = r })
+        onHeld()
+        await wait
+      }
+      return { value: 0 }
+    })
+    on('clock.after', (_$, e) => (e.ms === 0 ? { value: undefined } : new Promise<never>(() => {})))
+    on('clock.sleep', () => ({ value: undefined }))
+    const runs = fakeRepo(on, {
+      get checksFile() {
+        isArmed = true
+        return CHECKS
+      },
+      async *spawn() {
+        yield { stream: 'stdout', text: '{"type":"result","subtype":"success","result":"Renamed it."}\n' }
+      },
+    })
+    const delivered = collectDelivery(on)
+    const started = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    const id = /job (\w+)/.exec(JSON.stringify(started))?.[1] ?? ''
+    await reached
+    const ui = await $.ui.mount({
+      plugin: 'office',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'jobs',
+      props: { title: 'Jobs', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 30 } },
+    } as Parameters<typeof $.ui.mount>[0])
+    await ui.press({ key: `job-${id}` })
+    await ui.press({ key: 'kill' })
+    held?.()
+    // The host's timers, to let the gate run on past the clock read.
+    await new Promise(r => (globalThis as unknown as { setTimeout: (f: () => void, ms: number) => void }).setTimeout(() => r(undefined), 20))
+    await ui.unmount()
+    expect(delivered.join('\n')).toContain(`Worker FAILED: rename x to y (job ${id})`)
+    expect(checksRun(runs)).toEqual([])
+  })
+
   test('a deadline already firing when the worker goes to its gate leaves the job to the gate (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
     let transcript = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Renaming x.' }] } })
     let release = () => {}

@@ -2361,6 +2361,9 @@ async function runCheck($: EngineInterface, run: GateRun, line: string, dir: str
   let isTimedOut = false
   let isEnded = false
   let exitCode: number | null = null
+  // Killed while the clock was read: never started (and the gate never delivers after a kill).
+  if (run.isKilled) return { cmd: line, exitCode, isTimedOut, ms: 0, output }
+  // No await from here to run.stop: a kill always finds the child it must end.
   const stream = $.process.spawn({ argv: checkArgv(line), cwd: dir, env: CHECK_ENV })
   const end = () => {
     if (isEnded) return
