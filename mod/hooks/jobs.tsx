@@ -39,6 +39,8 @@ import type { CodexTier, ReviewTarget } from './codex'
 import {
   CODEX_LIMITS_REQUEST,
   CODEX_OUT_FALLBACK_MS,
+  codexConcurrencyVerdict,
+  codexDeepSizeVerdict,
   codexGuardVerdict,
   codexLimitsArgv,
   codexLimitsFrom,
@@ -198,6 +200,7 @@ type RunPlan = {
   outFile?: string
   codexModel?: string // set for codex runs: names the model in a quota failure
   isRound?: boolean // a review recorded in the rounds ledger: settled when the job ends
+  isForced?: boolean // the person's --force: a quota hit seen at the start does not stop it
 }
 type Started = { ok: boolean; text: string }
 type GitRun = { isOk: boolean; out: string } // out: stdout, or why it failed
@@ -887,6 +890,8 @@ const CAP_LOCK: FileLock = { name: 'capacity', chain: Promise.resolve() }
 const ROUNDS_LOCK: FileLock = { name: 'codex-rounds', chain: Promise.resolve() }
 /** The usage alerts' (usage-alert.ts): the first session to write an alert's key shows it. */
 const ALERT_LOCK: FileLock = { name: 'usage-alerts', chain: Promise.resolve() }
+/** Codex reviews' start: counting the running ones and adding the new job is one step, so a fan-out cannot all pass the count. */
+const CODEX_START_LOCK: FileLock = { name: 'codex-start', chain: Promise.resolve() }
 
 /** The capacity lock stayed held by another session past LOCK_WAIT_MS: the transaction was not run. */
 class CapLockBusy extends Error {
@@ -1631,6 +1636,16 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   let exit: { code: number | null; signal: string | null } | undefined
   let startError: string | undefined
 
+  // A job queued behind one that hit the quota meets the quota hit here, before it spends anything.
+  if (plan.codexModel !== undefined) {
+    const verdict = codexGuardVerdict(plan.codexModel, Date.now(), { out: await storedCodexOut($) }, plan.isForced === true)
+    if (!verdict.isAllowed) {
+      if (plan.isRound) await settleRound($, jobId, undefined)
+      await finishJob($, options, jobId, 'failed', `${verdict.reason} ${CODEX_OUT_FALLBACK_TEXT}`)
+      return
+    }
+  }
+
   let isClosed = false // the loop over the child's output was left: the stream, and so the child, is ended
   const stream = $.process.spawn({ argv: plan.argv, cwd: plan.cwd, input: plan.input, env: WORKER_ENV })
   RUNNING.set(jobId, async () => {
@@ -1854,6 +1869,13 @@ async function startCodexReview(
   }
   const tier = plan.tier
   const target: ReviewTarget = plan.target ?? fallback!
+  const deepModel = opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model)
+  const isDeep = tier.model === deepModel
+  const size: CodexVerdict = isDeep ? codexDeepSizeVerdict(await reviewLines($, cwd, target), ask.isForced) : { isAllowed: true }
+  if (!size.isAllowed) {
+    await drop()
+    return { ok: false, text: refusedText(size, ask) }
+  }
   const verdict = await codexGuard($, options, bin, cwd, tier.model, ask.isForced)
   if (!verdict.isAllowed) {
     await drop()
@@ -1879,7 +1901,21 @@ async function startCodexReview(
     await drop()
     return failedJob($, job, 'Could not create a temp file for the review output (mktemp failed).')
   }
-  await addJob($, job)
+  // The count of running reviews and the new job's entry are one step: N calls at once cannot all pass the same count.
+  const claimed = await withLock($, CODEX_START_LOCK, async () => {
+    const running = (await read($, JOBS)).filter(j => j.kind === 'codex-review' && j.status === 'running')
+    const taken = codexConcurrencyVerdict(tier.model, deepModel, running.map(j => (j.model ?? '').split('@')[0]!))
+    if (taken.isAllowed) await addJob($, job)
+    return taken
+  }).catch((err: unknown) => {
+    if (err instanceof CapLockBusy) return { isAllowed: false, reason: err.message } as const
+    throw err
+  })
+  if (!claimed.isAllowed) {
+    void $.process.run(['rm', '-f', outFile]).catch(() => undefined)
+    await drop()
+    return { ok: false, text: claimed.reason }
+  }
   const runPlan: RunPlan = {
     argv: codexReviewArgv(bin, target, outFile, tier, plan.instructions !== undefined),
     cwd,
@@ -1889,6 +1925,7 @@ async function startCodexReview(
     outFile,
     codexModel: tier.model,
     isRound,
+    isForced: ask.isForced,
   }
   $.clock.after(0, () => void runJob($, options, job, runPlan))
   const kind = plan.isRereview ? 're-review' : 'review'
@@ -1897,12 +1934,26 @@ async function startCodexReview(
     plan.note !== undefined ? `This is a ${plan.note}.` : '',
     isLast ? 'It is the last round an agent can start on this branch.' : '',
     verdict.warning ? `Budget: ${verdict.warning}` : '',
+    size.isAllowed && size.warning ? `Size: ${size.warning}` : '',
     booked?.isUnrecorded ? 'The round was not recorded (the review ledger could not be written), so it does not count toward the cap.' : '',
   ].filter(Boolean)
   return {
     ok: true,
     text: `Started Codex ${kind} job ${job.id}, round ${roundOf(plan.round, policy.maxRounds)} (${target.label}, ${tier.model}) in ${cwd}. It runs in the background; the review is appended to this conversation when it finishes. /jobs shows progress.${notes.length > 0 ? ` ${notes.join(' ')}` : ''}`,
   }
+}
+
+/** Lines a review target changes, as codex will diff it; undefined when git cannot measure them. */
+async function reviewLines($: EngineInterface, cwd: string, target: ReviewTarget): Promise<number | undefined> {
+  const [flag, value] = target.args
+  const stat =
+    flag === '--commit'
+      ? await gitOut($, cwd, ['show', '--shortstat', '--format=', value!])
+      : flag === '--base'
+        ? await gitOut($, cwd, ['diff', '--shortstat', `${value}...HEAD`])
+        : await gitOut($, cwd, ['diff', '--shortstat', 'HEAD'])
+  if (stat === undefined) return undefined
+  return shortstatLines(stat) + (flag === '--uncommitted' ? await untrackedLines($, cwd) : 0)
 }
 
 /** stdout of a git command in `cwd`, trimmed; undefined when it fails. */

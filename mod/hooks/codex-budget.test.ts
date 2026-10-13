@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { codexGuardVerdict, codexLimitsFrom, codexResetAt, parseCodexReviewArgs } from './codex-budget'
+import {
+  CODEX_DEEP_MAX_LINES, CODEX_MAX_RUNNING, codexConcurrencyVerdict, codexDeepSizeVerdict, codexGuardVerdict, codexLimitsFrom, codexResetAt,
+  parseCodexReviewArgs,
+} from './codex-budget'
 import type { CodexLimits } from './codex-budget'
+import { codexQuotaMessage } from './codex'
 
 // Local times, as codex prints them.
 const now = new Date(2026, 9, 6, 1, 0).getTime()
@@ -71,5 +75,48 @@ describe('codex rate-limit percentages', () => {
 
     // Past the window's reset, the old reading no longer counts.
     expect(codexGuardVerdict('gpt-6-luna', at311 + 1, { limits: limits(99, 40), out: {} }, false)).toEqual({ isAllowed: true })
+  })
+})
+
+describe('codex fan-out limits', () => {
+  const astra = 'gpt-6-astra'
+
+  test('a second deep review is refused while one runs; the normal model is not', () => {
+    expect(codexConcurrencyVerdict(astra, astra, [])).toEqual({ isAllowed: true })
+    const refused = codexConcurrencyVerdict(astra, astra, [astra])
+    expect(refused.isAllowed).toBe(false)
+    expect((refused as { reason: string }).reason).toContain('one at a time')
+    expect(codexConcurrencyVerdict('gpt-6.1-sol', astra, [astra])).toEqual({ isAllowed: true })
+  })
+
+  test('normal reviews are capped at CODEX_MAX_RUNNING, deep ones too', () => {
+    const running = Array.from({ length: CODEX_MAX_RUNNING }, () => 'gpt-6.1-sol')
+    const refused = codexConcurrencyVerdict('gpt-6-luna', astra, running)
+    expect(refused.isAllowed).toBe(false)
+    expect((refused as { reason: string }).reason).toContain(`limit ${CODEX_MAX_RUNNING}`)
+    expect(codexConcurrencyVerdict(astra, astra, running).isAllowed).toBe(false)
+    expect(codexConcurrencyVerdict('gpt-6-luna', astra, running.slice(1))).toEqual({ isAllowed: true })
+  })
+
+  test('a deep review over the size limit is refused with its size; --force overrides', () => {
+    expect(codexDeepSizeVerdict(CODEX_DEEP_MAX_LINES, false)).toEqual({ isAllowed: true })
+    expect(codexDeepSizeVerdict(undefined, false)).toEqual({ isAllowed: true })
+    const refused = codexDeepSizeVerdict(100_000, false)
+    expect(refused.isAllowed).toBe(false)
+    const reason = (refused as { reason: string }).reason
+    expect(reason).toContain('100,000 changed lines')
+    expect(reason).toContain('normal model')
+    expect(reason).toContain('narrower target')
+    expect(codexDeepSizeVerdict(100_000, true)).toMatchObject({ isAllowed: true, warning: expect.stringContaining('100,000') })
+  })
+
+  test('"out of credits" marks the model out, so the guard refuses the next job on it', () => {
+    const text = 'workspace is out of credits'
+    expect(codexQuotaMessage(text, 'gpt-6-astra')).toBeDefined()
+    // codex named no reset time: out for the fallback hour.
+    const until = codexResetAt(text, now) ?? now + 60 * 60_000
+    const state = { out: { 'gpt-6-astra': { until, note: text } } }
+    expect(codexGuardVerdict('gpt-6-astra', now, state, false).isAllowed).toBe(false)
+    expect(codexGuardVerdict('gpt-6.1-sol', now, state, false)).toEqual({ isAllowed: true })
   })
 })
