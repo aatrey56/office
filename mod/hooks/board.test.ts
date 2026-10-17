@@ -327,4 +327,20 @@ describe('band mode', () => {
     expect(await after.find({ text: /engine band/ })).toBeDefined()
     await after.unmount()
   })
+
+  test('/office off hides the pane and the band until /office brings it back', async ($, on) => {
+    const panes = await start($, on, { boardMode: 'band' })
+    const before = await $.ui.mount(band())
+    expect(await before.find({ text: /engine band/ })).toBeUndefined()
+    await before.unmount()
+
+    await $.command.run({ command: 'office', args: 'off', ...RUN })
+    expect(panes).toContain('close:office')
+    const hidden = await $.ui.mount(band())
+    expect(await hidden.find({ text: /engine band/ })).toBeDefined()
+    await hidden.unmount()
+
+    await $.command.run({ command: 'office', args: '', ...RUN })
+    expect(panes).toContain('open:office')
+  })
 })

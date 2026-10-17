@@ -257,7 +257,7 @@ export function installBoard(on: On, options: PluginOptions) {
     await $.command.register({
       name: 'office',
       description: 'Session board: see, message and resume your other Claude Code sessions',
-      argumentHint: '[band|pane|manage|manage off]',
+      argumentHint: '[band|pane|off|manage|manage off]',
       immediate: true,
     })
     await $.tool.register({
@@ -290,7 +290,9 @@ export function installBoard(on: On, options: PluginOptions) {
     // The mode survives restarts; a reload with the pane or band up picks the poll back up.
     const stored = parseMode(await $.store.get('boardMode'))
     if (stored !== (await read($, mode))) await update($, mode, () => stored)
-    if (stored === 'band' || (await isPaneOpen($))) startPolling($)
+    if (stored === 'off') {
+      if (await isPaneOpen($)) await $.ui.close({ id: PANE })
+    } else if (stored === 'band' || (await isPaneOpen($))) startPolling($)
 
     return next(e)
   })
@@ -298,6 +300,8 @@ export function installBoard(on: On, options: PluginOptions) {
   // Every open of the board, from /office or the reader's button, comes through here.
   // The board and the reader sit side by side as tabs; Tab (pane:next) switches them.
   on('ui.open', { id: PANE }, async ($, e, next) => {
+    // Opening it on purpose (the manga tab's Office button, /office) turns the board back on.
+    if ((await read($, mode)) === 'off') await setMode($, 'pane')
     await refresh($)
     startPolling($)
     return next(e)
@@ -319,11 +323,17 @@ export function installBoard(on: On, options: PluginOptions) {
       startPolling($)
       return { text: 'Office board moved above the prompt. ctrl+x tab (or a click) gives it the keys; /office pane moves it back.' }
     }
+    if (arg === 'off') {
+      await setMode($, 'off')
+      await $.ui.close({ id: PANE })
+      stopPolling()
+      return { text: 'Office board hidden (pane and band). Sessions, workers and tools keep running; /office, /office pane or /office band brings it back.' }
+    }
     if (arg === 'pane') {
       await setMode($, 'pane')
       return openPane($)
     }
-    if (arg !== '') return { text: 'Usage: /office [band|pane|manage|manage off]' }
+    if (arg !== '') return { text: 'Usage: /office [band|pane|off|manage|manage off]' }
     if ((await read($, mode)) === 'band') {
       await refresh($)
       const count = (await read($, sessions)).length
