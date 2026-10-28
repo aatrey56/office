@@ -198,8 +198,9 @@ export function bandWindow(count: number, picked: number, maxRows: number, hasIn
   return { start, end: start + shown, more: count - shown }
 }
 
-export type BoardMode = 'pane' | 'band'
+// 'off' hides both the pane and the band; sessions, workers and tools carry on.
+export type BoardMode = 'pane' | 'band' | 'off'
 
 export function parseMode(value: unknown): BoardMode {
-  return value === 'band' ? 'band' : 'pane'
+  return value === 'band' || value === 'off' ? value : 'pane'
 }

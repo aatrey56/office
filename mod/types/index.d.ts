@@ -202,7 +202,7 @@ declare module 'claude-code' {
       sessions: SessionCard[]
       selected: string | null
       boardTick: number // bumped each poll while the board pane or band is up; read only by the board
-      boardMode: 'pane' | 'band' // where the board draws; persisted in $.store 'boardMode'
+      boardMode: 'pane' | 'band' | 'off' // where the board draws ('off': nowhere); persisted in $.store 'boardMode'
       // jobs
       jobs: Job[]
       lastRoute: RouteDecision | null
