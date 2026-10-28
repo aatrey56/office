@@ -90,3 +90,12 @@ export function budgetLine(windows: RateWindow[]): string {
     .map(({ w }) => label(w))
     .join(' · ')
 }
+
+const kTokens = (n: number) => `${Math.round(n / 1000)}k`
+
+// "ctx 42% · 116k left" beside the budget line; '' before the first response reports a fill.
+export function contextLine(context: { tokens?: number; window: number; percent?: number }): string {
+  if (context.tokens === undefined || context.window <= 0) return ''
+  const percent = context.percent ?? Math.round((context.tokens / context.window) * 100)
+  return `ctx ${percent}% · ${kTokens(Math.max(0, context.window - context.tokens))} left`
+}

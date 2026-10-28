@@ -4,7 +4,7 @@ import type { EngineInterface, On, Timer } from 'claude-code'
 import type { Actor, AgentRecord, ChatLine, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
 import { freshAgentFiles, parseAgent, subagentsDir } from './agents'
 import type { AgentFile } from './agents'
-import { budgetLine } from './budget'
+import { budgetLine, contextLine } from './budget'
 import { chatLines, projectSlug, SLUG_MAX } from './sessions'
 import { officeArt, officeMap } from './scene/art'
 import { toCells, toPng } from './scene/encode'
@@ -394,7 +394,8 @@ export function installScene(on: On) {
     const pickedCard = picked && cards.find(c => c.sessionId === picked.id)
     let usage = ''
     try {
-      usage = budgetLine((await $.session.usage()).rateLimits as RateWindow[])
+      const { rateLimits, context } = await $.session.usage()
+      usage = [budgetLine(rateLimits as RateWindow[]), contextLine(context)].filter(Boolean).join(' · ')
     } catch {
       // the header simply goes without it
     }
