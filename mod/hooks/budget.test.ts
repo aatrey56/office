@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { budgetVerdict, DEFAULT_CAPS } from './budget'
+import { budgetVerdict, contextLine, DEFAULT_CAPS } from './budget'
 
 const none = { isSmall: false, isExplicit: false, isForced: false }
 const five = (percentUsed: number, resetsAt?: string) => ({ kind: 'five_hour', percentUsed, resetsAt })
@@ -42,3 +42,12 @@ describe('budgetVerdict', () => {
   })
 })
 
+
+describe('contextLine', () => {
+  test('percent used and tokens left', () => {
+    expect(contextLine({ tokens: 84_000, window: 200_000, percent: 42 })).toBe('ctx 42% · 116k left')
+  })
+  test('empty before the first reading', () => {
+    expect(contextLine({ window: 200_000 })).toBe('')
+  })
+})
