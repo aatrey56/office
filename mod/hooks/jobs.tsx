@@ -1868,7 +1868,7 @@ async function startCodexReview(
   const target: ReviewTarget = plan.target ?? fallback!
   const deepModel = opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model)
   const isDeep = tier.model === deepModel
-  const size: CodexVerdict = isDeep ? codexDeepSizeVerdict(await reviewLines($, cwd, target), ask.isForced) : { isAllowed: true }
+  const size: CodexVerdict = isDeep ? codexDeepSizeVerdict(await reviewLines($, cwd, target, plan.instructions !== undefined), ask.isForced) : { isAllowed: true }
   // Passed on as it is: the reason already names the size and the person's --force.
   if (!size.isAllowed) {
     await drop()
@@ -1927,17 +1927,21 @@ async function startCodexReview(
   }
 }
 
-/** Lines a review target changes, as codex will diff it; undefined when git cannot measure them. */
-async function reviewLines($: EngineInterface, cwd: string, target: ReviewTarget): Promise<number | undefined> {
+/**
+ * Lines a review target changes, in the scope codex is asked to review; undefined when git cannot measure them.
+ * With instructions, a `--base <sha>` review is prompted over `git diff <sha>` (committed or not), so it is measured that way.
+ */
+async function reviewLines($: EngineInterface, cwd: string, target: ReviewTarget, hasPrompt: boolean): Promise<number | undefined> {
   const [flag, value] = target.args
+  const isWorkingTree = flag === '--uncommitted' || (flag === '--base' && hasPrompt && /^[0-9a-f]{7,40}$/.test(value ?? ''))
   const stat =
     flag === '--commit'
       ? await gitOut($, cwd, ['show', '--shortstat', '--format=', value!])
       : flag === '--base'
-        ? await gitOut($, cwd, ['diff', '--shortstat', `${value}...HEAD`])
+        ? await gitOut($, cwd, ['diff', '--shortstat', isWorkingTree ? value! : `${value}...HEAD`])
         : await gitOut($, cwd, ['diff', '--shortstat', 'HEAD'])
   if (stat === undefined) return undefined
-  return shortstatLines(stat) + (flag === '--uncommitted' ? await untrackedLines($, cwd) : 0)
+  return shortstatLines(stat) + (isWorkingTree ? await untrackedLines($, cwd) : 0)
 }
 
 /** stdout of a git command in `cwd`, trimmed; undefined when it fails. */

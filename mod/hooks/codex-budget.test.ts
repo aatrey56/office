@@ -110,4 +110,9 @@ describe('codexUsageLine', () => {
     expect(codexUsageLine(limits, now + CODEX_USAGE_STALE_MS + 1)).toBe('')
     expect(codexUsageLine(undefined, now)).toBe('')
   })
+  test('a window past its reset is left out', () => {
+    const past = new Date(now - 1).toISOString()
+    const limits: CodexLimits = { at: now - 60_000, buckets: [{ windows: [{ kind: 'five_hour', percentUsed: 99, resetsAt: past }, { kind: 'seven_day', percentUsed: 12 }] }] }
+    expect(codexUsageLine(limits, now)).toBe('codex week 12%')
+  })
 })

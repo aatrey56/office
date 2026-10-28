@@ -41,6 +41,7 @@ const SHELF = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', ch
 const CODEX_LIMITS_KEY = 'codexLimits' // jobs.tsx's: the last reading of Codex's limits, shared
 const CODEX_REFRESH_MS = 5 * 60_000 // while the office is open, Codex's limits are read again this often
 const CODEX_LIMITS_TIMEOUT_MS = 6000
+const CODEX_TICK_MS = 60_000 // the header's Codex part is looked at again this often, so a stale or reset window drops off
 
 // Not drawn from: the animation's own state. A reload starts the walk over, which is harmless.
 let timer: Timer | undefined
@@ -330,6 +331,8 @@ function startTimer($: EngineInterface): void {
 }
 
 let codexReadAt = 0 // when this session last asked codex for its limits, so a failing read is not retried every frame
+// Runs while the scene is open: an unchanged office never redraws, so the refresh cannot hang off the render alone.
+let codexTimer: Timer | undefined
 
 /** Codex's usage for the header: the stored reading, read again in the background (no message spent) once it is old. */
 async function codexUsage($: EngineInterface, options: PluginOptions): Promise<string> {
@@ -340,6 +343,11 @@ async function codexUsage($: EngineInterface, options: PluginOptions): Promise<s
     void readCodexLimits($, typeof options.codexPath === 'string' && options.codexPath.trim() ? options.codexPath.trim() : 'codex')
   }
   return codexUsageLine(stored, now)
+}
+
+/** Redraws the header every CODEX_TICK_MS; the redraw refreshes an old reading and drops a stale or reset one. */
+function startCodexTimer($: EngineInterface): void {
+  codexTimer ??= $.clock.every(CODEX_TICK_MS, () => void update($, TICK, n => (n + 1) % 1_000_000))
 }
 
 // The same read as jobs.tsx's readCodexLimits ($ cannot cross an import); a new reading redraws the header.
@@ -368,6 +376,8 @@ async function readCodexLimits($: EngineInterface, bin: string): Promise<void> {
 function stopTimer(): void {
   timer?.cancel()
   timer = undefined
+  codexTimer?.cancel()
+  codexTimer = undefined
 }
 
 async function sendTo($: EngineInterface, card: SessionCard, text: string): Promise<void> {
@@ -443,6 +453,7 @@ export function installScene(on: On, options: PluginOptions) {
       // the header simply goes without it
     }
     const codex = await codexUsage($, options)
+    startCodexTimer($)
     const projectName = project ? (project.split('/').pop() ?? project) : 'no sessions'
     const series = (await read($, SHELF)).series
     const mangaTitle = series ? `Manga: ${series}` : 'Manga'

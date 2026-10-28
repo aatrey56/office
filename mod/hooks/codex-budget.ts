@@ -189,11 +189,12 @@ export function parseCodexReviewArgs(raw: string | undefined): { deep: boolean; 
 /** A reading older than this no longer stands for the 5-hour window, so the office shows none. */
 export const CODEX_USAGE_STALE_MS = 60 * 60_000
 
-/** "codex 5h 30% · week 12%" for the scene header, each window at its most used bucket; '' with no fresh reading. */
+/** "codex 5h 30% · week 12%" for the scene header, each window at its most used bucket; a window past its reset is left out, '' with no fresh reading. */
 export function codexUsageLine(limits: CodexLimits | undefined, now: number): string {
   if (!limits || !Array.isArray(limits.buckets) || now - limits.at > CODEX_USAGE_STALE_MS) return ''
   const byKind = new Map<string, RateWindow>()
-  for (const w of limits.buckets.flatMap(b => b.windows)) {
+  const live = limits.buckets.flatMap(b => b.windows).filter(w => w.resetsAt === undefined || Date.parse(w.resetsAt) > now)
+  for (const w of live) {
     const seen = byKind.get(w.kind)
     if (seen === undefined || w.percentUsed > seen.percentUsed) byKind.set(w.kind, w)
   }
