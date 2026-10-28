@@ -167,10 +167,10 @@ export const CODEX_REVIEW_TOOL = {
     'checking that the previous findings are fixed and that the fixes broke nothing; ' +
     'it becomes a full re-review of the whole branch (still on the cheaper model) after a rebase, when the diff since then is large, or with full: true. ' +
     'Later rounds with an explicit target run that target as given, also on the cheaper model; they still count as rounds. ' +
-    'deep: true (only when the person asks) runs the deep model on every round. Deep is scarce and one at a time: ' +
-    'a second deep call while one runs is refused, as is a diff over 5,000 changed lines; never fan deep out across many branches ' +
-    '(review them one after another, or without deep), and check the budget first (session_usage) before asking for it. ' +
-    'At most 3 Codex reviews run at once. A quota or credits failure marks the model out, and later reviews on it are refused until it resets. ' +
+    'deep: true (only when the person asks) runs the deep model on every round. Deep is scarce: check the budget first (session_usage). ' +
+    'A deep review over 5,000 changed lines is refused with its size: show the person that refusal as it is (the line count and the command); ' +
+    'only they can run it anyway, with /codex-review --deep --force. ' +
+    'A quota or credits failure marks the model out, and later reviews on it are refused until it resets. ' +
     'A call with nothing new since the last round is refused. At codexMaxRounds rounds (default 3) calls are refused: ' +
     'then stop, summarise the remaining findings and ask the person. ' +
     'If Codex is out of usage (the result says so), run an Opus review via a subagent instead: it is a same-model-family review with lower trust, ' +

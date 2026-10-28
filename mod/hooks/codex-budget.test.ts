@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
-  CODEX_DEEP_MAX_LINES, CODEX_MAX_RUNNING, codexConcurrencyVerdict, codexDeepSizeVerdict, codexGuardVerdict, codexLimitsFrom, codexResetAt,
-  parseCodexReviewArgs,
+  CODEX_DEEP_MAX_LINES, CODEX_USAGE_STALE_MS, codexDeepSizeVerdict, codexGuardVerdict, codexLimitsFrom, codexResetAt,
+  codexUsageLine, parseCodexReviewArgs,
 } from './codex-budget'
 import type { CodexLimits } from './codex-budget'
 import { codexQuotaMessage } from './codex'
@@ -78,35 +78,16 @@ describe('codex rate-limit percentages', () => {
   })
 })
 
-describe('codex fan-out limits', () => {
-  const astra = 'gpt-6-astra'
-
-  test('a second deep review is refused while one runs; the normal model is not', () => {
-    expect(codexConcurrencyVerdict(astra, astra, [])).toEqual({ isAllowed: true })
-    const refused = codexConcurrencyVerdict(astra, astra, [astra])
-    expect(refused.isAllowed).toBe(false)
-    expect((refused as { reason: string }).reason).toContain('one at a time')
-    expect(codexConcurrencyVerdict('gpt-6.1-sol', astra, [astra])).toEqual({ isAllowed: true })
-  })
-
-  test('normal reviews are capped at CODEX_MAX_RUNNING, deep ones too', () => {
-    const running = Array.from({ length: CODEX_MAX_RUNNING }, () => 'gpt-6.1-sol')
-    const refused = codexConcurrencyVerdict('gpt-6-luna', astra, running)
-    expect(refused.isAllowed).toBe(false)
-    expect((refused as { reason: string }).reason).toContain(`limit ${CODEX_MAX_RUNNING}`)
-    expect(codexConcurrencyVerdict(astra, astra, running).isAllowed).toBe(false)
-    expect(codexConcurrencyVerdict('gpt-6-luna', astra, running.slice(1))).toEqual({ isAllowed: true })
-  })
-
+describe('codex deep size and credits', () => {
   test('a deep review over the size limit is refused with its size; --force overrides', () => {
     expect(codexDeepSizeVerdict(CODEX_DEEP_MAX_LINES, false)).toEqual({ isAllowed: true })
     expect(codexDeepSizeVerdict(undefined, false)).toEqual({ isAllowed: true })
     const refused = codexDeepSizeVerdict(100_000, false)
     expect(refused.isAllowed).toBe(false)
     const reason = (refused as { reason: string }).reason
+    expect(reason.startsWith('DEEP REVIEW REFUSED')).toBe(true)
     expect(reason).toContain('100,000 changed lines')
-    expect(reason).toContain('normal model')
-    expect(reason).toContain('narrower target')
+    expect(reason).toContain('/codex-review --deep --force')
     expect(codexDeepSizeVerdict(100_000, true)).toMatchObject({ isAllowed: true, warning: expect.stringContaining('100,000') })
   })
 
@@ -118,5 +99,15 @@ describe('codex fan-out limits', () => {
     const state = { out: { 'gpt-6-astra': { until, note: text } } }
     expect(codexGuardVerdict('gpt-6-astra', now, state, false).isAllowed).toBe(false)
     expect(codexGuardVerdict('gpt-6.1-sol', now, state, false)).toEqual({ isAllowed: true })
+  })
+})
+
+describe('codexUsageLine', () => {
+  test('each window at its most used bucket, nothing once stale', () => {
+    const w = (kind: string, percentUsed: number) => ({ kind, percentUsed })
+    const limits: CodexLimits = { at: now, buckets: [{ windows: [w('five_hour', 30), w('seven_day', 12)] }, { model: 'gpt-6-astra', windows: [w('five_hour', 61)] }] }
+    expect(codexUsageLine(limits, now)).toBe('codex 5h 61% · week 12%')
+    expect(codexUsageLine(limits, now + CODEX_USAGE_STALE_MS + 1)).toBe('')
+    expect(codexUsageLine(undefined, now)).toBe('')
   })
 })

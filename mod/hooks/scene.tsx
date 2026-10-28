@@ -1,10 +1,12 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, On, Timer } from 'claude-code'
+import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 
 import type { Actor, AgentRecord, ChatLine, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
 import { freshAgentFiles, parseAgent, subagentsDir } from './agents'
 import type { AgentFile } from './agents'
 import { budgetLine, contextLine } from './budget'
+import { CODEX_LIMITS_REQUEST, codexLimitsArgv, codexLimitsFrom, codexUsageLine } from './codex-budget'
+import type { CodexLimits } from './codex-budget'
 import { chatLines, projectSlug, SLUG_MAX } from './sessions'
 import { officeArt, officeMap } from './scene/art'
 import { toCells, toPng } from './scene/encode'
@@ -35,6 +37,10 @@ const PROJECT = atom({ plugin: 'office', key: 'sceneProject' } as const, null as
 const TICK = atom({ plugin: 'office', key: 'sceneTick' } as const, 0)
 // The reader's series, so the manga tab opened from here is titled like /manga titles it.
 const SHELF = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', chapters: [], pages: [], dir: '', ready: [], loading: false } as MangaShelf)
+
+const CODEX_LIMITS_KEY = 'codexLimits' // jobs.tsx's: the last reading of Codex's limits, shared
+const CODEX_REFRESH_MS = 5 * 60_000 // while the office is open, Codex's limits are read again this often
+const CODEX_LIMITS_TIMEOUT_MS = 6000
 
 // Not drawn from: the animation's own state. A reload starts the walk over, which is harmless.
 let timer: Timer | undefined
@@ -323,6 +329,42 @@ function startTimer($: EngineInterface): void {
   })
 }
 
+let codexReadAt = 0 // when this session last asked codex for its limits, so a failing read is not retried every frame
+
+/** Codex's usage for the header: the stored reading, read again in the background (no message spent) once it is old. */
+async function codexUsage($: EngineInterface, options: PluginOptions): Promise<string> {
+  const stored = (await $.store.get(CODEX_LIMITS_KEY).catch(() => undefined)) as CodexLimits | undefined
+  const now = Date.now()
+  if (now - (stored?.at ?? 0) > CODEX_REFRESH_MS && now - codexReadAt > CODEX_REFRESH_MS) {
+    codexReadAt = now
+    void readCodexLimits($, typeof options.codexPath === 'string' && options.codexPath.trim() ? options.codexPath.trim() : 'codex')
+  }
+  return codexUsageLine(stored, now)
+}
+
+// The same read as jobs.tsx's readCodexLimits ($ cannot cross an import); a new reading redraws the header.
+async function readCodexLimits($: EngineInterface, bin: string): Promise<void> {
+  const stream = $.process.spawn({ argv: codexLimitsArgv(bin), input: CODEX_LIMITS_REQUEST })
+  const timeout = $.clock.after(CODEX_LIMITS_TIMEOUT_MS, () => void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined))
+  let out = ''
+  let limits: CodexLimits | undefined
+  try {
+    for await (const chunk of stream) {
+      if (chunk.stream !== 'stdout') continue
+      out = (out + chunk.text).slice(-65536)
+      limits = codexLimitsFrom(out, Date.now())
+      if (limits) break
+    }
+  } catch {
+    // codex missing or not logged in: the header goes without it
+  } finally {
+    timeout.cancel()
+  }
+  if (!limits) return
+  await $.store.set(CODEX_LIMITS_KEY, limits).catch(() => undefined)
+  await update($, TICK, n => (n + 1) % 1_000_000)
+}
+
 function stopTimer(): void {
   timer?.cancel()
   timer = undefined
@@ -353,7 +395,7 @@ const STATE_WORDS: Record<Crew['state'], string> = {
   leaving: 'leaving',
 }
 
-export function installScene(on: On) {
+export function installScene(on: On, options: PluginOptions) {
   // The text board (board.tsx) passes the pane on with next(e) while the view is the scene;
   // this passes it on while the view is text. Either order of the two hooks draws the right one.
   on('ui.render', { component: 'Pane', requestId: /^office$/ }, async ($, e, next) => {
@@ -395,10 +437,12 @@ export function installScene(on: On) {
     let usage = ''
     try {
       const { rateLimits, context } = await $.session.usage()
-      usage = [budgetLine(rateLimits as RateWindow[]), contextLine(context)].filter(Boolean).join(' · ')
+      const claude = [budgetLine(rateLimits as RateWindow[]), contextLine(context)].filter(Boolean).join(' · ')
+      usage = claude ? `claude ${claude}` : ''
     } catch {
       // the header simply goes without it
     }
+    const codex = await codexUsage($, options)
     const projectName = project ? (project.split('/').pop() ?? project) : 'no sessions'
     const series = (await read($, SHELF)).series
     const mangaTitle = series ? `Manga: ${series}` : 'Manga'
@@ -437,6 +481,7 @@ export function installScene(on: On) {
         <Box gap={1}>
           <Text bold>{projectName}</Text>
           {usage && <Text dimColor>{usage}</Text>}
+          {codex && <Text dimColor>{codex}</Text>}
           {all.length > 1 && <Button plain key="prev-proj" label="prev office" hotkey="h" onPress={cycle(-1)} />}
           {all.length > 1 && <Button plain key="next-proj" label="next office" hotkey="l" onPress={cycle(1)} />}
           <Button plain key="text" label="text board" hotkey="t" onPress={() => update($, VIEW, () => 'text')} />

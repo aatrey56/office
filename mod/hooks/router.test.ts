@@ -154,9 +154,8 @@ describe('codex tiers', () => {
     expect(codexQuotaMessage('add credits to the invoice view', 'gpt-6-astra')).toBeUndefined()
   })
 
-  test('the codex_review tool description tells a caller deep is one at a time', () => {
-    expect(CODEX_REVIEW_TOOL.description).toContain('one at a time')
-    expect(CODEX_REVIEW_TOOL.description).toContain('never fan deep out')
+  test('the codex_review tool description tells a caller to show a deep size refusal to the person', () => {
+    expect(CODEX_REVIEW_TOOL.description).toContain('/codex-review --deep --force')
     expect(CODEX_REVIEW_TOOL.description).toContain('session_usage')
   })
 })

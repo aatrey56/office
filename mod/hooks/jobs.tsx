@@ -39,7 +39,6 @@ import type { CodexTier, ReviewTarget } from './codex'
 import {
   CODEX_LIMITS_REQUEST,
   CODEX_OUT_FALLBACK_MS,
-  codexConcurrencyVerdict,
   codexDeepSizeVerdict,
   codexGuardVerdict,
   codexLimitsArgv,
@@ -890,8 +889,6 @@ const CAP_LOCK: FileLock = { name: 'capacity', chain: Promise.resolve() }
 const ROUNDS_LOCK: FileLock = { name: 'codex-rounds', chain: Promise.resolve() }
 /** The usage alerts' (usage-alert.ts): the first session to write an alert's key shows it. */
 const ALERT_LOCK: FileLock = { name: 'usage-alerts', chain: Promise.resolve() }
-/** Codex reviews' start: counting the running ones and adding the new job is one step, so a fan-out cannot all pass the count. */
-const CODEX_START_LOCK: FileLock = { name: 'codex-start', chain: Promise.resolve() }
 
 /** The capacity lock stayed held by another session past LOCK_WAIT_MS: the transaction was not run. */
 class CapLockBusy extends Error {
@@ -1872,9 +1869,10 @@ async function startCodexReview(
   const deepModel = opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model)
   const isDeep = tier.model === deepModel
   const size: CodexVerdict = isDeep ? codexDeepSizeVerdict(await reviewLines($, cwd, target), ask.isForced) : { isAllowed: true }
+  // Passed on as it is: the reason already names the size and the person's --force.
   if (!size.isAllowed) {
     await drop()
-    return { ok: false, text: refusedText(size, ask) }
+    return { ok: false, text: size.reason }
   }
   const verdict = await codexGuard($, options, bin, cwd, tier.model, ask.isForced)
   if (!verdict.isAllowed) {
@@ -1901,21 +1899,7 @@ async function startCodexReview(
     await drop()
     return failedJob($, job, 'Could not create a temp file for the review output (mktemp failed).')
   }
-  // The count of running reviews and the new job's entry are one step: N calls at once cannot all pass the same count.
-  const claimed = await withLock($, CODEX_START_LOCK, async () => {
-    const running = (await read($, JOBS)).filter(j => j.kind === 'codex-review' && j.status === 'running')
-    const taken = codexConcurrencyVerdict(tier.model, deepModel, running.map(j => (j.model ?? '').split('@')[0]!))
-    if (taken.isAllowed) await addJob($, job)
-    return taken
-  }).catch((err: unknown) => {
-    if (err instanceof CapLockBusy) return { isAllowed: false, reason: err.message } as const
-    throw err
-  })
-  if (!claimed.isAllowed) {
-    void $.process.run(['rm', '-f', outFile]).catch(() => undefined)
-    await drop()
-    return { ok: false, text: claimed.reason }
-  }
+  await addJob($, job)
   const runPlan: RunPlan = {
     argv: codexReviewArgv(bin, target, outFile, tier, plan.instructions !== undefined),
     cwd,

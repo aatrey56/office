@@ -1,4 +1,5 @@
 import type { RateWindow } from '../types'
+import { budgetLine } from './budget'
 
 // The Codex budget guard's pure half: reading the account's rate limits from
 // `codex app-server`, parsing a quota hit's reset time, and the verdict before
@@ -146,31 +147,8 @@ export function codexGuardVerdict(
   return { isAllowed: false, reason: `Codex budget guard refused: ${what} (limit ${CODEX_REFUSE_PCT}%).` }
 }
 
-/** Codex jobs that may run at once, and of those the scarce deep model's: a fan-out of N all pass the same stale budget reading. */
-export const CODEX_MAX_RUNNING = 3
-export const CODEX_MAX_DEEP_RUNNING = 1
 /** Lines changed above which a deep review is refused: one huge diff can drain the deep model's quota in a single run. */
 export const CODEX_DEEP_MAX_LINES = 5000
-
-/**
- * Before a Codex review starts, from the models of the Codex review jobs already running:
- * - a deep review while another deep one runs → refused (they are one at a time);
- * - CODEX_MAX_RUNNING reviews running → refused.
- * Not overridable by --force: it is not a budget reading but a limit on the fan-out itself.
- */
-export function codexConcurrencyVerdict(model: string, deepModel: string, runningModels: readonly string[]): CodexVerdict {
-  const isDeep = model === deepModel
-  if (isDeep && runningModels.filter(m => m === deepModel).length >= CODEX_MAX_DEEP_RUNNING) {
-    return {
-      isAllowed: false,
-      reason: `A deep Codex review (${deepModel}) is already running; deep reviews run one at a time. Retry when it finishes, or review without deep.`,
-    }
-  }
-  if (runningModels.length >= CODEX_MAX_RUNNING) {
-    return { isAllowed: false, reason: `${runningModels.length} Codex reviews are already running (limit ${CODEX_MAX_RUNNING}); retry when one finishes.` }
-  }
-  return { isAllowed: true }
-}
 
 /**
  * Before a deep review: a diff over CODEX_DEEP_MAX_LINES changed lines is refused, naming its size.
@@ -179,9 +157,16 @@ export function codexConcurrencyVerdict(model: string, deepModel: string, runnin
  */
 export function codexDeepSizeVerdict(changedLines: number | undefined, isForced: boolean): CodexVerdict {
   if (changedLines === undefined || changedLines <= CODEX_DEEP_MAX_LINES) return { isAllowed: true }
-  const what = `This review is ${changedLines.toLocaleString('en-US')} changed lines (deep limit ${CODEX_DEEP_MAX_LINES.toLocaleString('en-US')})`
-  if (isForced) return { isAllowed: true, warning: `Forced past the deep size limit: ${what}.` }
-  return { isAllowed: false, reason: `${what}; deep is for small, high-risk diffs. Use the normal model (no deep), or a narrower target (--commit <sha>, or a smaller branch).` }
+  const lines = `${changedLines.toLocaleString('en-US')} changed lines`
+  const limit = CODEX_DEEP_MAX_LINES.toLocaleString('en-US')
+  if (isForced) return { isAllowed: true, warning: `Forced past the deep size limit: this review is ${lines} (limit ${limit}).` }
+  return {
+    isAllowed: false,
+    reason:
+      `DEEP REVIEW REFUSED: this review is ${lines}, over the deep limit of ${limit}. ` +
+      'To run it anyway, the person types /codex-review --deep --force (plus the target). ' +
+      'Otherwise review without deep, or a narrower target (--commit <sha>, or a smaller branch).',
+  }
 }
 
 /** `/codex-review` args: `--deep`, `--force` and `--model <m>` anywhere; the rest is the target. */
@@ -199,4 +184,19 @@ export function parseCodexReviewArgs(raw: string | undefined): { deep: boolean; 
     else rest.push(w)
   }
   return { deep, force, model, rest: rest.join(' ') }
+}
+
+/** A reading older than this no longer stands for the 5-hour window, so the office shows none. */
+export const CODEX_USAGE_STALE_MS = 60 * 60_000
+
+/** "codex 5h 30% · week 12%" for the scene header, each window at its most used bucket; '' with no fresh reading. */
+export function codexUsageLine(limits: CodexLimits | undefined, now: number): string {
+  if (!limits || !Array.isArray(limits.buckets) || now - limits.at > CODEX_USAGE_STALE_MS) return ''
+  const byKind = new Map<string, RateWindow>()
+  for (const w of limits.buckets.flatMap(b => b.windows)) {
+    const seen = byKind.get(w.kind)
+    if (seen === undefined || w.percentUsed > seen.percentUsed) byKind.set(w.kind, w)
+  }
+  const line = budgetLine([...byKind.values()])
+  return line ? `codex ${line}` : ''
 }
