@@ -1,4 +1,5 @@
 import type { RateWindow } from '../types'
+import { budgetLine } from './budget'
 
 // The Codex budget guard's pure half: reading the account's rate limits from
 // `codex app-server`, parsing a quota hit's reset time, and the verdict before
@@ -146,6 +147,28 @@ export function codexGuardVerdict(
   return { isAllowed: false, reason: `Codex budget guard refused: ${what} (limit ${CODEX_REFUSE_PCT}%).` }
 }
 
+/** Lines changed above which a deep review is refused: one huge diff can drain the deep model's quota in a single run. */
+export const CODEX_DEEP_MAX_LINES = 5000
+
+/**
+ * Before a deep review: a diff over CODEX_DEEP_MAX_LINES changed lines is refused, naming its size.
+ * `changedLines` undefined (git could not measure it) is allowed. `isForced` (only the person's typed
+ * /codex-review --force) lets it start, with a warning.
+ */
+export function codexDeepSizeVerdict(changedLines: number | undefined, isForced: boolean): CodexVerdict {
+  if (changedLines === undefined || changedLines <= CODEX_DEEP_MAX_LINES) return { isAllowed: true }
+  const lines = `${changedLines.toLocaleString('en-US')} changed lines`
+  const limit = CODEX_DEEP_MAX_LINES.toLocaleString('en-US')
+  if (isForced) return { isAllowed: true, warning: `Forced past the deep size limit: this review is ${lines} (limit ${limit}).` }
+  return {
+    isAllowed: false,
+    reason:
+      `DEEP REVIEW REFUSED: this review is ${lines}, over the deep limit of ${limit}. ` +
+      'To run it anyway, the person types /codex-review --deep --force (plus the target). ' +
+      'Otherwise review without deep, or a narrower target (--commit <sha>, or a smaller branch).',
+  }
+}
+
 /** `/codex-review` args: `--deep`, `--force` and `--model <m>` anywhere; the rest is the target. */
 export function parseCodexReviewArgs(raw: string | undefined): { deep: boolean; force: boolean; model?: string; rest: string } {
   const words = (raw ?? '').trim().split(/\s+/).filter(Boolean)
@@ -161,4 +184,20 @@ export function parseCodexReviewArgs(raw: string | undefined): { deep: boolean; 
     else rest.push(w)
   }
   return { deep, force, model, rest: rest.join(' ') }
+}
+
+/** A reading older than this no longer stands for the 5-hour window, so the office shows none. */
+export const CODEX_USAGE_STALE_MS = 60 * 60_000
+
+/** "codex 5h 30% · week 12%" for the scene header, each window at its most used bucket; a window past its reset is left out, '' with no fresh reading. */
+export function codexUsageLine(limits: CodexLimits | undefined, now: number): string {
+  if (!limits || !Array.isArray(limits.buckets) || now - limits.at > CODEX_USAGE_STALE_MS) return ''
+  const byKind = new Map<string, RateWindow>()
+  const live = limits.buckets.flatMap(b => b.windows).filter(w => w.resetsAt === undefined || Date.parse(w.resetsAt) > now)
+  for (const w of live) {
+    const seen = byKind.get(w.kind)
+    if (seen === undefined || w.percentUsed > seen.percentUsed) byKind.set(w.kind, w)
+  }
+  const line = budgetLine([...byKind.values()])
+  return line ? `codex ${line}` : ''
 }

@@ -121,7 +121,7 @@ describe('codex review rounds', () => {
   })
 
   test('a Codex usage / rate limit failure is matched case-insensitively; other failures are not', () => {
-    for (const text of ["You've hit your usage limit. Try again at 3:11 AM.", 'Rate Limit exceeded', 'ERROR: you HIT YOUR LIMIT']) {
+    for (const text of ["You've hit your usage limit. Try again at 3:11 AM.", 'Rate Limit exceeded', 'ERROR: you HIT YOUR LIMIT', 'workspace is out of credits']) {
       expect(isUsageLimit(text)).toBe(true)
     }
     for (const text of ['Not logged in', 'stream error: 429 Too Many Requests', 'model not supported', '']) expect(isUsageLimit(text)).toBe(false)

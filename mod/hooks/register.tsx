@@ -11,5 +11,5 @@ export const register: Register = (on, options) => {
   installJobs(on, options)
   installManage(on)
   installManga(on)
-  installScene(on)
+  installScene(on, options)
 }

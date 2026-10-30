@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { codexGuardVerdict, codexLimitsFrom, codexResetAt, parseCodexReviewArgs } from './codex-budget'
+import {
+  CODEX_DEEP_MAX_LINES, CODEX_USAGE_STALE_MS, codexDeepSizeVerdict, codexGuardVerdict, codexLimitsFrom, codexResetAt,
+  codexUsageLine, parseCodexReviewArgs,
+} from './codex-budget'
 import type { CodexLimits } from './codex-budget'
+import { codexQuotaMessage } from './codex'
 
 // Local times, as codex prints them.
 const now = new Date(2026, 9, 6, 1, 0).getTime()
@@ -71,5 +75,44 @@ describe('codex rate-limit percentages', () => {
 
     // Past the window's reset, the old reading no longer counts.
     expect(codexGuardVerdict('gpt-6-luna', at311 + 1, { limits: limits(99, 40), out: {} }, false)).toEqual({ isAllowed: true })
+  })
+})
+
+describe('codex deep size and credits', () => {
+  test('a deep review over the size limit is refused with its size; --force overrides', () => {
+    expect(codexDeepSizeVerdict(CODEX_DEEP_MAX_LINES, false)).toEqual({ isAllowed: true })
+    expect(codexDeepSizeVerdict(undefined, false)).toEqual({ isAllowed: true })
+    const refused = codexDeepSizeVerdict(100_000, false)
+    expect(refused.isAllowed).toBe(false)
+    const reason = (refused as { reason: string }).reason
+    expect(reason.startsWith('DEEP REVIEW REFUSED')).toBe(true)
+    expect(reason).toContain('100,000 changed lines')
+    expect(reason).toContain('/codex-review --deep --force')
+    expect(codexDeepSizeVerdict(100_000, true)).toMatchObject({ isAllowed: true, warning: expect.stringContaining('100,000') })
+  })
+
+  test('"out of credits" marks the model out, so the guard refuses the next job on it', () => {
+    const text = 'workspace is out of credits'
+    expect(codexQuotaMessage(text, 'gpt-6-astra')).toBeDefined()
+    // codex named no reset time: out for the fallback hour.
+    const until = codexResetAt(text, now) ?? now + 60 * 60_000
+    const state = { out: { 'gpt-6-astra': { until, note: text } } }
+    expect(codexGuardVerdict('gpt-6-astra', now, state, false).isAllowed).toBe(false)
+    expect(codexGuardVerdict('gpt-6.1-sol', now, state, false)).toEqual({ isAllowed: true })
+  })
+})
+
+describe('codexUsageLine', () => {
+  test('each window at its most used bucket, nothing once stale', () => {
+    const w = (kind: string, percentUsed: number) => ({ kind, percentUsed })
+    const limits: CodexLimits = { at: now, buckets: [{ windows: [w('five_hour', 30), w('seven_day', 12)] }, { model: 'gpt-6-astra', windows: [w('five_hour', 61)] }] }
+    expect(codexUsageLine(limits, now)).toBe('codex 5h 61% · week 12%')
+    expect(codexUsageLine(limits, now + CODEX_USAGE_STALE_MS + 1)).toBe('')
+    expect(codexUsageLine(undefined, now)).toBe('')
+  })
+  test('a window past its reset is left out', () => {
+    const past = new Date(now - 1).toISOString()
+    const limits: CodexLimits = { at: now - 60_000, buckets: [{ windows: [{ kind: 'five_hour', percentUsed: 99, resetsAt: past }, { kind: 'seven_day', percentUsed: 12 }] }] }
+    expect(codexUsageLine(limits, now)).toBe('codex week 12%')
   })
 })
