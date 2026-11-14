@@ -556,7 +556,7 @@ export function installJobs(on: On, options: PluginOptions) {
           return (
             <Box key={`row-${job.id}`} flexDirection="row">
               <Text color={color}>{glyph} </Text>
-              <Button key={`job-${job.id}`} plain dimColor={!job.isSelected} onPress={() => void select(job.id)}>
+              <Button key={`job-${job.id}`} plain dimColor={!job.isSelected} onPress={() => background($, 'a job selection', select(job.id))}>
                 {clip(line, cols - 3)}
               </Button>
             </Box>
@@ -568,7 +568,7 @@ export function installJobs(on: On, options: PluginOptions) {
             {selected.route && <Text dimColor>{clip(describeRoute(selected.route), cols)}</Text>}
             <Box flexDirection="row">
               {isLive(selected) && (
-                <Button key="kill" hotkey="k" onPress={() => void killJob($, options, selected.id, 'killed')}>
+                <Button key="kill" hotkey="k" onPress={() => background($, `job ${selected.id}'s kill`, killJob($, options, selected.id, 'killed'))}>
                   kill
                 </Button>
               )}
@@ -576,7 +576,7 @@ export function installJobs(on: On, options: PluginOptions) {
                 <Button
                   key="attach"
                   hotkey="a"
-                  onPress={press => void $.ui.copy({ text: `claude attach ${selected.bgId}`, surface: press.surface })}
+                  onPress={press => background($, 'a copy', $.ui.copy({ text: `claude attach ${selected.bgId}`, surface: press.surface }))}
                 >
                   copy attach
                 </Button>
@@ -584,7 +584,7 @@ export function installJobs(on: On, options: PluginOptions) {
               <Button
                 key="copy"
                 hotkey="c"
-                onPress={press => void $.ui.copy({ text: selected.result ?? selected.tail, surface: press.surface })}
+                onPress={press => background($, 'a copy', $.ui.copy({ text: selected.result ?? selected.tail, surface: press.surface }))}
               >
                 copy
               </Button>
@@ -1200,7 +1200,8 @@ async function registerBgLocked($: EngineInterface, slot: Slot, bgId: string, mo
 
 /** Kill: stop the work (or its gate's check) and mark the job failed right away. */
 async function killJob($: EngineInterface, options: PluginOptions, id: string, why: string): Promise<void> {
-  void RUNNING.get(id)?.()
+  const stopping = RUNNING.get(id)?.()
+  if (stopping) background($, `job ${id}'s stop`, stopping)
   await finishJob($, options, id, 'failed', why)
 }
 
