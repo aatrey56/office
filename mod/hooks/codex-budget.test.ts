@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
-  CODEX_DEEP_MAX_LINES, CODEX_USAGE_STALE_MS, codexDeepSizeVerdict, codexGuardVerdict, codexLimitsFrom, codexResetAt,
+  CODEX_DEEP_MAX_LINES, CODEX_USAGE_STALE_MS, codexDeepAnswerVerdict, codexDeepConfirmQuestion, codexDeepSizeVerdict, codexGuardVerdict, codexLimitsFrom, codexResetAt,
   codexUsageLine, parseCodexReviewArgs,
 } from './codex-budget'
 import type { CodexLimits } from './codex-budget'
@@ -79,16 +79,25 @@ describe('codex rate-limit percentages', () => {
 })
 
 describe('codex deep size and credits', () => {
-  test('a deep review over the size limit is refused with its size; --force overrides', () => {
+  test('a deep review over the size limit needs confirmation; --force overrides', () => {
     expect(codexDeepSizeVerdict(CODEX_DEEP_MAX_LINES, false)).toEqual({ isAllowed: true })
     expect(codexDeepSizeVerdict(undefined, false)).toEqual({ isAllowed: true })
-    const refused = codexDeepSizeVerdict(100_000, false)
-    expect(refused.isAllowed).toBe(false)
-    const reason = (refused as { reason: string }).reason
-    expect(reason.startsWith('DEEP REVIEW REFUSED')).toBe(true)
-    expect(reason).toContain('100,000 changed lines')
-    expect(reason).toContain('/codex-review --deep --force')
+    const v = codexDeepSizeVerdict(100_000, false)
+    expect(v).toMatchObject({ isAllowed: false, needsConfirmation: true, lines: '100,000 changed lines' })
+    if (v.isAllowed || !('needsConfirmation' in v)) throw new Error('expected a confirmation verdict')
+    expect(v.reason).toContain('/codex-review --deep --force')
     expect(codexDeepSizeVerdict(100_000, true)).toMatchObject({ isAllowed: true, warning: expect.stringContaining('100,000') })
+    expect(codexDeepConfirmQuestion('gpt-6-astra', v.lines)).toBe(
+      'Deep review (gpt-6-astra) of 100,000 changed lines, over the 5,000-line limit. It can use a large share of the deep quota. Run it?',
+    )
+  })
+
+  test('the person\'s answer: only "Run deep review" starts it; cancel or no answer refuses', () => {
+    const v = codexDeepSizeVerdict(12_345, false)
+    if (v.isAllowed) throw new Error('expected a confirmation verdict')
+    expect(codexDeepAnswerVerdict(v, 'Run deep review')).toMatchObject({ isAllowed: true, warning: expect.stringContaining('Confirmed past the deep size limit') })
+    expect(codexDeepAnswerVerdict(v, 'Cancel')).toMatchObject({ isAllowed: false, reason: expect.stringContaining('--commit <sha>') })
+    expect(codexDeepAnswerVerdict(v, undefined)).toMatchObject({ isAllowed: false, reason: expect.stringContaining('/codex-review --deep --force') })
   })
 
   test('"out of credits" marks the model out, so the guard refuses the next job on it', () => {

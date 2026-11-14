@@ -39,6 +39,9 @@ import type { CodexTier, ReviewTarget } from './codex'
 import {
   CODEX_LIMITS_REQUEST,
   CODEX_OUT_FALLBACK_MS,
+  CODEX_DEEP_CONFIRM_OPTIONS,
+  codexDeepAnswerVerdict,
+  codexDeepConfirmQuestion,
   codexDeepSizeVerdict,
   codexGuardVerdict,
   codexLimitsArgv,
@@ -1868,7 +1871,16 @@ async function startCodexReview(
   const target: ReviewTarget = plan.target ?? fallback!
   const deepModel = opt(options, 'codexDeepModel', CODEX_DEFAULTS.deep.model)
   const isDeep = tier.model === deepModel
-  const size: CodexVerdict = isDeep ? codexDeepSizeVerdict(await reviewLines($, cwd, target, plan.instructions !== undefined), ask.isForced) : { isAllowed: true }
+  let size: CodexVerdict = { isAllowed: true }
+  if (isDeep) {
+    const sized = codexDeepSizeVerdict(await reviewLines($, cwd, target, plan.instructions !== undefined), ask.isForced)
+    if (sized.isAllowed) size = sized
+    else {
+      // Never started without an explicit yes: no answer, a throw or no UI all keep the refusal.
+      const answer = await $.ui.ask(codexDeepConfirmQuestion(tier.model, sized.lines), CODEX_DEEP_CONFIRM_OPTIONS).catch(() => undefined)
+      size = codexDeepAnswerVerdict(sized, answer)
+    }
+  }
   // Passed on as it is: the reason already names the size and the person's --force.
   if (!size.isAllowed) {
     await drop()
@@ -1917,6 +1929,7 @@ async function startCodexReview(
   const notes = [
     plan.note !== undefined ? `This is a ${plan.note}.` : '',
     isLast ? 'It is the last round an agent can start on this branch.' : '',
+    size.isAllowed && size.warning ? `Deep size: ${size.warning}` : '',
     verdict.warning ? `Budget: ${verdict.warning}` : '',
     size.isAllowed && size.warning ? `Size: ${size.warning}` : '',
     booked?.isUnrecorded ? 'The round was not recorded (the review ledger could not be written), so it does not count toward the cap.' : '',

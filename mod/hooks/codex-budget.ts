@@ -147,26 +147,56 @@ export function codexGuardVerdict(
   return { isAllowed: false, reason: `Codex budget guard refused: ${what} (limit ${CODEX_REFUSE_PCT}%).` }
 }
 
-/** Lines changed above which a deep review is refused: one huge diff can drain the deep model's quota in a single run. */
+/** Lines changed above which a deep review needs the person's yes: one huge diff can drain the deep model's quota in a single run. */
 export const CODEX_DEEP_MAX_LINES = 5000
 
+/** A deep size check: allowed, or the person must confirm (`reason` is the refusal when they do not, or cannot be asked). */
+export type CodexDeepSizeVerdict =
+  | { isAllowed: true; warning?: string }
+  | { isAllowed: false; needsConfirmation: true; lines: string; reason: string }
+
+function deepSizeText(changedLines: number): { lines: string; limit: string } {
+  return { lines: `${changedLines.toLocaleString('en-US')} changed lines`, limit: CODEX_DEEP_MAX_LINES.toLocaleString('en-US') }
+}
+
 /**
- * Before a deep review: a diff over CODEX_DEEP_MAX_LINES changed lines is refused, naming its size.
+ * Before a deep review: a diff over CODEX_DEEP_MAX_LINES changed lines needs the person's confirmation.
  * `changedLines` undefined (git could not measure it) is allowed. `isForced` (only the person's typed
- * /codex-review --force) lets it start, with a warning.
+ * /codex-review --force) lets it start, with a warning. The caller asks; its `reason` stands when no yes comes.
  */
-export function codexDeepSizeVerdict(changedLines: number | undefined, isForced: boolean): CodexVerdict {
+export function codexDeepSizeVerdict(changedLines: number | undefined, isForced: boolean): CodexDeepSizeVerdict {
   if (changedLines === undefined || changedLines <= CODEX_DEEP_MAX_LINES) return { isAllowed: true }
-  const lines = `${changedLines.toLocaleString('en-US')} changed lines`
-  const limit = CODEX_DEEP_MAX_LINES.toLocaleString('en-US')
+  const { lines, limit } = deepSizeText(changedLines)
   if (isForced) return { isAllowed: true, warning: `Forced past the deep size limit: this review is ${lines} (limit ${limit}).` }
   return {
     isAllowed: false,
+    needsConfirmation: true,
+    lines,
     reason:
-      `DEEP REVIEW REFUSED: this review is ${lines}, over the deep limit of ${limit}. ` +
+      `DEEP REVIEW REFUSED: this review is ${lines}, over the deep limit of ${limit}, and the person was not asked or did not confirm. ` +
       'To run it anyway, the person types /codex-review --deep --force (plus the target). ' +
       'Otherwise review without deep, or a narrower target (--commit <sha>, or a smaller branch).',
   }
+}
+
+/** The question put to the person for a deep review that needs confirmation. */
+export function codexDeepConfirmQuestion(model: string, lines: string): string {
+  return `Deep review (${model}) of ${lines}, over the ${CODEX_DEEP_MAX_LINES.toLocaleString('en-US')}-line limit. It can use a large share of the deep quota. Run it?`
+}
+
+export const CODEX_DEEP_CONFIRM_YES = 'Run deep review'
+export const CODEX_DEEP_CONFIRM_OPTIONS = [CODEX_DEEP_CONFIRM_YES, 'Cancel']
+
+/** What follows the person's answer: 'Run deep review' starts it with a warning; anything else refuses (a Cancel says so). */
+export function codexDeepAnswerVerdict(
+  verdict: Extract<CodexDeepSizeVerdict, { needsConfirmation: true }>,
+  answer: string | undefined,
+): CodexVerdict {
+  if (answer === CODEX_DEEP_CONFIRM_YES) return { isAllowed: true, warning: `Confirmed past the deep size limit: this review is ${verdict.lines} (limit ${CODEX_DEEP_MAX_LINES.toLocaleString('en-US')}).` }
+  if (answer === 'Cancel') {
+    return { isAllowed: false, reason: `Deep review cancelled: the person declined to run ${verdict.lines}. Review without deep, or a narrower target (--commit <sha>).` }
+  }
+  return { isAllowed: false, reason: verdict.reason }
 }
 
 /** `/codex-review` args: `--deep`, `--force` and `--model <m>` anywhere; the rest is the target. */
