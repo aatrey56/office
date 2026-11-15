@@ -444,11 +444,12 @@ export function installScene(on: On, options: PluginOptions) {
     const workers = crew.filter(c => !c.isSelectable && !agents.some(a => a.id === c.id))
     const picked = leads.find(c => c.id === selectedId)
     const pickedCard = picked && cards.find(c => c.sessionId === picked.id)
-    let usage = ''
+    let claudeBudget = ''
+    let claudeContext = ''
     try {
       const { rateLimits, context } = await $.session.usage()
-      const claude = [budgetLine(rateLimits as RateWindow[]), contextLine(context)].filter(Boolean).join(' · ')
-      usage = claude ? `claude ${claude}` : ''
+      claudeBudget = budgetLine(rateLimits as RateWindow[])
+      claudeContext = contextLine(context)
     } catch {
       // the header simply goes without it
     }
@@ -491,8 +492,6 @@ export function installScene(on: On, options: PluginOptions) {
       <Box flexDirection="column">
         <Box gap={1}>
           <Text bold>{projectName}</Text>
-          {usage && <Text dimColor>{usage}</Text>}
-          {codex && <Text dimColor>{codex}</Text>}
           {all.length > 1 && <Button plain key="prev-proj" label="prev office" hotkey="h" onPress={cycle(-1)} />}
           {all.length > 1 && <Button plain key="next-proj" label="next office" hotkey="l" onPress={cycle(1)} />}
           <Button plain key="text" label="text board" hotkey="t" onPress={() => update($, VIEW, () => 'text')} />
@@ -509,6 +508,13 @@ export function installScene(on: On, options: PluginOptions) {
           <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', title: mangaTitle, focus: true })} />
         </Box>
         {picture}
+        {(claudeBudget || claudeContext) && (
+          <Box width={columns} justifyContent="space-between">
+            <Text dimColor wrap="truncate-end">{claudeBudget ? `claude ${claudeBudget}` : ''}</Text>
+            {claudeContext && <Text dimColor>{claudeContext}</Text>}
+          </Box>
+        )}
+        {codex && <Text dimColor wrap="truncate-end">{codex}</Text>}
         {debug && (
           <Text dimColor wrap="truncate-end">
             {`frames drawn ${stats.painted} · swapped ${stats.swapped} · last swap ${stats.last || 'none yet'} · timer ${timer ? `running, last tick ${Math.round((Date.now() - lastFrameAt) / 100) / 10}s ago` : 'stopped'} · ${box.graphics ? `picture ×${box.scale} ${lastPicture.file && fileFrames ? `file gen ${lastPicture.generation}` : 'inline'}` : 'cells'} · walking ${actors.filter(a => a.path.length > 0).length}`}
