@@ -476,7 +476,7 @@ export function installManga(on: On) {
     const askKey = `${bodyRows}x${e.viewport?.columns}`
     if (wider && askedFor !== askKey) {
       askedFor = askKey
-      void $.ui.open({ id: PANE, columns: wider, ...(e.props.isFocused ? { focus: true as const } : {}) })
+      void $.ui.open({ id: PANE, columns: wider, ...(e.props.isFocused ? { focus: true as const } : {}) }).catch(() => undefined)
     }
     const imagePath = `${dir}/${file}`
     const imageExists = file ? await $.fs.exists(imagePath) : false

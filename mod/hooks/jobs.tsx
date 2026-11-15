@@ -325,11 +325,11 @@ export function installJobs(on: On, options: PluginOptions) {
     await sweepAfterLoad($, options)
     // Keep elapsed times moving while anything runs: only the jobs pane reads TICK.
     $.clock.every(2000, () => {
-      if (RUNNING.size > 0) void update($, TICK, n => (n + 1) % 1_000_000)
+      if (RUNNING.size > 0) background($, 'the jobs tick', update($, TICK, n => (n + 1) % 1_000_000))
     })
     // --bg workers live outside this process: poll `claude agents --json`.
     $.clock.every(BG_POLL_MS, () => {
-      if (BG_JOBS.size > 0 && !bgPolling) void pollBg($, options)
+      if (BG_JOBS.size > 0 && !bgPolling) background($, 'a --bg poll', pollBg($, options))
     })
     return started
   })
@@ -561,7 +561,7 @@ export function installJobs(on: On, options: PluginOptions) {
           return (
             <Box key={`row-${job.id}`} flexDirection="row">
               <Text color={color}>{glyph} </Text>
-              <Button key={`job-${job.id}`} plain dimColor={!job.isSelected} onPress={() => void select(job.id)}>
+              <Button key={`job-${job.id}`} plain dimColor={!job.isSelected} onPress={() => background($, 'a job selection', select(job.id))}>
                 {clip(line, cols - 3)}
               </Button>
             </Box>
@@ -573,7 +573,7 @@ export function installJobs(on: On, options: PluginOptions) {
             {selected.route && <Text dimColor>{clip(describeRoute(selected.route), cols)}</Text>}
             <Box flexDirection="row">
               {isLive(selected) && (
-                <Button key="kill" hotkey="k" onPress={() => void killJob($, options, selected.id, 'killed')}>
+                <Button key="kill" hotkey="k" onPress={() => background($, `job ${selected.id}'s kill`, killJob($, options, selected.id, 'killed'))}>
                   kill
                 </Button>
               )}
@@ -581,7 +581,7 @@ export function installJobs(on: On, options: PluginOptions) {
                 <Button
                   key="attach"
                   hotkey="a"
-                  onPress={press => void $.ui.copy({ text: `claude attach ${selected.bgId}`, surface: press.surface })}
+                  onPress={press => background($, 'a copy', $.ui.copy({ text: `claude attach ${selected.bgId}`, surface: press.surface }))}
                 >
                   copy attach
                 </Button>
@@ -589,7 +589,7 @@ export function installJobs(on: On, options: PluginOptions) {
               <Button
                 key="copy"
                 hotkey="c"
-                onPress={press => void $.ui.copy({ text: selected.result ?? selected.tail, surface: press.surface })}
+                onPress={press => background($, 'a copy', $.ui.copy({ text: selected.result ?? selected.tail, surface: press.surface }))}
               >
                 copy
               </Button>
@@ -1143,12 +1143,16 @@ async function reserveSlot($: EngineInterface, options: PluginOptions, view: BgV
 /** Keeps a slot reserved while its start runs on: every RESERVATION_RENEW_MS it holds RESERVATION_MS more. */
 function renewSlot($: EngineInterface, slot: Slot): Timer {
   return $.clock.every(RESERVATION_RENEW_MS, () =>
-    void withCapLockIfFree($, 'a reservation renewal', async () => {
-      if (slot.isSettled) return
-      const now = await clockNow($)
-      const others = liveReservations(await storeGet($, RESERVED_KEY), now).filter(r => r.id !== slot.id)
-      await $.store.set(RESERVED_KEY, [...others, { id: slot.id, isOpus: slot.isOpus, until: now + RESERVATION_MS }]).catch(() => undefined)
-    }),
+    background(
+      $,
+      'a reservation renewal',
+      withCapLockIfFree($, 'a reservation renewal', async () => {
+        if (slot.isSettled) return
+        const now = await clockNow($)
+        const others = liveReservations(await storeGet($, RESERVED_KEY), now).filter(r => r.id !== slot.id)
+        await $.store.set(RESERVED_KEY, [...others, { id: slot.id, isOpus: slot.isOpus, until: now + RESERVATION_MS }]).catch(() => undefined)
+      }),
+    ),
   )
 }
 
@@ -1201,7 +1205,8 @@ async function registerBgLocked($: EngineInterface, slot: Slot, bgId: string, mo
 
 /** Kill: stop the work (or its gate's check) and mark the job failed right away. */
 async function killJob($: EngineInterface, options: PluginOptions, id: string, why: string): Promise<void> {
-  void RUNNING.get(id)?.()
+  const stopping = RUNNING.get(id)?.()
+  if (stopping) background($, `job ${id}'s stop`, stopping)
   await finishJob($, options, id, 'failed', why)
 }
 
@@ -1223,7 +1228,7 @@ async function startTimeout($: EngineInterface, options: PluginOptions, id: stri
   const left = Math.max(1000, (CLOCK_START.get(id) ?? now) + (PAUSED_MS.get(id) ?? 0) + minutes * 60_000 - now)
   TIMERS.get(id)?.cancel()
   TIMERS.delete(id)
-  if (RUNNING.has(id) && !GATES.has(id)) TIMERS.set(id, $.clock.after(left, () => void onDeadline($, options, id)))
+  if (RUNNING.has(id) && !GATES.has(id)) TIMERS.set(id, $.clock.after(left, () => background($, `job ${id}'s deadline`, onDeadline($, options, id))))
 }
 
 /** At a running job's deadline: extend it once while its transcript still grows; otherwise end it. */
@@ -1339,7 +1344,7 @@ function adoptSubagent($: EngineInterface, options: PluginOptions, job: Job, age
       return agent === undefined || !['running', 'pending', 'waiting'].includes(agent.status)
     })
   })
-  void startTimeout($, options, job.id)
+  background($, `job ${job.id}'s deadline`, startTimeout($, options, job.id))
 }
 
 /** `claude stop`, then the session ended in `claude agents`: whether the --bg session's stop is confirmed. */
@@ -1363,7 +1368,7 @@ function adoptBg($: EngineInterface, options: PluginOptions, job: Job, bgId: str
     return stopBg($, options, bgId)
   })
   // A blocked job's deadline waits for its unblock, which re-arms it (pollBg).
-  if (job.status !== 'blocked') void startTimeout($, options, job.id)
+  if (job.status !== 'blocked') background($, `job ${job.id}'s deadline`, startTimeout($, options, job.id))
 }
 
 /** One poll of every --bg job: state from `claude agents`, result from the transcript. */
@@ -1444,7 +1449,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
         if (blocked === 'end') {
           const why = `ended after ${formatElapsed(now - since)} waiting for approval or input (twice blockedTimeoutMin ${blockedMin})`
           // Not awaited: confirming the stop takes up to STOP_CONFIRM_MS, and the other workers' polls go on.
-          void endJob($, options, jobId, why, Math.round(sinceStart / 60_000))
+          background($, `job ${jobId}'s end`, endJob($, options, jobId, why, Math.round(sinceStart / 60_000)))
           continue
         }
         if (blocked === 'report') {
@@ -1654,7 +1659,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
     return confirmStopped($, async () => isClosed)
   })
-  void startTimeout($, options, jobId)
+  background($, `job ${jobId}'s deadline`, startTimeout($, options, jobId))
 
   const take = (line: string) => {
     const ev = plan.parse(line)
@@ -1738,7 +1743,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   // Kept before delivery too, so the next round, asked for on reading this one, sees its findings.
   if (plan.isRound) await settleRound($, jobId, status === 'done' ? final : undefined)
   await finishJob($, options, jobId, status, final)
-  if (plan.codexModel !== undefined) void readCodexLimits($, plan.argv[0]!, plan.cwd)
+  if (plan.codexModel !== undefined) background($, 'the Codex limits read', readCodexLimits($, plan.argv[0]!, plan.cwd))
 }
 
 // ── codex ───────────────────────────────────────────────────────────────
@@ -1923,7 +1928,7 @@ async function startCodexReview(
     isRound,
     isForced: ask.isForced,
   }
-  $.clock.after(0, () => void runJob($, options, job, runPlan))
+  $.clock.after(0, () => background($, `job ${job.id}`, runJob($, options, job, runPlan)))
   const kind = plan.isRereview ? 're-review' : 'review'
   const isLast = isRound && !ask.isPerson && plan.round >= policy.maxRounds
   const notes = [
@@ -2171,7 +2176,7 @@ async function startCodexExec(
     outFile,
     codexModel: tier.model,
   }
-  $.clock.after(0, () => void runJob($, options, job, plan))
+  $.clock.after(0, () => background($, `job ${job.id}`, runJob($, options, job, plan)))
   return {
     ok: true,
     text: `Started Codex job ${job.id} (read-only sandbox) in ${cwd}. Its answer is appended to this conversation when it finishes. /jobs shows progress.${verdict.warning ? ` Budget: ${verdict.warning}` : ''}`,
@@ -2367,8 +2372,8 @@ async function launchWorker(
   const handed: Slot = { ...slot }
   slot.isSettled = true
   $.clock.after(0, () => {
-    void runJob($, options, job, plan)
-    void releaseSlot($, handed)
+    background($, `job ${job.id}`, runJob($, options, job, plan))
+    background($, `job ${job.id}'s slot release`, releaseSlot($, handed))
   })
   return {
     ok: true,
@@ -2387,6 +2392,15 @@ function debugLog($: EngineInterface, text: string): void {
   } catch {
     // best effort
   }
+}
+
+/**
+ * Work nothing awaits (a timer's, or one left running past its hook): a rejection is logged, never left
+ * unhandled. One comes when the environment that started it is gone (a reload mid-job, a test's end), as
+ * the host then refuses that environment's $.state reads.
+ */
+function background($: EngineInterface, what: string, work: Promise<unknown>): void {
+  work.catch(err => debugLog($, `office: ${what} stopped: ${String(err)}`))
 }
 
 /**
@@ -2604,7 +2618,7 @@ function isGated(job: Job): boolean {
  * minutes). The job holds its slot in RUNNING meanwhile, and a kill there ends the check under way.
  */
 function startGate($: EngineInterface, options: PluginOptions, id: string, run = claimGate(id)): void {
-  $.clock.after(0, () => void gateWorker($, options, id, run))
+  $.clock.after(0, () => background($, `job ${id}'s gate`, gateWorker($, options, id, run)))
 }
 
 /** Makes the job its gate's, synchronously: GATES says so (no timeout ends it), and RUNNING holds the gate's kill. */
