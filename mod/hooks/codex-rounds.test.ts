@@ -2,8 +2,8 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { CODEX_DEFAULTS } from './codex'
 import {
-  branchProbes, CODEX_OUT_FALLBACK_TEXT, coversBranch, FINDINGS_MAX, isGoneIn, isUsageLimit, mainRefs, mergedOf, parseLedger, planCovers,
-  planReviewRound, retainedLedger, ROUND_CAP_MS, ROUND_TTL_MS, roundTiers, roundTitle, settledLedger, shortstatLines, textLines,
+  anyYes, branchOfRef, branchProbes, CODEX_OUT_FALLBACK_TEXT, coversBranch, FINDINGS_MAX, isUsageLimit, liveRefs, parseLedger, planCovers,
+  planReviewRound, retainedLedger, ROUND_CAP_MS, ROUND_TTL_MS, roundId, roundTiers, roundTitle, settledLedger, shortstatLines, textLines,
 } from './codex-rounds'
 import type { ReviewRound, RoundFacts } from './codex-rounds'
 
@@ -125,20 +125,35 @@ describe('codex review rounds', () => {
     const DAY = 86_400_000
     const now = 40 * DAY
     const month = [{ ...round(A, '[P1] x.ts:3 off by one'), at: now - 30 * DAY }]
+    const last = roundId(month[0])
     const ledger = { '/r/.git#live': month, '/r/.git#merged': month, '/r/.git#gone': month, '/r/.git#unknown': month, '/s/.git#gone': month }
-    const kept = retainedLedger(ledger, '/r/.git/', { live: { isGone: false, isMerged: false }, merged: { isGone: false, isMerged: true }, gone: { isGone: true }, unknown: {} }, now)
+    const lives = { live: { last, isGone: false, isMerged: false }, merged: { last, isGone: false, isMerged: true }, gone: { last, isGone: true }, unknown: { last } }
+    const kept = retainedLedger(ledger, '/r/.git/', lives)
     expect(Object.keys(kept)).toEqual(['/r/.git#live', '/r/.git#unknown', '/s/.git#gone']) // another repo's branch is not judged here
     expect(planReviewRound(facts({ rounds: kept['/r/.git#live']! }), policy)).toMatchObject({ round: 2, isRereview: true, tier: CODEX_DEFAULTS.rereview })
-    // the default branch and a detached HEAD never merge or go: their rounds keep the fixed TTL
-    const onMain = { '/r/.git#main': [{ ...round(A), at: now - ROUND_TTL_MS }, { ...round(B), at: now - DAY }], '/r/.git#HEAD': month }
-    expect(retainedLedger(onMain, '/r/.git', {}, now)).toEqual({ '/r/.git#main': [onMain['/r/.git#main'][1]] })
-    expect(branchProbes({ ...ledger, ...onMain, '/r/.git#wip': [{ ...round(A), isCovering: false }] }, '/r/.git').map(p => [p.branch, p.sha])).toEqual(
-      [['live', A], ['merged', A], ['gone', A], ['unknown', A], ['wip', undefined]],
+    // a verdict probed outside the lock judges only the round it was asked about: a round booked since keeps the branch
+    const rebooked = { '/r/.git#merged': [{ ...round(B), jobId: 'other', at: now }] }
+    expect(retainedLedger(rebooked, '/r/.git', lives)).toEqual(rebooked)
+    expect(branchProbes({ ...ledger, '/r/.git#main': month, '/r/.git#wip': [{ ...round(A), isCovering: false }] }, '/r/.git').map(p => [p.branch, p.sha, p.last])).toEqual(
+      [['live', A, last], ['merged', A, last], ['gone', A, last], ['unknown', A, last], ['wip', undefined, roundId(round(A))]],
     )
-    const refs = ['refs/heads/main', 'refs/heads/live/x', 'refs/remotes/origin/live', 'refs/remotes/origin/master']
-    expect(mainRefs(refs)).toEqual(['refs/heads/main', 'refs/remotes/origin/master'])
-    expect([isGoneIn('live', refs), isGoneIn('live/x', refs), isGoneIn('gone', refs), isGoneIn('gone', undefined)]).toEqual([false, false, true, undefined])
-    expect([mergedOf([false, true]), mergedOf([false, false]), mergedOf([false, undefined]), mergedOf([])]).toEqual([true, false, undefined, undefined])
+    expect([anyYes([false, true]), anyYes([false, false]), anyYes([false, undefined]), anyYes([])]).toEqual([true, false, undefined, undefined])
+  })
+
+  test('a branch is named from its full ref: a tag of the same name cannot make a live branch look deleted', () => {
+    expect([branchOfRef('refs/heads/feature'), branchOfRef('refs/heads/heads/feature'), branchOfRef(undefined)]).toEqual(['feature', 'heads/feature', ''])
+    expect(liveRefs('feature')).toEqual(['refs/heads/feature', 'refs/remotes/origin/feature'])
+    // a key stored in git's ambiguous short form `heads/feature` stays alive while either reading of it exists
+    expect(liveRefs('heads/feature')).toEqual(['refs/heads/heads/feature', 'refs/remotes/origin/heads/feature', 'refs/heads/feature', 'refs/remotes/origin/feature'])
+  })
+
+  test('the default branch and a detached HEAD lose each round past 14 days when the ledger is read, with no git', () => {
+    const DAY = 86_400_000
+    const now = 40 * DAY
+    const old = { ...round(A), at: now - ROUND_TTL_MS }
+    const fresh = { ...round(B), at: now - DAY }
+    const ledger = parseLedger({ '/r/.git#main': [old, fresh], '/r/.git#master': [old], '/r/.git#HEAD': [old], '/r/.git#feature': [old] }, now)
+    expect(ledger).toEqual({ '/r/.git#main': [fresh], '/r/.git#feature': [old] })
   })
 
   test('a Codex usage / rate limit failure is matched case-insensitively; other failures are not', () => {

@@ -158,9 +158,10 @@ code (`codex-rounds.ts`, wired in `jobs.tsx`):
   branch: each round's HEAD, base, model, job id, time, and its final text (first 4 KB) once
   done. A failed or killed round is dropped. A branch keeps its rounds while it lives: they go when
   its newest covering round's HEAD is merged into main/master (local or origin's) or the branch is
-  gone locally and on origin, checked when a round is booked in that repo (a failed git call keeps
-  them), and in any case 90 days after its last round. The default branch and a detached HEAD
-  keep the old 14-day expiry per round. Writes take their own cross-session flock
+  gone locally and on origin, checked ref by ref when a round is booked in that repo (a failed git
+  call keeps them; a verdict only drops the rounds when the branch's newest round is still the one
+  probed), and in any case 90 days after its last round. The default branch and a detached HEAD
+  keep the old 14-day expiry per round, applied whenever the ledger is read. Writes take their own cross-session flock
   (`codex-rounds.lock`), as the capacity lock does.
 - **Sol only for a branch's first round.** Every later round, including yours (`/codex-review`)
   and a full re-review, runs on Luna. Exceptions: `deep` (the deep model, only when you ask) and
