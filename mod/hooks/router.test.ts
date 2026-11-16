@@ -316,7 +316,7 @@ describe('budget guard on worker starts', () => {
   test('an agent naming a model does not count as the person choosing it', async ($, on) => {
     const ran = fakeStart(on)
     on('session.usage', () => usageAt(85))
-    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'design it', model: 'opus', cwd: '/r' })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'design it', model: 'opus', reason: 'r', cwd: '/r' })
     expect(JSON.stringify(r)).toContain('only small tasks')
     expect(ran.filter(argv => argv.includes('--bg'))).toHaveLength(0)
   })

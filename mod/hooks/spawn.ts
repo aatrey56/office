@@ -414,7 +414,8 @@ export const SPAWN_TOOL = {
   name: 'spawn_worker',
   description:
     'Start a background worker on a self-contained task: a `claude --bg` background session (default), a headless `claude -p` process, or a subagent. ' +
-    'With no model, the office router picks the cheapest adequate model tier and effort (at most high). Returns a job id at once; ' +
+    'Omit model and effort by default: the office router then picks the cheapest adequate model tier and effort (at most high). ' +
+    'A model you name needs a one-line reason, or the spawn is refused. Returns a job id at once; ' +
     'the worker result is appended to this conversation when it finishes (watch it in /jobs). ' +
     'In a git repo the worker already runs on its own branch in its own worktree: never tell it to git switch, check out or create a branch; ' +
     'name the branch with `branch` and start it from another commit with `base` instead.',
@@ -423,7 +424,8 @@ export const SPAWN_TOOL = {
     properties: {
       task: { type: 'string', description: 'The whole task, self-contained: the worker has none of this context.' },
       mode: { type: 'string', enum: ['bg', 'headless', 'subagent'], description: 'Default bg.' },
-      model: { type: 'string', description: 'haiku | sonnet | opus | fable, or a full model id. Omit to route (the router picks haiku, sonnet or opus; fable only when named).' },
+      model: { type: 'string', description: 'haiku | sonnet | opus | fable, or a full model id. Omit to route (the router picks haiku, sonnet or opus; fable only when named). Given, it needs reason.' },
+      reason: { type: 'string', description: 'Required with model: one line on why this task needs that model rather than the router\'s pick.' },
       effort: {
         type: 'string',
         enum: [...EFFORTS],

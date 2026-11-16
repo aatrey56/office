@@ -35,10 +35,12 @@ declare module 'claude-code' {
       task: string
       mode?: "bg" | "headless" | "subagent"
       model?: string
+      reason?: string
       effort?: "low" | "medium" | "high" | "xhigh" | "max"
       cwd?: string
       base?: string
       branch?: string
+      deliverable?: "commit" | "report"
     }
     mcp__office__route_task: {
       task: string

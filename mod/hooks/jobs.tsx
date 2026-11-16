@@ -67,6 +67,8 @@ import {
   rulesRoute,
 } from './router'
 import type { Routed } from './router'
+import type { Chooser, RouterPick, Tokens } from './outcomes'
+import { finishRecord, OUTCOMES_FILE, reasonMissingText, reviewRecord, routerPick, spawnRecord, transcriptTokens, trialSwap, trialUntil } from './outcomes'
 import { alertKeysSeen, alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
 import {
   addJobTo,
@@ -156,6 +158,7 @@ const TICK = atom({ plugin: 'office', key: 'jobsTick' } as const, 0)
 const PANE = 'jobs'
 const FLUSH_MS = 400
 const JEV_TIMEOUT_MS = 5000
+const SHADOW_ROUTE_MS = 10_000
 const BG_POLL_MS = 5000
 const KEY_RETRY_MS = 60_000
 
@@ -402,8 +405,12 @@ export function installJobs(on: On, options: PluginOptions) {
     if (!task) return { deny: 'spawn_worker needs a task.' }
     const mode: WorkerMode = isWorkerMode(input.mode) ? input.mode : 'bg'
     if (input.deliverable !== undefined && !isDeliverable(input.deliverable)) return { deny: 'deliverable is commit or report.' }
-    const want = { base: str(input.base), branch: str(input.branch), deliverable: input.deliverable }
-    const msg = await startWorker($, options, task, mode, str(input.model), input.effort, str(input.cwd), BY_AGENT, want)
+    // An agent's explicit model says why; the person's /spawn --model never needs to.
+    const model = str(input.model)
+    const reason = str(input.reason)
+    if (model !== undefined && reason === undefined) return { deny: reasonMissingText(model) }
+    const want = { base: str(input.base), branch: str(input.branch), deliverable: input.deliverable, reason }
+    const msg = await startWorker($, options, task, mode, model, input.effort, str(input.cwd), BY_AGENT, want)
     const text = takeAlerts() + msg.text
     return msg.ok ? { result: text } : { deny: text }
   })
@@ -641,6 +648,29 @@ async function evalBackend(
 }
 
 async function route($: EngineInterface, options: PluginOptions, task: string): Promise<RouteDecision> {
+  const stored = await decide($, options, task)
+  await update($, LAST_ROUTE, () => stored)
+  return stored
+}
+
+/**
+ * What the router would pick for a spawn whose model was given, for its outcome record only: raced
+ * against SHADOW_ROUTE_MS, and undefined when it is late or fails. LAST_ROUTE is left alone.
+ */
+async function shadowRoute($: EngineInterface, options: PluginOptions, task: string): Promise<RouteDecision | undefined> {
+  let timer: Timer | undefined
+  const late = new Promise<undefined>(resolve => {
+    timer = $.clock.after(SHADOW_ROUTE_MS, () => resolve(undefined))
+  })
+  try {
+    return await Promise.race([decide($, options, task).catch(() => undefined), late])
+  } finally {
+    timer?.cancel()
+  }
+}
+
+/** The router's decision: the backends in order, the rules when none answers. */
+async function decide($: EngineInterface, options: PluginOptions, task: string): Promise<RouteDecision> {
   const forced = opt(options, 'routerBackend', 'auto')
   const wantsJev = forced === 'auto' || forced === 'jev'
   const jevKey = wantsJev ? await resolveJevKey($, options) : undefined
@@ -670,9 +700,7 @@ async function route($: EngineInterface, options: PluginOptions, task: string): 
     const reason = misses.length === 0 ? r.reason : `${r.reason} [${misses.join('; ')}]`
     decision = { ...r, reason, backend: 'rules', latencyMs: Date.now() - t0 }
   }
-  const stored = decision
-  await update($, LAST_ROUTE, () => stored)
-  return stored
+  return decision
 }
 
 /**
@@ -812,6 +840,7 @@ async function finishJob($: EngineInterface, options: PluginOptions, id: string,
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
   logInbox($, finishedLine(finished))
+  await logFinish($, finished)
   // Only a 'done' worker has surely stopped: a killed or timed-out one may still write there.
   await deliver($, finished.worktree !== undefined ? await settleWorktree($, finished, status === 'done') : finished)
 }
@@ -862,6 +891,78 @@ function logInbox($: EngineInterface, line: string | undefined): void {
       }
     }
   })
+}
+
+// ── the outcome log ($ halves; the records are built in outcomes.ts) ─────
+
+/** Lines wait here so this session's lines land in order. */
+let outcomesChain: Promise<void> = Promise.resolve()
+
+/**
+ * Appends one line to <config dir>/office/outcomes.jsonl off the caller's path. `>>`, not read and
+ * write back: every session appends to the one file, and none may drop another's line. A failure
+ * is logged, never thrown.
+ */
+function logOutcome($: EngineInterface, line: string): void {
+  outcomesChain = outcomesChain.then(async () => {
+    try {
+      const file = `${(await configDirOf($)).replace(/\/+$/, '')}/office/${OUTCOMES_FILE}`
+      const r = await $.process.run(['sh', '-c', 'mkdir -p "$(dirname "$1")" && printf \'%s\\n\' "$2" >> "$1"', 'sh', file, line], { timeoutMs: 10000 })
+      if (r.exitCode !== 0) debugLog($, `office: outcome log not written: ${(r.stderr || r.stdout).trim() || `exit ${r.exitCode}`}`)
+    } catch (err) {
+      debugLog($, `office: outcome log not written: ${String(err)}`)
+    }
+  })
+}
+
+/** A started worker's spawn record, written once the router's pick is in (at most SHADOW_ROUTE_MS). */
+function logSpawn($: EngineInterface, job: Job, task: string, cwd: string, o: OutcomeStart): void {
+  const write = async () => {
+    // A worker with no worktree has no project: its checkout says which repo and branch.
+    const here = job.project === undefined ? await git($, ['git', '-C', job.cwd, 'rev-parse', '--show-toplevel', '--abbrev-ref', 'HEAD']) : undefined
+    const [top, current] = here?.isOk === true ? here.out.trim().split('\n') : []
+    const root = job.project ?? top
+    const pick = await o.pick.catch(() => null)
+    logOutcome($, spawnRecord({
+      job: job.id,
+      at: job.startedAt,
+      cwd,
+      repo: root ? (root.replace(/\/+$/, '').split('/').pop() ?? null) : null,
+      branch: job.branch ?? (current && current !== 'HEAD' ? current : null),
+      base: job.baseRef ?? null,
+      mode: job.mode ?? 'bg',
+      deliverable: job.deliverable ?? o.deliverable ?? null,
+      model: job.model ?? '',
+      effort: job.effort ?? 'medium',
+      chooser: o.chooser,
+      routerPick: pick,
+      reason: o.reason,
+      task,
+    }))
+  }
+  background($, `job ${job.id}'s spawn record`, write())
+}
+
+/** A finished worker's record: its commits counted now (before its worktree may go), its tokens read off the caller's path. */
+async function logFinish($: EngineInterface, job: Job): Promise<void> {
+  if (job.kind !== 'worker' || job.endedAt === undefined) return
+  const { project, branch, baseRef } = job
+  const counted = project !== undefined && branch !== undefined && baseRef !== undefined
+    ? await git($, ['git', '-C', project, 'rev-list', '--count', `${baseRef}..${branch}`], 10000)
+    : undefined
+  const commits = counted?.isOk === true && /^\d+$/.test(counted.out.trim()) ? Number(counted.out.trim()) : null
+  const at = job.endedAt
+  const write = async () => logOutcome($, finishRecord(job, at, commits, await workerTokens($, job)))
+  background($, `job ${job.id}'s finish record`, write())
+}
+
+/** A --bg worker's tokens from its transcript's assistant lines; undefined when it cannot be read whole. */
+async function workerTokens($: EngineInterface, job: Job): Promise<Tokens | undefined> {
+  if (job.sessionId === undefined) return undefined
+  const path = await bgTranscript($, await configDirOf($), job.cwd, job.sessionId).catch(() => undefined)
+  if (path === undefined) return undefined
+  const r = await $.process.run(['grep', '-F', '"type":"assistant"', path], { timeoutMs: 10000 }).catch(() => undefined)
+  return r !== undefined && r.exitCode === 0 && !r.isStdoutTruncated ? transcriptTokens(r.stdout) : undefined
 }
 
 /** Jobs running now, and how many of them are workers on Opus-tier models. */
@@ -1646,6 +1747,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     const verdict = codexGuardVerdict(plan.codexModel, Date.now(), { out: await storedCodexOut($) }, plan.isForced === true)
     if (!verdict.isAllowed) {
       if (plan.isRound) await settleRound($, jobId, undefined)
+      logReview($, job, plan, '', verdict.reason)
       await finishJob($, options, jobId, 'failed', `${verdict.reason} ${CODEX_OUT_FALLBACK_TEXT}`)
       return
     }
@@ -1714,6 +1816,7 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   if (killed) {
     // killJob already marked and delivered it; a killed review gave no findings to keep.
     if (plan.isRound) await settleRound($, jobId, undefined)
+    logReview($, job, plan, '', 'killed')
     return
   }
 
@@ -1742,8 +1845,16 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   if (plan.codexModel !== undefined && quotaText !== undefined) await markCodexOut($, plan.codexModel, quotaText)
   // Kept before delivery too, so the next round, asked for on reading this one, sees its findings.
   if (plan.isRound) await settleRound($, jobId, status === 'done' ? final : undefined)
+  logReview($, job, plan, final, status === 'failed' ? final : undefined)
   await finishJob($, options, jobId, status, final)
   if (plan.codexModel !== undefined) background($, 'the Codex limits read', readCodexLimits($, plan.argv[0]!, plan.cwd))
+}
+
+/** A Codex review's outcome record (no other job kind has one); `error` for one that failed or was killed. */
+function logReview($: EngineInterface, job: Job, plan: RunPlan, text: string, error?: string): void {
+  if (job.kind !== 'codex-review') return
+  const model = plan.codexModel ?? job.model?.split('@')[0] ?? ''
+  logOutcome($, reviewRecord({ job: job.id, at: Date.now(), branch: job.review?.branch ?? null, round: job.review?.round ?? null, model, text, ...(error !== undefined ? { error } : {}) }))
 }
 
 // ── codex ───────────────────────────────────────────────────────────────
@@ -1904,6 +2015,7 @@ async function startCodexReview(
     status: 'running',
     startedAt: now,
     model: `${tier.model}@${tier.effort}`,
+    review: { branch: booked?.branch ?? null, round: plan.round },
     tail: '',
   }
   const notReady = await codexNotReady($, bin, cwd)
@@ -1985,11 +2097,12 @@ async function bookRound(
   policy: RoundPolicy,
   facts: Omit<RoundFacts, 'rounds' | 'head' | 'sinceLast'>,
   fallback: ReviewTarget,
-): Promise<(RoundPlan & { isUnrecorded?: true }) | string | undefined> {
+): Promise<(RoundPlan & { isUnrecorded?: true; branch?: string }) | string | undefined> {
   const head = await gitOut($, cwd, ['rev-parse', 'HEAD'])
   const commonDir = await gitOut($, cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
   if (!head || !commonDir) return undefined
-  const key = branchKey(commonDir, (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD'])) ?? '')
+  const branch = (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD']))?.trim() || undefined
+  const key = branchKey(commonDir, branch ?? '')
   const isIncremental = !facts.isPerson && facts.target === undefined && !facts.isFull
   const measureLast = async () => {
     const last = (await readLedgerLocked($, now)).ledger[key]?.at(-1) // the reconciled ledger, as the lock will see it
@@ -2024,7 +2137,7 @@ async function bookRound(
         // never recorded, so the cap could not count it: an agent waits, the person's review runs and says so
         return facts.isPerson ? { ...plan, isUnrecorded: true as const } : ROUNDS_UNRECORDED_TEXT
       })
-      if (booked !== undefined) return booked
+      if (booked !== undefined) return typeof booked === 'string' || branch === undefined ? booked : { ...booked, branch }
       measured = await measureLast()
     }
   } catch (err) {
@@ -2244,13 +2357,17 @@ async function startWorker(
   const now = Date.now()
   const routed = modelArg === undefined ? await route($, options, task) : undefined
   const deliverable = isDeliverable(want.deliverable) ? want.deliverable : undefined
-  const modelId = modelIdFor(modelArg ?? routed?.model ?? 'sonnet')
-  const effort: Effort = isEffort(effortArg) ? effortArg : (routed?.effort ?? 'medium')
+  const explicitEffort = isEffort(effortArg) ? effortArg : undefined
+  // The Sonnet trial overrules only the router's Opus; an explicit model is never swapped.
+  const trial = routed !== undefined ? trialSwap(routed, deliverable, trialUntil(options.sonnetTrialUntil), now, explicitEffort) : undefined
+  const modelId = modelIdFor(trial?.model ?? modelArg ?? routed?.model ?? 'sonnet')
+  const effort: Effort = trial?.effort ?? explicitEffort ?? routed?.effort ?? 'medium'
+  const chooser: Chooser = modelArg !== undefined ? (by.isPerson ? 'person' : 'manager') : trial !== undefined ? 'trial' : 'router'
   // Refused, never quietly moved to a cheaper model (checked again with the slot reserved below).
   const opusFull = opusError(load, options, modelId)
   if (opusFull) return { ok: false, text: opusFull }
   const verdict = budgetVerdict(windows, caps, {
-    isSmall: isSmallRoute(routed?.model ?? tierOfModelId(modelId), effort),
+    isSmall: isSmallRoute(trial?.model ?? routed?.model ?? tierOfModelId(modelId), effort),
     // Only a model the person typed counts as their explicit choice; an agent's does not.
     isExplicit: by.isPerson && modelArg !== undefined,
     isForced,
@@ -2261,17 +2378,24 @@ async function startWorker(
   // The load above was read before routing: a start racing this one may have taken the last slot.
   const slot = await reserveSlot($, options, view, newJobId(now), modelId)
   if (typeof slot === 'string') return { ok: false, text: slot }
+  // What the router would have picked, for the outcome record: asked while the worker starts, never awaited by it.
+  const pick = routed !== undefined ? Promise.resolve(routerPick(routed)) : shadowRoute($, options, task).then(routerPick, () => null)
+  const outcome: OutcomeStart = { chooser, reason: want.reason ?? null, pick, deliverable }
   // A slow start (worktree, --bg, a listing) may outlast one reservation: it is renewed until settled.
   const renewal = renewSlot($, slot)
   try {
-    return await launchWorker($, options, slot, task, mode, { modelId, effort, routed, cwd, now, warning: verdict.warning, placement, deliverable })
+    const started = await launchWorker($, options, slot, task, mode, { modelId, effort, routed, cwd, now, warning: verdict.warning, placement, deliverable, outcome })
+    return started.ok && trial !== undefined ? { ...started, text: `${started.text} ${trial.line}` } : started
   } finally {
     renewal.cancel()
     await releaseSlot($, slot)
   }
 }
 
-type Launch = { modelId: string; effort: Effort; routed?: RouteDecision; cwd: string; now: number; warning?: string; placement: Placement; deliverable?: Deliverable }
+type Launch = { modelId: string; effort: Effort; routed?: RouteDecision; cwd: string; now: number; warning?: string; placement: Placement; deliverable?: Deliverable; outcome: OutcomeStart }
+
+/** A spawn's facts for its outcome record that the job does not hold; `pick` settles within SHADOW_ROUTE_MS. */
+type OutcomeStart = { chooser: Chooser; reason: string | null; pick: Promise<RouterPick>; deliverable?: Deliverable }
 
 /** Starts a worker on a reserved slot; the slot is settled once the worker counts where it runs. */
 async function launchWorker(
@@ -2280,7 +2404,7 @@ async function launchWorker(
   slot: Slot,
   task: string,
   mode: WorkerMode,
-  { modelId, effort, routed, cwd, now, warning, placement, deliverable }: Launch,
+  { modelId, effort, routed, cwd, now, warning, placement, deliverable, outcome }: Launch,
 ): Promise<Started> {
   const placed = await placeWorker($, options, task, placement, {
     id: slot.jobId,
@@ -2321,6 +2445,7 @@ async function launchWorker(
     const withAgent = { ...job, agentId }
     await addJob($, withAgent)
     logInbox($, routedLine(job, task, now))
+    logSpawn($, withAgent, task, cwd, outcome)
     adoptSubagent($, options, withAgent, agentId)
     return { ok: true, text: `Started subagent worker job ${job.id} (agent ${agentId}) on ${how} ${where} /jobs shows it.` }
   }
@@ -2351,6 +2476,7 @@ async function launchWorker(
     await registerBg($, slot, bgId, modelId)
     await addJob($, withBg)
     logInbox($, routedLine(job, task, now))
+    logSpawn($, withBg, task, cwd, outcome)
     adoptBg($, options, withBg, bgId)
     return {
       ok: true,
@@ -2360,6 +2486,7 @@ async function launchWorker(
 
   await addJob($, job)
   logInbox($, routedLine(job, task, now))
+  logSpawn($, job, task, cwd, outcome)
   const plan: RunPlan = {
     argv: headlessArgv(claudeBin, modelId, effort, permissionMode),
     cwd: job.cwd,
@@ -2476,8 +2603,8 @@ async function git($: EngineInterface, argv: string[], timeoutMs = 30000): Promi
 
 /** The base commit and branch name a caller asked a worker's worktree for; unset parts take the defaults. */
 type Placement = { base?: string; branch?: string }
-/** What a spawn_worker call asks for beyond the task: the placement, and the deliverable (checked by startWorker). */
-type Want = Placement & { deliverable?: unknown }
+/** What a spawn_worker call asks for beyond the task: the placement, the deliverable (checked by startWorker), and why its model. */
+type Want = Placement & { deliverable?: unknown; reason?: string }
 
 /**
  * A base or branch the caller gave, checked: the base resolved to its commit, the branch a valid
@@ -2689,6 +2816,7 @@ async function endGate(
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
   logInbox($, finishedLine(finished))
+  await logFinish($, finished)
   if (gate?.sha !== undefined && finished.branch !== undefined) await recordGate($, finished.branch, gate.sha, gate.verdict, endedAt)
   await deliver($, await settleWorktree($, finished, canRemove))
 }
