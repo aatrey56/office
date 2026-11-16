@@ -67,8 +67,8 @@ import {
   rulesRoute,
 } from './router'
 import type { Routed } from './router'
-import type { Chooser, RouterPick, Tokens } from './outcomes'
-import { finishRecord, OUTCOMES_FILE, reasonMissingText, reviewRecord, routerPick, spawnRecord, transcriptTokens, trialSwap, trialUntil } from './outcomes'
+import type { Chooser, Ending, RouterPick, Tokens } from './outcomes'
+import { bgEnding, finishRecord, lockedAppendArgv, OUTCOME_LINE_MAX, OUTCOMES_FILE, reasonMissingText, reviewRecord, routerPick, spawnRecord, transcriptTokens, trialSwap, trialUntil, turnEnding } from './outcomes'
 import { alertKeysSeen, alertPctOf, staleAlertKeys, usageAlerts } from './usage-alert'
 import {
   addJobTo,
@@ -532,7 +532,7 @@ export function installJobs(on: On, options: PluginOptions) {
     const jobId = SUBAGENT_JOBS.get(agentId)
     if (jobId !== undefined) {
       const ok = e.reason === 'answer'
-      await finishJob($, options, jobId, ok ? 'done' : 'failed', e.answer || `worker ended: ${e.reason}`)
+      await finishJob($, options, jobId, ok ? 'done' : 'failed', e.answer || `worker ended: ${e.reason}`, ok ? undefined : turnEnding(e.reason))
     }
     return next(e)
   })
@@ -786,8 +786,9 @@ async function patchJob($: EngineInterface, id: string, change: (job: Job) => Jo
 /**
  * Ends a running job once (a later finish is a no-op) and delivers it. A worker with a worktree
  * that says it is done is not delivered here: it goes to `checking`, and its gate ends it.
+ * `ending` is how a failed one ended, when the caller knows (its outcome record's verdict).
  */
-async function finishJob($: EngineInterface, options: PluginOptions, id: string, status: 'done' | 'failed', result: string): Promise<void> {
+async function finishJob($: EngineInterface, options: PluginOptions, id: string, status: 'done' | 'failed', result: string, ending?: Ending): Promise<void> {
   // A job being ended past its time is delivered by endJob, once its work is committed.
   if (ENDING.has(id)) return
   const before = (await read($, JOBS)).find(j => j.id === id)
@@ -840,7 +841,7 @@ async function finishJob($: EngineInterface, options: PluginOptions, id: string,
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
   logInbox($, finishedLine(finished))
-  await logFinish($, finished)
+  await logEnd($, finished, { ending, text: result })
   // Only a 'done' worker has surely stopped: a killed or timed-out one may still write there.
   await deliver($, finished.worktree !== undefined ? await settleWorktree($, finished, status === 'done') : finished)
 }
@@ -898,17 +899,24 @@ function logInbox($: EngineInterface, line: string | undefined): void {
 /** Lines wait here so this session's lines land in order. */
 let outcomesChain: Promise<void> = Promise.resolve()
 
+/** How long an append waits for another session's hold on the outcome log before its line is skipped. */
+const OUTCOME_LOCK_WAIT_MS = 5000
+
 /**
- * Appends one line to <config dir>/office/outcomes.jsonl off the caller's path. `>>`, not read and
- * write back: every session appends to the one file, and none may drop another's line. A failure
- * is logged, never thrown.
+ * Appends one line to <config dir>/office/outcomes.jsonl off the caller's path: appended, not read
+ * and written back, so no session drops another's line, and under an flock on the file for the
+ * whole write (lockedAppendArgv), so no two sessions' lines interleave. A line too long, a lock
+ * held too long or any failure skips the line, debug-logged, and is never thrown.
  */
 function logOutcome($: EngineInterface, line: string): void {
   outcomesChain = outcomesChain.then(async () => {
     try {
+      const bytes = new TextEncoder().encode(line).length
+      if (bytes > OUTCOME_LINE_MAX) return debugLog($, `office: outcome record skipped: ${bytes} bytes (over ${OUTCOME_LINE_MAX})`)
       const file = `${(await configDirOf($)).replace(/\/+$/, '')}/office/${OUTCOMES_FILE}`
-      const r = await $.process.run(['sh', '-c', 'mkdir -p "$(dirname "$1")" && printf \'%s\\n\' "$2" >> "$1"', 'sh', file, line], { timeoutMs: 10000 })
-      if (r.exitCode !== 0) debugLog($, `office: outcome log not written: ${(r.stderr || r.stdout).trim() || `exit ${r.exitCode}`}`)
+      const r = await $.process.run(lockedAppendArgv(file, line, OUTCOME_LOCK_WAIT_MS), { timeoutMs: OUTCOME_LOCK_WAIT_MS + 5000 })
+      if (r.exitCode === CAP_LOCK_TIMEOUT_CODE) debugLog($, `office: outcome log lock held past ${OUTCOME_LOCK_WAIT_MS} ms; record skipped`)
+      else if (r.exitCode !== 0) debugLog($, `office: outcome log not written: ${(r.stderr || r.stdout).trim() || `exit ${r.exitCode}`}`)
     } catch (err) {
       debugLog($, `office: outcome log not written: ${String(err)}`)
     }
@@ -943,8 +951,22 @@ function logSpawn($: EngineInterface, job: Job, task: string, cwd: string, o: Ou
   background($, `job ${job.id}'s spawn record`, write())
 }
 
+/**
+ * A job just set to a terminal status: a worker's finish record, or a Codex review's (no other kind
+ * has one). Every path that ends a job calls this right after the one write that ended it, so each
+ * job gets one record. `text` is a review's uncapped output; `ending` is how a failed worker ended.
+ */
+async function logEnd($: EngineInterface, job: Job, o: { ending?: Ending; text?: string } = {}): Promise<void> {
+  if (job.kind === 'codex-review') {
+    const text = o.text ?? job.result ?? ''
+    logOutcome($, reviewRecord({ job: job.id, at: job.endedAt ?? Date.now(), branch: job.review?.branch ?? null, round: job.review?.round ?? null, model: job.model?.split('@')[0] ?? '', text, ...(job.status !== 'done' ? { error: text || job.status } : {}) }))
+    return
+  }
+  await logFinish($, job, o.ending)
+}
+
 /** A finished worker's record: its commits counted now (before its worktree may go), its tokens read off the caller's path. */
-async function logFinish($: EngineInterface, job: Job): Promise<void> {
+async function logFinish($: EngineInterface, job: Job, ending?: Ending): Promise<void> {
   if (job.kind !== 'worker' || job.endedAt === undefined) return
   const { project, branch, baseRef } = job
   const counted = project !== undefined && branch !== undefined && baseRef !== undefined
@@ -952,7 +974,7 @@ async function logFinish($: EngineInterface, job: Job): Promise<void> {
     : undefined
   const commits = counted?.isOk === true && /^\d+$/.test(counted.out.trim()) ? Number(counted.out.trim()) : null
   const at = job.endedAt
-  const write = async () => logOutcome($, finishRecord(job, at, commits, await workerTokens($, job)))
+  const write = async () => logOutcome($, finishRecord(job, at, commits, await workerTokens($, job), ending))
   background($, `job ${job.id}'s finish record`, write())
 }
 
@@ -1308,7 +1330,7 @@ async function registerBgLocked($: EngineInterface, slot: Slot, bgId: string, mo
 async function killJob($: EngineInterface, options: PluginOptions, id: string, why: string): Promise<void> {
   const stopping = RUNNING.get(id)?.()
   if (stopping) background($, `job ${id}'s stop`, stopping)
-  await finishJob($, options, id, 'failed', why)
+  await finishJob($, options, id, 'failed', why, 'stopped')
 }
 
 /** jobTimeoutMin, and jobTimeoutHardMin (never below it): the deadline, and the one extension's. */
@@ -1383,7 +1405,7 @@ async function endJob($: EngineInterface, options: PluginOptions, id: string, wh
   } finally {
     ENDING.delete(id)
   }
-  await finishJob($, options, id, 'failed', saved ? `${why}\n${saved}` : why)
+  await finishJob($, options, id, 'failed', saved ? `${why}\n${saved}` : why, 'timeout')
 }
 
 /**
@@ -1507,13 +1529,15 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
           continue
         }
         const last = seen.result ? `\nLast reply:\n${seen.result}` : ''
-        await finishJob($, options, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)${last}`)
+        await finishJob($, options, jobId, 'failed', `background session ${bgId} is gone (stopped or removed)${last}`, 'stopped')
         continue
       }
       BG_MISSES.delete(jobId)
       const seen = agent.sessionId !== undefined
         ? await bgSeen($, configDir, agent.cwd ?? job.cwd, agent.sessionId)
         : { tail: '' }
+      // Kept before any ending below: a worker done by its first poll has its tokens read through it.
+      if (agent.sessionId !== undefined && agent.sessionId !== job.sessionId) await patchJob($, jobId, j => ({ ...j, sessionId: agent.sessionId }))
       GROWTH.set(jobId, nextGrowth(GROWTH.get(jobId), seen.mark ?? '', now))
       const phase = bgPhase(agent.state, agent.status)
       const idlePolls = phase === 'idle' && seen.result !== undefined ? (BG_IDLE.get(jobId) ?? 0) + 1 : 0
@@ -1527,7 +1551,7 @@ async function pollBg($: EngineInterface, options: PluginOptions): Promise<void>
       }
       if (phase === 'failed') {
         const last = seen.result ? `\nLast reply:\n${seen.result}` : ''
-        await finishJob($, options, jobId, 'failed', `background session ${bgId} ended: ${agent.state}${last}`)
+        await finishJob($, options, jobId, 'failed', `background session ${bgId} ended: ${agent.state}${last}`, bgEnding(agent.state))
         continue
       }
       const sinceStart = now - (CLOCK_START.get(jobId) ?? job.startedAt)
@@ -1672,7 +1696,9 @@ async function sweepAfterLoad($: EngineInterface, options: PluginOptions): Promi
   await reconcileSettlements($, list.filter(j => dead.has(j.id) && j.endedAt === at && j.kind === 'codex-review').map(j => j.id))
   // Whether the worker still runs is unknown: its worktree is kept and reported.
   for (const job of list) {
-    if (dead.has(job.id) && job.endedAt === at && job.worktree !== undefined) await settleWorktree($, job, false)
+    if (!dead.has(job.id) || job.endedAt !== at) continue
+    await logEnd($, job, { ending: 'stopped' })
+    if (job.worktree !== undefined) await settleWorktree($, job, false)
   }
 }
 
@@ -1747,7 +1773,6 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
     const verdict = codexGuardVerdict(plan.codexModel, Date.now(), { out: await storedCodexOut($) }, plan.isForced === true)
     if (!verdict.isAllowed) {
       if (plan.isRound) await settleRound($, jobId, undefined)
-      logReview($, job, plan, '', verdict.reason)
       await finishJob($, options, jobId, 'failed', `${verdict.reason} ${CODEX_OUT_FALLBACK_TEXT}`)
       return
     }
@@ -1816,7 +1841,6 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   if (killed) {
     // killJob already marked and delivered it; a killed review gave no findings to keep.
     if (plan.isRound) await settleRound($, jobId, undefined)
-    logReview($, job, plan, '', 'killed')
     return
   }
 
@@ -1845,16 +1869,8 @@ async function runJob($: EngineInterface, options: PluginOptions, job: Job, plan
   if (plan.codexModel !== undefined && quotaText !== undefined) await markCodexOut($, plan.codexModel, quotaText)
   // Kept before delivery too, so the next round, asked for on reading this one, sees its findings.
   if (plan.isRound) await settleRound($, jobId, status === 'done' ? final : undefined)
-  logReview($, job, plan, final, status === 'failed' ? final : undefined)
   await finishJob($, options, jobId, status, final)
   if (plan.codexModel !== undefined) background($, 'the Codex limits read', readCodexLimits($, plan.argv[0]!, plan.cwd))
-}
-
-/** A Codex review's outcome record (no other job kind has one); `error` for one that failed or was killed. */
-function logReview($: EngineInterface, job: Job, plan: RunPlan, text: string, error?: string): void {
-  if (job.kind !== 'codex-review') return
-  const model = plan.codexModel ?? job.model?.split('@')[0] ?? ''
-  logOutcome($, reviewRecord({ job: job.id, at: Date.now(), branch: job.review?.branch ?? null, round: job.review?.round ?? null, model, text, ...(error !== undefined ? { error } : {}) }))
 }
 
 // ── codex ───────────────────────────────────────────────────────────────
@@ -1925,7 +1941,9 @@ function refusedText(verdict: { reason: string }, ask: CodexAsk): string {
 }
 
 async function failedJob($: EngineInterface, job: Job, why: string): Promise<Started> {
-  await addJob($, { ...job, status: 'failed', endedAt: Date.now(), result: why })
+  const failed: Job = { ...job, status: 'failed', endedAt: Date.now(), result: why }
+  await addJob($, failed)
+  await logEnd($, failed)
   return { ok: false, text: why }
 }
 
@@ -2816,7 +2834,7 @@ async function endGate(
   const finished = list.find(j => j.id === id)
   if (finished === undefined || finished.endedAt !== endedAt) return
   logInbox($, finishedLine(finished))
-  await logFinish($, finished)
+  await logEnd($, finished)
   if (gate?.sha !== undefined && finished.branch !== undefined) await recordGate($, finished.branch, gate.sha, gate.verdict, endedAt)
   await deliver($, await settleWorktree($, finished, canRemove))
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { countFindings, finishVerdict, reviewRecord, spawnRecord, transcriptTokens, trialSwap, trialUntil } from './outcomes'
+import { bgEnding, countFindings, finishRecord, finishVerdict, OUTCOME_LINE_MAX, reviewRecord, spawnRecord, transcriptTokens, trialSwap, trialUntil, turnEnding } from './outcomes'
 
 describe('finishVerdict', () => {
   test('a done job is what its gate said; a failed one is a timeout, a stop or a failure', () => {
@@ -17,6 +17,25 @@ describe('finishVerdict', () => {
     ]
     for (const [job, verdict, why] of cases) expect(finishVerdict(job)).toEqual({ verdict: verdict as never, why })
   })
+  test('a killed, stopped or aborted ending is a stop: from the ending passed in, else read off the result (regression)', () => {
+    expect(bgEnding('killed')).toBe('stopped')
+    expect(bgEnding('stopped')).toBe('stopped')
+    expect(bgEnding('error')).toBeUndefined()
+    expect(turnEnding('aborted')).toBe('stopped')
+    expect(turnEnding('error')).toBeUndefined()
+    expect(finishVerdict({ status: 'failed', result: 'any text' }, 'stopped')).toEqual({ verdict: 'stopped', why: 'any text' })
+    expect(finishVerdict({ status: 'failed', result: 'background session 5ac0f0df ended: killed' }).verdict).toBe('stopped')
+    expect(finishVerdict({ status: 'failed', result: 'worker ended: aborted' }).verdict).toBe('stopped')
+    expect(finishVerdict({ status: 'failed', result: 'worker ended: error' }).verdict).toBe('failed')
+  })
+})
+
+test('a record stays well under OUTCOME_LINE_MAX however long its reason, why or error', () => {
+  const long = 'x'.repeat(60_000)
+  const spawn = spawnRecord({ job: 'j', at: 0, cwd: '/r', repo: 'r', branch: null, base: null, mode: 'bg', deliverable: 'commit', model: 'm', effort: 'low', chooser: 'manager', routerPick: null, reason: long, task: long })
+  const finish = finishRecord({ id: 'j', kind: 'worker', title: 't', cwd: '/r', status: 'failed', startedAt: 0, tail: '', result: long } as never, 0, null)
+  const review = reviewRecord({ job: 'j', at: 0, branch: null, round: null, model: 'm', text: '', error: long })
+  for (const line of [spawn, finish, review]) expect(line.length).toBeLessThan(OUTCOME_LINE_MAX / 4)
 })
 
 test('a review counts its [P1]/[P2]/[P3] markers; clean only with none, and a failed one is never clean', () => {

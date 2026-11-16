@@ -7,6 +7,28 @@ import type { Effort, Job, ModelTier, RouteDecision } from '../types'
 
 export const OUTCOMES_FILE = 'outcomes.jsonl'
 const TASK_KEEP = 160
+/** A reason, why or error is clipped to this, so a record stays well under OUTCOME_LINE_MAX. */
+const TEXT_KEEP = 300
+/** The longest line appended (bytes); a longer one is skipped, never cut into torn JSON. */
+export const OUTCOME_LINE_MAX = 4000
+
+const clip = (s: string | null, n = TEXT_KEEP) => (s === null || s.length <= n ? s : `${s.slice(0, n - 1)}…`)
+
+/**
+ * perl appending `line` and a newline to `path` (made with its directory if missing), holding an
+ * exclusive flock on it for the whole write, so lines from every session land whole. Exits 1 when
+ * the lock stays held past `waitMs`, 2 when the file cannot be opened, 3 when the write fails.
+ */
+export function lockedAppendArgv(path: string, line: string, waitMs: number): string[] {
+  const script = [
+    "use Fcntl qw(:flock O_WRONLY O_APPEND O_CREAT); use File::Path 'make_path'; use File::Basename 'dirname'; use Time::HiRes 'time';",
+    'my ($path, $line, $wait) = @ARGV; eval { make_path(dirname($path)) };',
+    'sysopen(my $f, $path, O_WRONLY | O_APPEND | O_CREAT, 0644) or exit 2; my $until = time + $wait;',
+    'until (flock($f, LOCK_EX | LOCK_NB)) { exit 1 if time >= $until; select(undef, undef, undef, 0.05) }',
+    'my $s = "$line\\n"; while (length $s) { my $n = syswrite($f, $s); exit 3 unless $n; substr($s, 0, $n) = "" } close($f) or exit 3;',
+  ].join(' ')
+  return ['perl', '-e', script, path, line, String(waitMs / 1000)]
+}
 
 /** Who chose the model: the router, the router overruled by the Sonnet trial, an agent's explicit model, or the person's /spawn --model. */
 export type Chooser = 'router' | 'trial' | 'manager' | 'person'
@@ -34,19 +56,33 @@ export type SpawnFacts = {
 }
 
 export function spawnRecord(f: SpawnFacts): string {
-  return JSON.stringify({ kind: 'spawn', ...f, at: new Date(f.at).toISOString(), taskChars: f.task.length, task: f.task.replace(/\s+/g, ' ').trim().slice(0, TASK_KEEP) })
+  return JSON.stringify({ kind: 'spawn', ...f, at: new Date(f.at).toISOString(), reason: clip(f.reason), taskChars: f.task.length, task: f.task.replace(/\s+/g, ' ').trim().slice(0, TASK_KEEP) })
 }
 
 export type Verdict = 'passed' | 'rejected' | 'no-change' | 'unverified' | 'failed' | 'timeout' | 'stopped'
 
 const firstLine = (s: string | undefined) => (s ?? '').split('\n').map(l => l.trim()).find(l => l !== '') ?? ''
 
+/** How a worker that did not finish ended, when its caller knows: stopped (a kill, an abort, its session stopped) or out of time. */
+export type Ending = 'stopped' | 'timeout'
+
+/** A --bg session's ending from its `claude agents` state; undefined for one that failed on its own. */
+export function bgEnding(state: string | undefined): Ending | undefined {
+  return state === 'killed' || state === 'stopped' ? 'stopped' : undefined
+}
+
+/** A subagent's ending from its turn's reason: an abort is a stop. */
+export function turnEnding(reason: string): Ending | undefined {
+  return reason === 'aborted' ? 'stopped' : undefined
+}
+
 /**
  * A finished worker's verdict and the first line of why. A done job is what its gate said (a job
  * with no gate, or a gate that checked nothing, is unverified, never passed); a failed one is
- * a timeout, a stop (the person's kill, or its session stopped) or a failure.
+ * its `ending` when the caller knows it, else read off its result: a timeout, a stop (the
+ * person's kill, or its session stopped) or a failure.
  */
-export function finishVerdict(job: Pick<Job, 'status' | 'gate' | 'result'>): { verdict: Verdict; why: string | null } {
+export function finishVerdict(job: Pick<Job, 'status' | 'gate' | 'result'>, ending?: Ending): { verdict: Verdict; why: string | null } {
   const line = firstLine(job.result)
   const gate = job.gate
   if (job.status === 'rejected') return { verdict: 'rejected', why: gate?.head ?? (line.replace(/^REJECTED by the office gate: /, '') || null) }
@@ -57,22 +93,23 @@ export function finishVerdict(job: Pick<Job, 'status' | 'gate' | 'result'>): { v
     if (gate?.verdict === 'fail') return { verdict: 'rejected', why: gate.head }
     return { verdict: 'unverified', why: gate?.head ?? null }
   }
+  if (ending !== undefined) return { verdict: ending, why: line || null }
   if (/^(timed out after|ended after .* waiting for approval)/.test(line)) return { verdict: 'timeout', why: line }
-  if (/^killed\b|is gone \(stopped|ended: stopped/.test(line)) return { verdict: 'stopped', why: line }
+  if (/^killed\b|is gone \(stopped|ended: (stopped|killed|aborted)\b/.test(line)) return { verdict: 'stopped', why: line }
   return { verdict: 'failed', why: line || null }
 }
 
 export type Tokens = { outputTokens: number; cacheReadTokens: number }
 
-export function finishRecord(job: Job, at: number, commits: number | null, tokens?: Tokens): string {
-  const { verdict, why } = finishVerdict(job)
+export function finishRecord(job: Job, at: number, commits: number | null, tokens?: Tokens, ending?: Ending): string {
+  const { verdict, why } = finishVerdict(job, ending)
   return JSON.stringify({
     kind: 'finish',
     job: job.id,
     at: new Date(at).toISOString(),
     minutes: Math.round((at - job.startedAt) / 6000) / 10,
     verdict,
-    why,
+    why: clip(why),
     commits,
     ...(tokens ?? {}),
   })
@@ -132,7 +169,7 @@ export function reviewRecord(f: ReviewFacts): string {
     model: f.model,
     findings,
     clean: f.error === undefined && findings.p1 + findings.p2 + findings.p3 === 0,
-    ...(f.error !== undefined ? { error: firstLine(f.error) } : {}),
+    ...(f.error !== undefined ? { error: clip(firstLine(f.error)) } : {}),
   })
 }
 

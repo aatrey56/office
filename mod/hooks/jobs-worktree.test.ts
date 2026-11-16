@@ -26,7 +26,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock; outcomes: Record<string, unknown>[] }
 type Check = (line: string) => { code: number; out?: string } | Promise<{ code: number; out?: string }>
-type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string; untracked?: string; failSet?: string; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
+type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string; untracked?: string; failSet?: string; codexLogin?: number; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock(), outcomes: [] }) as Runs
   const { store, flock } = runs
@@ -77,8 +77,8 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
   on('process.run', async (_$, e) => {
     const argv = [...e.argv]
     // The outcome log's append: kept apart, as its records.
-    if (argv[0] === 'sh' && argv[4]?.endsWith('/office/outcomes.jsonl')) {
-      runs.outcomes.push(JSON.parse(argv[5] ?? '{}') as Record<string, unknown>)
+    if (argv[0] === 'perl' && argv[3]?.endsWith('/office/outcomes.jsonl')) {
+      runs.outcomes.push(JSON.parse(argv[4] ?? '{}') as Record<string, unknown>)
       return { value: RUN }
     }
     runs.push({ argv, cwd: e.init?.cwd })
@@ -116,7 +116,11 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
       return out(JSON.stringify(listed.map(a => (stopped.has(a.id) ? { ...a, state: 'stopped' } : a))))
     }
     if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
-    if (argv[0] === 'grep') return out('', (fake.whole ?? fake.transcript)?.().includes(argv.at(-2) ?? '') ? 0 : 1)
+    if (argv[0] === 'grep') {
+      const hits = ((fake.whole ?? fake.transcript)?.() ?? '').split('\n').filter(l => l.includes(argv.at(-2) ?? ''))
+      return out(hits.map(l => `${l}\n`).join(''), hits.length > 0 ? 0 : 1)
+    }
+    if (argv[0] === 'codex' && argv[1] === 'login') return out('Not logged in\n', fake.codexLogin ?? 0)
     if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
     if (cmd.endsWith('status --porcelain')) return out(isDirty ? ' M src/x.ts\n?? big.bin\n' : '')
     if (argv.includes('ls-files')) return out(isDirty ? 'src/x.ts\0big.bin\0' : '')
@@ -253,9 +257,12 @@ describe('worker worktrees', () => {
 
   test('claude --bg exiting 0 with no findable id keeps the worktree (regression)', async ($, on) => {
     const runs = fakeRepo(on, { bg: 'started\n' })
+    const clock = mock.clock(on)
     const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     expect(runs.some(run => run.argv.includes('remove') || run.argv.includes('branch'))).toBe(false)
     expect(JSON.stringify(r)).toMatch(/worktree is kept at \/cfg\/office\/worktrees\//)
+    await clock.settle()
+    expect(runs.outcomes).toMatchObject([{ kind: 'finish', verdict: 'failed' }]) // a start that failed still ends in the log
   })
 
   test('a blocked worker seen idle with no reply resumes its timeout (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
@@ -349,6 +356,20 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     expect(stops(runs)).toBe(0)
     await clock.advance(30_000)
     expect(stops(runs)).toBe(1)
+  })
+
+  test('a headless worker a reload interrupted gets one finish record, as stopped (regression)', async ($, on) => {
+    const runs = fakeRepo(on)
+    const clock = mock.clock(on, { now: 61_000 })
+    let left: unknown = [{ id: 'j1', kind: 'worker', title: 'rename x to y', cwd: '/r', status: 'running', startedAt: 0, mode: 'headless', tail: '' }]
+    on('state.set', (_$, e, next) => {
+      if (e.key === 'jobs') left = undefined
+      return next(e)
+    })
+    on('state.get', (_$, e, next) => (left !== undefined && e.key === 'jobs' ? { value: { value: left, version: 0 } } : next(e)))
+    await start($, on)
+    await clock.settle()
+    expect(runs.outcomes).toMatchObject([{ kind: 'finish', job: 'j1', verdict: 'stopped', why: 'interrupted: the plugin reloaded' }])
   })
 
   test('an oversized file the worker staged is unstaged and left out of the WIP commit', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
@@ -532,6 +553,31 @@ describe('--bg worker finish: the [office: done] marker', () => {
     expect(text).toContain('Worker finished: rename x to y')
     expect(text).toContain('Renamed it.')
     expect(text).not.toContain('FAILED')
+  })
+
+  test('a worker done by its first poll keeps its session id: its tokens reach the finish record (regression)', async ($, on) => {
+    const line = JSON.stringify({ type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Renamed it.\n[office: done]' }], usage: { output_tokens: 42, cache_read_input_tokens: 7 } } })
+    const runs = fakeRepo(on, { agents: () => agent('done'), transcript: () => line })
+    const clock = mock.clock(on)
+    collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(runs.outcomes.find(o => o.kind === 'finish')).toMatchObject({ verdict: 'unverified', outputTokens: 42, cacheReadTokens: 7 })
+  })
+
+  test('a session listed killed is a stop in the outcome log, not a failure', async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('killed'), transcript: () => reply('Renaming x.') })
+    const clock = mock.clock(on)
+    collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(runs.outcomes.filter(o => o.kind === 'finish')).toMatchObject([{ verdict: 'stopped', why: 'background session 5ac0f0df ended: killed' }])
   })
 
   test('blocked without the marker still waits for input', async ($, on) => {
@@ -1056,11 +1102,12 @@ describe('codex review rounds', () => {
   const OLD = 'f00d'.repeat(10)
   const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
   const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings, isCovering: true })
-  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }, failSet?: string) => {
+  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }, failSet?: string, codexLogin?: number) => {
     const reviews: { argv: readonly string[]; input?: string }[] = []
     const fake: Fake = {
       store,
       failSet,
+      codexLogin,
       untracked: untracked && `${untracked.path}\0`,
       async *spawn(e) {
         if (e.argv[0] === 'codex') reviews.push(e)
@@ -1105,6 +1152,15 @@ describe('codex review rounds', () => {
     expect(rounds.map(x => x.isCovering)).toEqual([false, true])
     await $.command.run({ command: 'codex-review', args: '--commit abc1234', ...TYPED })
     expect((runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!.map(x => x.isCovering)).toEqual([false, true, false])
+  })
+
+  test('a review codex cannot start (not logged in) still gets its one review record, failed (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs } = reviewRuns(on, {}, undefined, undefined, 1)
+    const clock = mock.clock(on)
+    await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    await clock.settle()
+    expect(runs.outcomes).toMatchObject([{ kind: 'review', clean: false, findings: { p1: 0, p2: 0, p3: 0 } }])
+    expect(runs.outcomes[0]?.error).toEqual(expect.any(String))
   })
 
   test('untracked files count toward the re-review size limit (a large new file makes it a full review)', { options: { workerWorktree: 'off' } }, async ($, on) => {
