@@ -3,7 +3,19 @@ import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
 import { cachePath, fitPage, graphicsLikely, sipsArgv, unzipArgv } from './manga'
-import { coverCaption, coverDir, coverSource, coversPerRow, fitCaption, unzipListArgv, unzipOneArgv } from './manga-library'
+import {
+  archivePages,
+  coverCaption,
+  coverDir,
+  coverLockPath,
+  coverSource,
+  coverStaging,
+  coversPerRow,
+  fitCaption,
+  unzipListArgv,
+  unzipOneArgv,
+  zipListing,
+} from './manga-library'
 
 const HOME = '/Users/aatrey'
 const ROOT = `${HOME}/Manga`
@@ -19,12 +31,18 @@ function fakeDisk(on: On, tree: Record<string, Entry[]>) {
   on('fs.list', (_$, e) => ({ value: tree[e.path] ?? [] }))
 }
 
-// Same for $.store, kept readable so a test can assert what was persisted.
+// Same for $.store, kept readable so a test can assert what was persisted; `sets` lists the keys written.
 function fakeStore(on: On, entries: Record<string, unknown> = {}) {
-  const kept = new Map(Object.entries(entries))
+  const kept = Object.assign(new Map(Object.entries(entries)), { sets: [] as string[] })
   on('store.get', (_$, e) => ({ value: kept.get(e.key) }))
   on('store.set', (_$, e) => {
+    kept.sets.push(e.key)
     kept.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...kept.keys()] }))
+  on('store.delete', (_$, e) => {
+    kept.delete(e.key)
     return { value: undefined }
   })
   return kept
@@ -145,6 +163,23 @@ describe('/manga pane', () => {
     expect(ran).toMatchObject({ text: expect.stringContaining('Berserk') })
     const missing = await $.command.run({ command: 'manga', args: 'Nope', ...RUN })
     expect(missing).toMatchObject({ text: expect.stringContaining('No series "Nope"') })
+  })
+
+  test('a legacy bookmark survives opening another series, and each series saves under its own key (regression)', async ($, on) => {
+    // An older version's store: the one `position`, for Kingdom, and a `progress` map.
+    const kingdom = { series: 'Kingdom', chapter: '2', page: 1 }
+    const store = fakeStore(on, { position: kingdom, progress: { Kingdom: { series: 'Kingdom', chapter: '1', page: 0 } } })
+    fakePanes(on)
+    fakeDisk(on, DISK)
+    await $.command.run({ command: 'manga', args: 'berserk', ...RUN })
+    expect(store.get('progress:Kingdom')).toEqual(kingdom) // migrated before `position` moved to Berserk
+    expect(store.has('progress')).toBe(false)
+    // Migrated once: a later save writes only its own series' key and the last-read pointer.
+    store.sets.length = 0
+    await $.command.run({ command: 'manga', args: 'berserk', ...RUN })
+    expect(store.sets).toEqual(['progress:Berserk', 'position'])
+    await $.command.run({ command: 'manga', args: 'kingdom', ...RUN })
+    expect(store.get('position')).toEqual(kingdom)
   })
 })
 
@@ -361,6 +396,19 @@ describe('library', () => {
     expect(coverSource([file('notes.txt')], undefined)).toEqual({ kind: 'none' })
   })
 
+  test('archive member names reach unzip literally: spaces kept, backslashes and wildcards escaped (regression)', () => {
+    expect(archivePages(zipListing(' Chapter 458/\n Chapter 458/1.jpg \n'))).toEqual([' Chapter 458/1.jpg '])
+    // unzip -o -j -qq a.cbz 'a\\1.jpg' extracts a\1.jpg; 'a\1.jpg' extracts a1.jpg or nothing
+    expect(unzipOneArgv('/a.cbz', 'it\'s [1]\\*?.jpg', '/d')[5]).toBe('it\'s \\[1]\\\\\\*\\?.jpg')
+  })
+
+  test('each cover build stages in its own folder; the lock sits outside every cover dir', () => {
+    const dir = coverDir(CACHE, 'Kingdom')
+    expect(coverStaging(dir, 's1-5-1')).not.toBe(coverStaging(dir, 's2-5-1'))
+    expect(coverStaging(dir, 's1-5-1').startsWith(`${dir}/`)).toBe(true)
+    expect(coverLockPath(CACHE, 'Kingdom').startsWith(`${coverDir(CACHE, '')}`)).toBe(false)
+  })
+
   test('covers per row follow the pane width; captions fit under a cover', () => {
     expect([coversPerRow(19), coversPerRow(42), coversPerRow(80), coversPerRow(100)]).toEqual([1, 2, 3, 4])
     expect(coverCaption('Kingdom', '458')).toBe('Kingdom · ch 458')
@@ -373,8 +421,20 @@ describe('library', () => {
     const opened = fakePanes(on)
     const clock = mock.clock(on, { now: 1_000_000 })
     const COVERS = coverDir(CACHE, 'Kingdom')
+    // A member name may start with a space; it must reach unzip unchanged.
     const { calls } = fakeCbzWorld(on, {
-      zipList: ['Kingdom 458/', 'Kingdom 458/10.jpg', 'Kingdom 458/2.jpg', 'Kingdom 458/1.jpg', '__MACOSX/Kingdom 458/._1.jpg', 'ComicInfo.xml'],
+      zipList: [' Kingdom 458/', ' Kingdom 458/10.jpg', ' Kingdom 458/2.jpg', ' Kingdom 458/1.jpg', '__MACOSX/ Kingdom 458/._1.jpg', 'ComicInfo.xml'],
+    })
+    // The per-series lock is perl's flock: record when it is held and when it is let go.
+    on('process.spawn', async function* (_$, e) {
+      calls.push(['lock', e.argv[3] ?? ''])
+      try {
+        yield { stream: 'stdout' as const, text: 'held\n' }
+        await new Promise(() => {})
+        return { value: { code: 0, signal: null } }
+      } finally {
+        calls.push(['unlock'])
+      }
     })
     const ui = await $.ui.mount({ plugin: 'office', surface: 'terminal', component: 'Pane', requestId: 'manga', props: PANE_PROPS, viewport: { columns: 100, rows: 40 } })
     expect(await ui.find({ type: 'Text', text: /Library · 1 series/ })).toBeDefined()
@@ -383,11 +443,19 @@ describe('library', () => {
     expect(await ui.find({ type: 'Image' })).toBeUndefined() // the title box until the cover is built
 
     await clock.advance(0)
-    // Only the first page of the first chapter leaves the archive, converted into the cover cache.
-    expect(calls).toContainEqual(unzipListArgv(CBZ458))
-    expect(calls).toContainEqual(unzipOneArgv(CBZ458, 'Kingdom 458/1.jpg', COVERS))
+    // Only the first page of the first chapter leaves the archive, into this build's own staging folder,
+    // under the series lock; the finished cover is renamed into place and the staging folder alone removed.
+    const build = calls.slice(calls.findIndex(c => c[0] === 'lock'))
+    expect(build[0]).toEqual(['lock', coverLockPath(CACHE, 'Kingdom')])
+    const staging = build.find(c => c[0] === 'mkdir')?.[2] ?? ''
+    expect(staging.startsWith(`${COVERS}/.build-`)).toBe(true)
+    expect(build).toContainEqual(unzipListArgv(CBZ458))
+    expect(build).toContainEqual(unzipOneArgv(CBZ458, ' Kingdom 458/1.jpg', staging))
     expect(calls).not.toContainEqual(unzipArgv(CBZ458, DIR458))
-    expect(sipsCalls(calls)).toEqual([sipsArgv(`${COVERS}/1.jpg`, `${COVERS}/.cover.png.part.png`)])
+    expect(sipsCalls(calls)).toEqual([sipsArgv(`${staging}/1.jpg`, `${staging}/.cover.png.part.png`)])
+    expect(build).toContainEqual(['mv', '-f', `${staging}/cover.png`, `${COVERS}/cover.png`])
+    expect(calls.filter(c => c[0] === 'rm').map(c => c[3])).toEqual([staging])
+    expect(build.at(-1)).toEqual(['unlock'])
     expect((await ui.find({ type: 'Image', key: 'cover-Kingdom' }))?.props.source).toMatchObject({ file: `${COVERS}/cover.png` })
 
     await ui.press({ key: 'series-Kingdom' })

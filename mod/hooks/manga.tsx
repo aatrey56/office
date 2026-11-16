@@ -7,19 +7,30 @@ import {
   COVER_GAP,
   COVER_PNG,
   COVER_ROWS,
+  PROGRESS_PREFIX,
   archivePages,
   baseName,
   coverCaption,
   coverDir,
   coverFresh,
   coverHotkey,
+  coverLockPath,
   coverSource,
+  coverStaging,
   coversPerRow,
   fitCaption,
   inRows,
+  legacyProgress,
+  mergedProgress,
+  ownProgress,
+  progressKey,
+  toMigrate,
   unzipListArgv,
   unzipOneArgv,
+  zipListing,
 } from './manga-library'
+import type { Position } from './manga-library'
+import { CAP_LOCK_HELD, capLockArgv } from './spawn'
 
 // ~/Manga/<Series>/<chapter>: a chapter is a folder of PNGs or a .cbz/.zip of images.
 // A cbz is unpacked into ~/Library/Caches/office-manga (never into ~/Manga) and its pages
@@ -37,8 +48,6 @@ const chapter = atom({ plugin: 'office', key: 'chapter' } as const, 0)
 const page = atom({ plugin: 'office', key: 'page' } as const, 0)
 const covers = atom({ plugin: 'office', key: 'covers' } as const, {} as Record<string, MangaCover>)
 const library = atom({ plugin: 'office', key: 'library' } as const, false)
-
-type Position = { series: string; chapter: string | null; page: number }
 
 // ── pure logic (no `$`), covered by manga.test.ts ────────────────────────
 export const LAST = Number.MAX_SAFE_INTEGER // "last page", clamped once the chapter is listed
@@ -299,8 +308,73 @@ function prefetchNext($: EngineInterface, series: string, chapters: string[], c:
   $.clock.after(0, () => void prefetchChapter($, series, name).catch(() => prefetched.delete(`${series}/${name}`)))
 }
 
+// A wait for another session's build of the same cover: longer than one build's unzips and sips.
+const COVER_LOCK_WAIT_MS = 150_000
+let coverBuilds = 0
+
+// The per-series cover lock, the way jobs.tsx takes its capacity lock: the kernel's flock on `path`, held
+// by a perl child (capLockArgv) until `release` ends it, and dropped with that child however it ends, so a
+// crashed build leaves no stale lock. Undefined when another session held it past the wait; a release that
+// does nothing when perl cannot run (each build's own staging still keeps the files apart).
+async function takeCoverLock($: EngineInterface, path: string): Promise<(() => Promise<void>) | undefined> {
+  let holder: ReturnType<EngineInterface['process']['spawn']> | undefined
+  const release = async () => {
+    await holder?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+  }
+  let isTimedOut = false
+  try {
+    holder = $.process.spawn({ argv: capLockArgv(path, COVER_LOCK_WAIT_MS) })
+    void holder.result.catch(() => undefined)
+    let out = ''
+    for (let piece = await holder.next(); ; piece = await holder.next()) {
+      if (piece.done) {
+        isTimedOut = out === '' && piece.value?.code === 1
+        break
+      }
+      if (piece.value.stream === 'stdout') out += piece.value.text
+      if (out.startsWith(CAP_LOCK_HELD)) return release
+    }
+  } catch {
+    // perl missing or refused: no cross-session lock
+  }
+  await release()
+  return isTimedOut ? undefined : async () => undefined
+}
+
+// Builds the cover in a staging folder of this build's own, renames the finished PNG over `file` and then
+// writes the marker; the staging folder, and only it, is removed after. False when no cover came out.
+async function stageCover($: EngineInterface, pick: { kind: string }, source: string, dir: string, stat: { size: number; mtimeMs: number }) {
+  const staging = coverStaging(dir, `${await $.clock.now()}-${Math.random().toString(36).slice(2, 8)}-${++coverBuilds}`)
+  await $.process.run(['mkdir', '-p', staging])
+  try {
+    let src = baseName(source)
+    if (pick.kind === 'cbz') {
+      const listed = await $.process.run(unzipListArgv(source), { timeoutMs: 30000 })
+      if (listed.exitCode > 1) throw new Error(`unzip -Z1 exited ${listed.exitCode}`)
+      const pages = archivePages(zipListing(listed.stdout))
+      const first = planPages(pages.map(baseName))[0]
+      const entry = first && pages.find(x => baseName(x) === first.src)
+      if (!first || !entry) return false
+      const ran = await $.process.run(unzipOneArgv(source, entry, staging), { timeoutMs: 60000 })
+      if (ran.exitCode > 1) throw new Error(`unzip exited ${ran.exitCode}`)
+      src = first.src
+    } else {
+      await $.process.run(['cp', '-f', source, `${staging}/${src}`])
+    }
+    if (!(await convertPage($, staging, { src, png: COVER_PNG }))) return false
+    // One rename within the cover dir: a reader sees the old cover or the new one, never part of one.
+    const moved = await $.process.run(['mv', '-f', `${staging}/${COVER_PNG}`, `${dir}/${COVER_PNG}`])
+    if (moved.exitCode !== 0) return false
+    await $.fs.write(`${dir}/${MARKER}`, JSON.stringify({ source, size: stat.size, mtimeMs: stat.mtimeMs }))
+    return true
+  } finally {
+    await removeCacheDir($, staging)
+  }
+}
+
 // The cover of one series, built once into its cache dir and reused while its source is unchanged:
 // cover.* in the folder, else the first page of the first chapter (one file out of a cbz).
+// Sessions share the cache, so a build holds the series' lock and checks again once it has it.
 async function buildCover($: EngineInterface, series: string) {
   const { manga, cache } = await roots($)
   const base = `${manga}/${series}`
@@ -316,25 +390,15 @@ async function buildCover($: EngineInterface, series: string) {
   const dir = coverDir(cache, series)
   const file = `${dir}/${COVER_PNG}`
   const stat = await $.fs.stat(source)
-  if (!coverFresh(await readMarker($, dir), source, stat) || !(await $.fs.exists(file))) {
-    if (await $.fs.exists(dir)) await removeCacheDir($, dir)
-    await $.process.run(['mkdir', '-p', dir])
-    let src = baseName(source)
-    if (pick.kind === 'cbz') {
-      const listed = await $.process.run(unzipListArgv(source), { timeoutMs: 30000 })
-      if (listed.exitCode > 1) throw new Error(`unzip -Z1 exited ${listed.exitCode}`)
-      const pages = archivePages(listed.stdout.split('\n').map(x => x.trim()))
-      const first = planPages(pages.map(baseName))[0]
-      const entry = first && pages.find(x => baseName(x) === first.src)
-      if (!first || !entry) return
-      const ran = await $.process.run(unzipOneArgv(source, entry, dir), { timeoutMs: 60000 })
-      if (ran.exitCode > 1) throw new Error(`unzip exited ${ran.exitCode}`)
-      src = first.src
-    } else {
-      await $.process.run(['cp', '-f', source, `${dir}/${src}`])
+  const current = async () => coverFresh(await readMarker($, dir), source, stat) && (await $.fs.exists(file))
+  if (!(await current())) {
+    const release = await takeCoverLock($, coverLockPath(cache, series))
+    if (!release) return
+    try {
+      if (!(await current()) && !(await stageCover($, pick, source, dir, stat))) return
+    } finally {
+      await release()
     }
-    if (!(await convertPage($, dir, { src, png: COVER_PNG }))) return
-    await $.fs.write(`${dir}/${MARKER}`, JSON.stringify({ source, size: stat.size, mtimeMs: stat.mtimeMs }))
   }
   await update($, covers, cur => ({ ...cur, [series]: { file, generation: Math.floor(stat.mtimeMs) } }))
 }
@@ -353,16 +417,33 @@ function startCovers($: EngineInterface, all: string[]) {
 }
 
 // ── state writers (handlers only, never while rendering) ─────────────────
-// The last place read, and each series' own, so the library can resume any of them.
+// The legacy map of every series' place, from before each had its own key (manga-library.ts).
+const LEGACY_PROGRESS = 'progress'
+
+async function readProgress($: EngineInterface) {
+  const keys = (await $.store.keys()).filter(k => k.startsWith(PROGRESS_PREFIX))
+  const own = ownProgress(await Promise.all(keys.map(async k => [k, await $.store.get(k)] as [string, unknown])))
+  const map = await $.store.get(LEGACY_PROGRESS)
+  return { own, map, legacy: legacyProgress(map, await $.store.get('position')) }
+}
+
+// Each series' place under its own key, so the library can resume any of them, and `position` for the
+// last series read. The legacy records move to their own keys first: `position` may hold another
+// series' only bookmark, and it is about to be replaced.
 async function savePosition($: EngineInterface, at: Position) {
+  const { own, map, legacy } = await readProgress($)
+  for (const [s, p] of Object.entries(toMigrate(own, legacy))) {
+    // checked again just before: another session may have saved that series meanwhile
+    if (s !== at.series && (await $.store.get(progressKey(s))) === undefined) await $.store.set(progressKey(s), p)
+  }
+  await $.store.set(progressKey(at.series), at)
   await $.store.set('position', at)
-  await $.store.set('progress', { ...(await savedProgress($)), [at.series]: at })
+  if (map !== undefined) await $.store.delete(LEGACY_PROGRESS)
 }
 
 async function savedProgress($: EngineInterface): Promise<Record<string, Position>> {
-  const all = ((await $.store.get('progress')) ?? {}) as Record<string, Position>
-  const last = (await $.store.get('position')) as Position | undefined
-  return last?.series ? { ...all, [last.series]: last } : all
+  const { own, legacy } = await readProgress($)
+  return mergedProgress(own, legacy)
 }
 
 async function openChapter($: EngineInterface, series: string, index: number, atPage: number) {
@@ -455,7 +536,7 @@ async function loadReader($: EngineInterface, asked = ''): Promise<{ ok: boolean
   if (chapters.length === 0) return { ok: false, text: `No chapters in ~/Manga/${series}/. ${EMPTY_HINT}` }
 
   // A saved chapter that is gone (deleted, renamed) falls back to the first one, at its page 0.
-  const resume = saved?.series === series ? saved : (await savedProgress($))[series]
+  const resume = (await savedProgress($))[series]
   const found = resume?.chapter ? chapters.indexOf(resume.chapter) : -1
   const at = Math.max(0, found)
   await openChapter($, series, at, found >= 0 ? (resume?.page ?? 0) : 0)

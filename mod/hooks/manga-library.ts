@@ -29,13 +29,21 @@ export const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
 export const archivePages = (entries: string[]) =>
   entries.filter(e => e && !e.endsWith('/') && !/(^|\/)__MACOSX\//.test(e) && !baseName(e).startsWith('.'))
 
-// unzip reads its member arguments as wildcards: bracket the characters that would match others.
-export const zipPattern = (entry: string) => entry.replace(/[[*?]/g, c => `[${c}]`)
+// unzip reads its member arguments as wildcards with `\` the escape: escape it and the characters that would match others.
+export const zipPattern = (entry: string) => entry.replace(/[\\[*?]/g, c => `\\${c}`)
+// `unzip -Z1` prints one bare name per line: split on the newlines alone, since a name may start or end with a space.
+export const zipListing = (stdout: string) => stdout.split('\n')
 export const unzipListArgv = (cbz: string) => ['unzip', '-Z1', cbz]
 export const unzipOneArgv = (cbz: string, entry: string, dir: string) => ['unzip', '-o', '-j', '-qq', cbz, zipPattern(entry), '-d', dir]
 
 // Outside every <cache root>/<series>/ chapter folder, so the per-series prune never sees it.
 export const coverDir = (cacheRoot: string, series: string) => `${cacheRoot}/.covers/${series}`
+
+// Each build stages in its own folder inside the cover dir, so two builds never share a file; the finished
+// cover is renamed into place. `token` is unique per build (time, random, a counter).
+export const coverStaging = (dir: string, token: string) => `${dir}/.build-${token}`
+// The per-series build lock, outside every cover dir and series folder, so no cleanup removes a lock in use.
+export const coverLockPath = (cacheRoot: string, series: string) => `${cacheRoot}/.locks/cover-${series}.lock`
 
 export type CoverMarker = { source: string; size: number; mtimeMs: number }
 
@@ -62,3 +70,37 @@ export const fitCaption = (text: string, width: number) => (text.length <= width
 
 // The first nine covers answer 1-9; the rest are pressed or clicked.
 export const coverHotkey = (index: number) => (index < 9 ? String(index + 1) : undefined)
+
+// ── reading progress in $.store ──────────────────────────────────────────
+// Each series' place under its own key, so sessions saving different series never write the same record
+// ($.store has no versioned write). Older versions kept one `progress` map and the last place in `position`.
+export type Position = { series: string; chapter: string | null; page: number }
+export const PROGRESS_PREFIX = 'progress:'
+export const progressKey = (series: string) => `${PROGRESS_PREFIX}${series}`
+
+const isPosition = (x: unknown): x is Position => {
+  const p = x as Partial<Position> | null | undefined
+  return !!p && typeof p.series === 'string' && p.series !== '' && typeof p.page === 'number'
+}
+
+// The legacy records, series by series: the last place wins for its series (it was written last).
+export function legacyProgress(map: unknown, last: unknown): Record<string, Position> {
+  const out: Record<string, Position> = {}
+  for (const [s, p] of Object.entries(map && typeof map === 'object' ? map : {})) if (isPosition(p)) out[s] = p
+  if (isPosition(last)) out[last.series] = last
+  return out
+}
+
+// The per-series records from the store's own entries, by series.
+export function ownProgress(entries: [string, unknown][]): Record<string, Position> {
+  const out: Record<string, Position> = {}
+  for (const [k, v] of entries) if (k.startsWith(PROGRESS_PREFIX) && isPosition(v)) out[k.slice(PROGRESS_PREFIX.length)] = v
+  return out
+}
+
+// What a reader resumes from: a series' own record, else its legacy one.
+export const mergedProgress = (own: Record<string, Position>, legacy: Record<string, Position>) => ({ ...legacy, ...own })
+
+// The legacy records not yet under their own key: what a save migrates first. Empty once migrated.
+export const toMigrate = (own: Record<string, Position>, legacy: Record<string, Position>) =>
+  Object.fromEntries(Object.entries(legacy).filter(([s]) => !(s in own)))
