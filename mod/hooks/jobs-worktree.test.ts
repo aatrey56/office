@@ -26,11 +26,11 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `sh -c` line (default exit 0), `head` is the worktree's branch (default the one it was made on), `commits` counts base..branch (1);
 // `renamed` is the name the worker renamed its branch to: HEAD is on it, and the branch it was made on is gone (a range to it fails).
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
-type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock }
+type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock; outcomes: Record<string, unknown>[] }
 type Check = (line: string) => { code: number; out?: string } | Promise<{ code: number; out?: string }>
-type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string; untracked?: string; failSet?: string; refs?: string[] | 'fail'; merged?: string[]; onProbe?: () => void; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
+type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string; untracked?: string; failSet?: string; codexLogin?: number; refs?: string[] | 'fail'; merged?: string[]; onProbe?: () => void; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
-  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock() }) as Runs
+  const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock(), outcomes: [] }) as Runs
   const { store, flock } = runs
   let isDirty = fake.dirty === true
   const stopped = new Set<string>()
@@ -78,6 +78,11 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
   on('session.cwd', () => ({ value: '/r/src' }))
   on('process.run', async (_$, e) => {
     const argv = [...e.argv]
+    // The outcome log's append: kept apart, as its records.
+    if (argv[0] === 'perl' && argv[3]?.endsWith('/office/outcomes.jsonl')) {
+      runs.outcomes.push(JSON.parse(argv[4] ?? '{}') as Record<string, unknown>)
+      return { value: RUN }
+    }
     runs.push({ argv, cwd: e.init?.cwd })
     const cmd = argv.join(' ')
     const out = (stdout: string, exitCode = 0) => ({ value: { ...RUN, stdout, exitCode } })
@@ -121,7 +126,11 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
       return out(JSON.stringify(listed.map(a => (stopped.has(a.id) ? { ...a, state: 'stopped' } : a))))
     }
     if (argv[0] === 'tail') return out(fake.transcript?.() ?? '')
-    if (argv[0] === 'grep') return out('', (fake.whole ?? fake.transcript)?.().includes(argv.at(-2) ?? '') ? 0 : 1)
+    if (argv[0] === 'grep') {
+      const hits = ((fake.whole ?? fake.transcript)?.() ?? '').split('\n').filter(l => l.includes(argv.at(-2) ?? ''))
+      return out(hits.map(l => `${l}\n`).join(''), hits.length > 0 ? 0 : 1)
+    }
+    if (argv[0] === 'codex' && argv[1] === 'login') return out('Not logged in\n', fake.codexLogin ?? 0)
     if (argv[0] === 'mktemp') return out('/tmp/office-job.x\n')
     if (cmd.endsWith('status --porcelain')) return out(isDirty ? ' M src/x.ts\n?? big.bin\n' : '')
     if (argv.includes('ls-files')) return out(isDirty ? 'src/x.ts\0big.bin\0' : '')
@@ -176,7 +185,7 @@ function fakeFlock(): Flock {
 describe('worker worktrees', () => {
   test('a worker started in a repo runs on its own branch in its own worktree', async ($, on) => {
     const runs = fakeRepo(on)
-    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     const add = runs.find(run => run.argv.includes('worktree') && run.argv.includes('add'))?.argv ?? []
     const branch = add[add.indexOf('-b') + 1] ?? ''
     const dir = add[add.indexOf('-b') + 2] ?? ''
@@ -194,7 +203,7 @@ describe('worker worktrees', () => {
 
   test('base and branch: the worktree starts from that commit on that branch, and the worker is told never to switch', async ($, on) => {
     const runs = fakeRepo(on)
-    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', base: 'release', branch: 'fix/rename' })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src', base: 'release', branch: 'fix/rename' })
     const add = runs.find(run => run.argv.includes('worktree') && run.argv.includes('add'))?.argv ?? []
     expect(add[add.indexOf('-b') + 1]).toBe('fix/rename')
     expect(add.at(-1)).toBe(OTHER)
@@ -206,7 +215,7 @@ describe('worker worktrees', () => {
 
   test('a branch asked for in a repo with no commits is refused, never started in the shared checkout', async ($, on) => {
     const runs = fakeRepo(on, { noHead: true })
-    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', branch: 'fix/rename' })
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src', branch: 'fix/rename' })
     expect(JSON.stringify(r)).toContain('Worker not started: git rev-parse HEAD')
     expect(runs.some(run => run.argv.includes('--bg'))).toBe(false)
   })
@@ -214,7 +223,7 @@ describe('worker worktrees', () => {
   test('a branch that exists or is checked out elsewhere is refused before anything starts', async ($, on) => {
     const runs = fakeRepo(on, { branches: ['main', 'taken'], worktrees: 'worktree /r\nHEAD abc\nbranch refs/heads/main\n' })
     const spawn = (branch: string) =>
-      $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', branch }).then(r => JSON.stringify(r))
+      $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src', branch }).then(r => JSON.stringify(r))
     expect(await spawn('main')).toContain('Branch main is checked out in /r')
     expect(await spawn('taken')).toContain('Branch taken already exists')
     expect(runs.some(run => run.argv.includes('add') || run.argv.includes('--bg'))).toBe(false)
@@ -230,7 +239,7 @@ describe('worker worktrees', () => {
     })
     const clock = mock.clock(on)
     const delivered = collectDelivery(on)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.settle()
     expect(spawnedCwd).toMatch(/^\/cfg\/office\/worktrees\//)
     const remove = runs.find(run => run.argv.includes('worktree') && run.argv.includes('remove'))?.argv
@@ -247,7 +256,7 @@ describe('worker worktrees', () => {
     const runs = fakeRepo(on, { agents: () => '[{"id":"5ac0f0df","state":"working","status":"busy"}]' })
     const clock = mock.clock(on)
     const delivered = collectDelivery(on)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(61_000)
     expect(runs.some(run => run.argv.includes('stop'))).toBe(true)
     expect(runs.some(run => run.argv.includes('remove'))).toBe(false)
@@ -258,9 +267,12 @@ describe('worker worktrees', () => {
 
   test('claude --bg exiting 0 with no findable id keeps the worktree (regression)', async ($, on) => {
     const runs = fakeRepo(on, { bg: 'started\n' })
-    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    const clock = mock.clock(on)
+    const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     expect(runs.some(run => run.argv.includes('remove') || run.argv.includes('branch'))).toBe(false)
     expect(JSON.stringify(r)).toMatch(/worktree is kept at \/cfg\/office\/worktrees\//)
+    await clock.settle()
+    expect(runs.outcomes).toMatchObject([{ kind: 'finish', verdict: 'failed' }]) // a start that failed still ends in the log
   })
 
   test('a blocked worker seen idle with no reply resumes its timeout (regression)', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
@@ -274,7 +286,7 @@ describe('worker worktrees', () => {
     on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
     on('ui.panes', () => ({ value: [] }))
     await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(5_000) // blocked: the timeout pauses
     expect(delivered.join('\n')).toContain('waiting for input')
     state = 'working' // now idle, and no transcript to read a reply from
@@ -288,7 +300,7 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
   const turn = (text: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } })
   const agent = (state: string, status = 'busy') =>
     `[{"id":"5ac0f0df","sessionId":"S1","cwd":"/r","kind":"background","state":"${state}","status":"${status}"}]`
-  const spawn = ($: Engine) => $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+  const spawn = ($: Engine) => $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
   async function start($: Engine, on: On) {
     on('session.start', (_$, e) => ({ cwd: e.cwd }))
     on('command.register', (_$, e) => ({ value: { command: e.name } }))
@@ -356,6 +368,20 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     expect(stops(runs)).toBe(1)
   })
 
+  test('a headless worker a reload interrupted gets one finish record, as stopped (regression)', async ($, on) => {
+    const runs = fakeRepo(on)
+    const clock = mock.clock(on, { now: 61_000 })
+    let left: unknown = [{ id: 'j1', kind: 'worker', title: 'rename x to y', cwd: '/r', status: 'running', startedAt: 0, mode: 'headless', tail: '' }]
+    on('state.set', (_$, e, next) => {
+      if (e.key === 'jobs') left = undefined
+      return next(e)
+    })
+    on('state.get', (_$, e, next) => (left !== undefined && e.key === 'jobs' ? { value: { value: left, version: 0 } } : next(e)))
+    await start($, on)
+    await clock.settle()
+    expect(runs.outcomes).toMatchObject([{ kind: 'finish', job: 'j1', verdict: 'stopped', why: 'interrupted: the plugin reloaded' }])
+  })
+
   test('an oversized file the worker staged is unstaged and left out of the WIP commit', { options: { jobTimeoutMin: 1 } }, async ($, on) => {
     const runs = fakeRepo(on, { agents: () => agent('working'), transcript: () => turn('step'), dirty: true, staged: ['out/staged-big.bin'] })
     const clock = mock.clock(on)
@@ -407,7 +433,7 @@ describe('watchdog: deadline, blocked limit, stalled worker', () => {
     const delivered = collectDelivery(on)
     await start($, on)
     await spawn($)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'add a test', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'add a test', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(125_000) // the first: blocked at 5 s, ended at twice blockedTimeoutMin; its first listing then takes 20 s
     await clock.advance(10_000)
     expect(delivered.join('\n')).toContain('Worker finished: add a test')
@@ -494,7 +520,7 @@ describe('--bg worker finish: the [office: done] marker', () => {
     const delivered = collectDelivery(on)
     stubStart(on)
     await $.session.start(START)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(5_000)
     const text = delivered.join('\n')
     expect(text).toContain('Worker finished: rename x to y')
@@ -503,7 +529,7 @@ describe('--bg worker finish: the [office: done] marker', () => {
     expect(text).not.toContain('waiting for input')
     expect(runs.some(run => run.argv.join(' ').endsWith('stop 5ac0f0df'))).toBe(true)
     state = 'stopped' // what `claude stop` leaves: the slot is free for the next worker
-    const next = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'tidy it', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    const next = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'tidy it', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     expect(JSON.stringify(next)).toContain('Started background worker')
   })
 
@@ -513,7 +539,7 @@ describe('--bg worker finish: the [office: done] marker', () => {
     const delivered = collectDelivery(on)
     stubStart(on)
     await $.session.start(START)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(5_000)
     const text = delivered.join('\n')
     expect(text).toContain('Worker finished: rename x to y')
@@ -528,7 +554,7 @@ describe('--bg worker finish: the [office: done] marker', () => {
     const delivered = collectDelivery(on)
     stubStart(on)
     await $.session.start(START)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(5_000) // the poll learns the session id
     last = reply('Renamed it.\n[office: done]')
     listed = '[]'
@@ -539,13 +565,38 @@ describe('--bg worker finish: the [office: done] marker', () => {
     expect(text).not.toContain('FAILED')
   })
 
+  test('a worker done by its first poll keeps its session id: its tokens reach the finish record (regression)', async ($, on) => {
+    const line = JSON.stringify({ type: 'assistant', message: { id: 'm1', content: [{ type: 'text', text: 'Renamed it.\n[office: done]' }], usage: { output_tokens: 42, cache_read_input_tokens: 7 } } })
+    const runs = fakeRepo(on, { agents: () => agent('done'), transcript: () => line })
+    const clock = mock.clock(on)
+    collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(runs.outcomes.find(o => o.kind === 'finish')).toMatchObject({ verdict: 'unverified', outputTokens: 42, cacheReadTokens: 7 })
+  })
+
+  test('a session listed killed is a stop in the outcome log, not a failure', async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => agent('killed'), transcript: () => reply('Renaming x.') })
+    const clock = mock.clock(on)
+    collectDelivery(on)
+    stubStart(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
+    await clock.advance(5_000)
+    await clock.settle()
+    expect(runs.outcomes.filter(o => o.kind === 'finish')).toMatchObject([{ verdict: 'stopped', why: 'background session 5ac0f0df ended: killed' }])
+  })
+
   test('blocked without the marker still waits for input', async ($, on) => {
     fakeRepo(on, { agents: () => agent('blocked'), transcript: () => reply('Rename x in tests too?') })
     const clock = mock.clock(on)
     const delivered = collectDelivery(on)
     stubStart(on)
     await $.session.start(START)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(5_000)
     const text = delivered.join('\n')
     expect(text).toContain('is waiting for input')
@@ -568,7 +619,7 @@ describe('the worker gate', () => {
     on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
     on('ui.panes', () => ({ value: [] }))
     await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
-    const started = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src', ...input })
+    const started = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src', ...input })
     const id = /job (\w+)/.exec(JSON.stringify(started))?.[1] ?? ''
     await clock.advance(5_000)
     return { runs, clock, id, text: () => delivered.join('\n') }
@@ -577,7 +628,7 @@ describe('the worker gate', () => {
   const removed = (runs: Runs) => runs.some(r => r.argv.includes('worktree') && r.argv.includes('remove'))
 
   test('green checks: done, CHECKS PASSED in the head, the worktree removed; the session stopped before the checks', async ($, on) => {
-    const { runs, id, text } = await finish($, on, { checksFile: CHECKS })
+    const { runs, clock, id, text } = await finish($, on, { checksFile: CHECKS })
     expect(text()).toContain(`Worker finished: rename x to y (job ${id}) · CHECKS PASSED (3/3, 0s)`)
     expect(checksRun(runs)).toEqual(['tsc', 'npm test', 'lint'])
     expect(runs.find(r => r.argv[0] === 'sh')?.cwd).toMatch(/^\/cfg\/office\/worktrees\//)
@@ -585,18 +636,26 @@ describe('the worker gate', () => {
     expect(at(a => a.join(' ').endsWith('stop 5ac0f0df'))).toBeLessThan(at(a => a[0] === 'sh'))
     expect(removed(runs)).toBe(true)
     expect(runs.store.get('gates')).toMatchObject({ [`office/${id}-rename-x-to-y`]: { sha: BASE, verdict: 'pass' } })
+    // The outcome log: the spawn (an agent's model, its reason, the router's own pick beside it), then the gate's verdict.
+    await clock.settle()
+    const [spawned, finished] = runs.outcomes
+    expect(spawned).toMatchObject({ kind: 'spawn', job: id, cwd: '/r/src', repo: 'r', branch: `office/${id}-rename-x-to-y`, base: BASE, mode: 'bg', deliverable: 'commit', model: 'claude-sonnet-5-5', effort: 'low', chooser: 'manager', reason: 'r', task: 'rename x to y' })
+    expect(spawned?.routerPick).toMatchObject({ backend: 'rules' })
+    expect(finished).toMatchObject({ kind: 'finish', job: id, verdict: 'passed', why: null, commits: 1 })
   })
 
   test('a red check, red again on its re-run: rejected with the command and output tail, the worktree kept, the slot freed', { options: { maxWorkers: 1 } }, async ($, on) => {
     const check: Check = line => (line === 'npm test' ? { code: 1, out: 'ok 1\nnot ok 2 login fails\n' } : { code: 0 })
-    const { runs, id, text } = await finish($, on, { checksFile: CHECKS, check })
+    const { runs, clock, id, text } = await finish($, on, { checksFile: CHECKS, check })
     expect(text()).toContain(`Worker REJECTED: CHECKS FAILED: \`npm test\` exit 1 · rename x to y (job ${id})`)
+    await clock.settle()
+    expect(runs.outcomes.find(o => o.kind === 'finish')).toMatchObject({ job: id, verdict: 'rejected', why: 'CHECKS FAILED: `npm test` exit 1' })
     expect(text()).toContain('$ npm test\nexit 1 after 0s (and again on its re-run)\nok 1\nnot ok 2 login fails')
     expect(text()).toContain("Worker's report:\nRenamed it.")
     expect(checksRun(runs)).toEqual(['tsc', 'npm test', 'npm test']) // lint never runs
     expect(removed(runs)).toBe(false)
     expect(text()).toMatch(/Worktree kept at \/cfg\/office\/worktrees\//)
-    const next = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'tidy it', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    const next = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'tidy it', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     expect(JSON.stringify(next)).toContain('Started background worker')
   })
 
@@ -648,7 +707,7 @@ describe('the worker gate', () => {
     })
     const clock = mock.clock(on)
     const delivered = collectDelivery(on)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.settle()
     expect(delivered.join('\n')).toContain('Worker REJECTED: CHECKS FAILED: `tsc` exit 2')
     expect(removed(runs)).toBe(false)
@@ -705,7 +764,7 @@ describe('the worker gate', () => {
       },
     })
     const delivered = collectDelivery(on)
-    const started = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    const started = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     const id = /job (\w+)/.exec(JSON.stringify(started))?.[1] ?? ''
     await reached
     const ui = await $.ui.mount({
@@ -748,7 +807,7 @@ describe('the worker gate', () => {
     on('ui.panes', () => ({ value: [] }))
     await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
     await clock.advance(1_000) // the deadline (61 s) falls between two polls
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', effort: 'low', cwd: '/r/src' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' })
     await clock.advance(59_000)
     isArmed = true
     await clock.advance(1_000) // the deadline fires: it reads the job running, and waits
@@ -786,11 +845,42 @@ describe('the worker gate', () => {
   })
 })
 
+describe('model reasons and the Sonnet trial', () => {
+  const working = JSON.stringify([{ id: '5ac0f0df', kind: 'background', state: 'working', status: 'busy' }])
+  const spawn = ($: Engine, input: Record<string, unknown>) =>
+    $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'debug the flaky login test', cwd: '/r/src', ...input }).then(r => JSON.stringify(r))
+
+  test('an agent naming a model with no reason is refused before anything starts', async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => working })
+    for (const reason of [undefined, '  ']) {
+      const r = await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'design it', cwd: '/r/src', model: 'opus', ...(reason !== undefined ? { reason } : {}) })
+      expect(r.deny ?? '').toContain('model "opus" was given without a reason. Omit model (and effort) to let the router pick')
+    }
+    expect(runs.filter(run => run.argv.includes('--bg') || run.argv.includes('worktree'))).toHaveLength(0)
+  })
+
+  test('in the trial a commit worker routed to opus runs on sonnet/high and says so; a report worker keeps opus', { options: { routerBackend: 'rules', sonnetTrialUntil: '2099-12-31' } }, async ($, on) => {
+    const runs = fakeRepo(on, { agents: () => working })
+    const clock = mock.clock(on)
+    const commit = await spawn($, {})
+    expect(commit).toContain('claude-sonnet-5-5 at high effort')
+    expect(commit).toMatch(/Sonnet trial until 2099-12-31: router picked opus\/\w+, running sonnet\/high\./)
+    const report = await spawn($, { deliverable: 'report' })
+    expect(report).toContain('claude-opus-5-5 at')
+    expect(report).not.toContain('Sonnet trial')
+    await clock.settle()
+    expect(runs.outcomes.map(o => [o.chooser, o.model, (o.routerPick as { model?: string } | null)?.model])).toEqual([
+      ['trial', 'claude-sonnet-5-5', 'opus'],
+      ['router', 'claude-opus-5-5', 'opus'],
+    ])
+  })
+})
+
 describe('maxOpusWorkers', () => {
   const OPUS = 'claude-opus-5-5'
   const working = (...ids: string[]) => JSON.stringify(ids.map(id => ({ id, kind: 'background', state: 'working', status: 'busy' })))
   const spawn = ($: Engine, model: string | undefined, task = 'rename x to y') =>
-    $.tool.call({ tool: 'mcp__office__spawn_worker', task, ...(model ? { model } : {}), effort: 'low', cwd: '/r/src' })
+    $.tool.call({ tool: 'mcp__office__spawn_worker', task, ...(model ? { model, reason: 'r' } : {}), effort: 'low', cwd: '/r/src' })
       .then(r => JSON.stringify(r))
   const bgStarts = (runs: Runs) => runs.filter(run => run.argv.includes('--bg')).length
 
@@ -807,7 +897,7 @@ describe('maxOpusWorkers', () => {
     expect(await spawn($, 'sonnet')).toContain('Started background worker')
   })
 
-  test('a router-chosen Opus worker counts toward the cap', { options: { maxWorkers: 8, maxOpusWorkers: 1, routerBackend: 'rules' } }, async ($, on) => {
+  test('a router-chosen Opus worker counts toward the cap', { options: { maxWorkers: 8, maxOpusWorkers: 1, routerBackend: 'rules', sonnetTrialUntil: 'off' } }, async ($, on) => {
     const runs = fakeRepo(on, { agents: () => working('5ac0f0df') })
     const first = await spawn($, undefined, 'debug the flaky login test')
     expect(first).toContain(OPUS)
@@ -850,7 +940,7 @@ describe('maxOpusWorkers', () => {
     expect(runs.sets.slice(writes)).toEqual([]) // nothing gone, nothing written
   })
 
-  test('two starts racing for the last Opus slot: exactly one starts (regression)', { options: { maxWorkers: 8, maxOpusWorkers: 1, routerBackend: 'claude' } }, async ($, on) => {
+  test('two starts racing for the last Opus slot: exactly one starts (regression)', { options: { maxWorkers: 8, maxOpusWorkers: 1, routerBackend: 'claude', sonnetTrialUntil: 'off' } }, async ($, on) => {
     let openRoute = () => {}
     let openBg = () => {}
     const routeGate = new Promise<void>(r => { openRoute = r })
@@ -1003,7 +1093,7 @@ describe('maxOpusWorkers', () => {
     })
     const clock = mock.clock(on)
     const start = (task: string, mode: string) =>
-      $.tool.call({ tool: 'mcp__office__spawn_worker', task, mode, model: 'sonnet', effort: 'low', cwd: '/r/src' }).then(r => JSON.stringify(r))
+      $.tool.call({ tool: 'mcp__office__spawn_worker', task, mode, model: 'sonnet', reason: 'r', effort: 'low', cwd: '/r/src' }).then(r => JSON.stringify(r))
     expect(await start('rename x to y', 'headless')).toContain('Started headless worker')
     // The next start waits on the lock (another session holds it)...
     const drop = await runs.flock.take()
@@ -1022,11 +1112,12 @@ describe('codex review rounds', () => {
   const OLD = 'f00d'.repeat(10)
   const TYPED = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
   const round = (sha: string, findings?: string) => ({ sha, base: 'main', model: 'gpt-6.1-sol', jobId: `j-${sha}`, at: Date.now(), findings, isCovering: true })
-  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }, failSet?: string) => {
+  const reviewRuns = (on: On, store: Record<string, unknown>, untracked?: { path: string; lines: number }, failSet?: string, codexLogin?: number) => {
     const reviews: { argv: readonly string[]; input?: string }[] = []
     const fake: Fake = {
       store,
       failSet,
+      codexLogin,
       untracked: untracked && `${untracked.path}\0`,
       async *spawn(e) {
         if (e.argv[0] === 'codex') reviews.push(e)
@@ -1055,6 +1146,8 @@ describe('codex review rounds', () => {
       [OLD, 'main', '[P1] x.ts:3 off by one'],
       [BASE, OLD, 'No P1/P2 left.'],
     ])
+    await clock.settle()
+    expect(runs.outcomes).toMatchObject([{ kind: 'review', branch: 'feature', round: 2, model: 'gpt-6-luna', findings: { p1: 0, p2: 0, p3: 0 }, clean: true }])
   })
 
   for (const [name, over, result] of [
@@ -1097,6 +1190,15 @@ describe('codex review rounds', () => {
     expect(rounds.map(x => x.isCovering)).toEqual([false, true])
     await $.command.run({ command: 'codex-review', args: '--commit abc1234', ...TYPED })
     expect((runs.store.get('codexRounds') as Record<string, { isCovering?: boolean }[]>)[KEY]!.map(x => x.isCovering)).toEqual([false, true, false])
+  })
+
+  test('a review codex cannot start (not logged in) still gets its one review record, failed (regression)', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const { runs } = reviewRuns(on, {}, undefined, undefined, 1)
+    const clock = mock.clock(on)
+    await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    await clock.settle()
+    expect(runs.outcomes).toMatchObject([{ kind: 'review', clean: false, findings: { p1: 0, p2: 0, p3: 0 } }])
+    expect(runs.outcomes[0]?.error).toEqual(expect.any(String))
   })
 
   test('untracked files count toward the re-review size limit (a large new file makes it a full review)', { options: { workerWorktree: 'off' } }, async ($, on) => {

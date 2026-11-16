@@ -128,6 +128,12 @@
       "description": "Workers on Opus-tier models (opus, fable or their full ids) running at once; more are refused. Codex reviews don't count. 0 sets no limit beyond Max concurrent jobs.",
       "default": 0
     },
+    "sonnetTrialUntil": {
+      "type": "string",
+      "title": "Sonnet trial until (YYYY-MM-DD)",
+      "description": "Through this day (UTC), a commit worker the router sizes as Opus runs on Sonnet at high effort instead, and its spawn result says so. An explicit model (with its reason) and report workers are left alone. Empty or off ends the trial.",
+      "default": "2026-11-30"
+    },
     "jobTimeoutMin": {
       "type": "number",
       "title": "Job timeout (minutes)",

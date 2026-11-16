@@ -71,7 +71,7 @@ describe('routing inbox', () => {
   test('a worker given its model logs nothing', OPTIONS, async ($, on) => {
     const inbox = fakeWorker(on)
     const clock = mock.clock(on)
-    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', cwd: '/r' })
+    await $.tool.call({ tool: 'mcp__office__spawn_worker', task: 'rename x to y', mode: 'headless', model: 'sonnet', reason: 'r', cwd: '/r' })
     await clock.settle()
     expect(inbox()).toHaveLength(0)
   })

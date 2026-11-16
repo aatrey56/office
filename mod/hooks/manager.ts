@@ -6,7 +6,7 @@ export const NOTE_TAGS = ['plan', 'decision', 'result', 'blocker', 'handoff'] as
 
 // The system-prompt section for the session managing `project`: what the role is, the tools
 // (list_sessions, message_session, route_task, spawn_worker, session_usage, post_note,
-// read_notes), and the loop: split the goal, route each task, delegate, collect, note, report.
+// read_notes), and the loop: split the goal, delegate each task (the router picks its model), collect, note, report.
 // Under 250 words.
 export function managerSection(project: string, self: string): string {
   return [
@@ -14,8 +14,8 @@ export function managerSection(project: string, self: string): string {
     'Your tools: list_sessions, message_session, route_task, spawn_worker, session_usage, post_note, read_notes.',
     'Work in this loop:',
     '1. Split the goal into small tasks.',
-    '2. Call route_task for each task to pick a model and effort.',
-    '3. Delegate each task with spawn_worker, or with message_session when another session should take it.',
+    '2. Delegate each task with spawn_worker, or with message_session when another session should take it.',
+    '3. Omit model and effort in spawn_worker: the router picks them (route_task is a dry run). Name a model only when the task needs it, with a one-line reason.',
     '4. Check session_usage before you start several workers.',
     '5. Collect the results as they finish.',
     '6. Use post_note for decisions and results, and read_notes to see what others wrote.',

@@ -64,6 +64,7 @@ export type Job = {
   hasReplied?: boolean // bg-mode worker: an assistant turn was seen in its transcript (never reported stalled after)
   deliverable?: Deliverable // worker with a worktree: what its result is (default commit)
   gate?: JobGate // worker with a worktree: its gate's verdict, once checked
+  review?: { branch: string | null; round: number } // codex review: the branch and round it reviews (for its outcome record)
 }
 // commit: the result is commits on the worker's branch; report: text alone (no commits is fine).
 export type Deliverable = 'commit' | 'report'
