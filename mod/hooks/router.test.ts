@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { CODEX_DEFAULTS, codexQuotaMessage, codexReviewArgv, codexReviewPrompt, parseReviewTarget } from './codex'
+import { CODEX_DEFAULTS, CODEX_REVIEW_TOOL, codexQuotaMessage, codexReviewArgv, codexReviewPrompt, parseReviewTarget } from './codex'
 import { MODEL_IDS, modelIdFor, parseClaudeRoute, parseJevResponse, rulesRoute } from './router'
 import { bgArgv, bgPhase, headlessArgv, parseAgentsJson, parseBgId, readTranscript, transcriptPath } from './spawn'
 
@@ -143,6 +143,20 @@ describe('codex tiers', () => {
     expect(codexQuotaMessage('stream error: 429 Too Many Requests', 'gpt-6-sol')).toBeUndefined()
     expect(codexQuotaMessage('fix the quota check in billing.ts', 'gpt-6-sol')).toBeUndefined()
     expect(codexQuotaMessage('The model is not supported', 'gpt-6-sol')).toBeUndefined()
+  })
+
+  test('"out of credits" is a quota hit too, so the model is marked out', () => {
+    expect(codexQuotaMessage('workspace is out of credits', 'gpt-6-astra')).toBe('Codex quota hit for gpt-6-astra.')
+    expect(codexQuotaMessage('{"type":"error","message":"Insufficient credits"}', 'gpt-6-astra')).toBe('Codex quota hit for gpt-6-astra.')
+    expect(codexQuotaMessage('Your credits have been exhausted. Try again in 2 hours.', 'gpt-6-astra')).toBe(
+      'Codex quota hit for gpt-6-astra, resets in 2 hours.',
+    )
+    expect(codexQuotaMessage('add credits to the invoice view', 'gpt-6-astra')).toBeUndefined()
+  })
+
+  test('the codex_review tool description tells a caller to show a deep size refusal to the person', () => {
+    expect(CODEX_REVIEW_TOOL.description).toContain('/codex-review --deep --force')
+    expect(CODEX_REVIEW_TOOL.description).toContain('session_usage')
   })
 })
 

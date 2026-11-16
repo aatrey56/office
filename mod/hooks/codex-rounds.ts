@@ -88,7 +88,7 @@ export function textLines(content: string): number {
 }
 
 /** Codex's usage / rate-limit failure wording, matched case-insensitively. */
-const USAGE_LIMIT = /usage limit|rate limit|hit your limit/i
+const USAGE_LIMIT = /usage limit|rate limit|hit your limit|out of credits|insufficient credits/i
 export function isUsageLimit(text: string): boolean {
   return USAGE_LIMIT.test(text)
 }
