@@ -7,10 +7,12 @@ import type { AgentFile } from './agents'
 import { budgetLine, contextLine, usageRows } from './budget'
 import { CODEX_LIMITS_REQUEST, codexLimitsArgv, codexLimitsFrom, codexUsageLine } from './codex-budget'
 import type { CodexLimits } from './codex-budget'
+import { freshRecord, isDroppable, RUNNING_PREFIX, runningKey, runningOf, runningRow, waitingText } from './running'
+import type { RunningRecord, ShownJob } from './running'
 import { chatLines, projectSlug, SLUG_MAX } from './sessions'
 import { officeArt, officeMap } from './scene/art'
 import { toCells, toPng } from './scene/encode'
-import { assignSeats, deriveCrew, distinctLooks, projectsOf } from './scene/model'
+import { assignSeats, deriveCrew, distinctLooks, projectOf, projectsOf } from './scene/model'
 import { isSettled, stepActors } from './scene/motion'
 import { paintFrame } from './scene/paint'
 import { projectRootArgv, repoRootFromCommonDir } from './worktree'
@@ -24,6 +26,7 @@ const FRAME_MS = 100 // 10 frames/s while anyone walks or a bubble blinks; nothi
 const STEP_PX = 4 // a 16 px cell in 4 frames, about Gold's walking pace
 const LINGER_MS = 20_000 // a finished worker is seen reporting, then leaving, for this long
 const AGENT_SCAN_MS = 2000 // how often the live sessions' subagent folders are looked at
+const RUNNING_SCAN_MS = 2000 // how often other sessions' running jobs (running.ts) are read
 const CELL_W = 9.35 // pixels per terminal cell, as measured in Ghostty; sizes the picture box
 const CELL_H = 20
 
@@ -222,6 +225,37 @@ async function scanAgents($: EngineInterface, cards: SessionCard[]): Promise<voi
   }
 }
 
+// Other sessions' running jobs, read from $.store every RUNNING_SCAN_MS in the background; this
+// session's own come from its job list. A record with an old heartbeat is ignored, a very old one deleted.
+let others: RunningRecord[] = []
+let runningScanAt = 0
+let selfId: string | undefined
+
+async function scanRunning($: EngineInterface): Promise<void> {
+  if (Date.now() - runningScanAt < RUNNING_SCAN_MS) return
+  runningScanAt = Date.now()
+  selfId ??= await $.session.id()
+  const now = Date.now()
+  const found: RunningRecord[] = []
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(RUNNING_PREFIX) || key === runningKey(selfId)) continue
+    const raw = await $.store.get(key).catch(() => undefined)
+    if (isDroppable(raw, now)) await $.store.delete(key).catch(() => undefined)
+    const record = freshRecord(raw, now)
+    if (record && record.jobs.length > 0) found.push(record)
+  }
+  const isChanged = JSON.stringify(found.map(r => r.jobs)) !== JSON.stringify(others.map(r => r.jobs))
+  others = found
+  if (isChanged) await update($, TICK, n => (n + 1) % 1_000_000)
+}
+
+// Every running job, this session's first, each with the session that started it.
+function runningJobs(jobs: Job[], cards: SessionCard[]): ShownJob[] {
+  const name = (id: string) => cards.find(c => c.sessionId === id)?.name ?? id.slice(0, 8)
+  const own = runningOf(jobs).map(j => ({ ...j, sessionId: selfId ?? '', owner: cards.find(c => c.isSelf)?.name ?? 'this session' }))
+  return [...own, ...others.flatMap(r => r.jobs.map(j => ({ ...j, sessionId: r.sessionId, owner: name(r.sessionId) })))]
+}
+
 // The project shown: the one picked with [ ], else this session's, else the busiest.
 function shownProject(crew: Crew[], picked: string | null): string | null {
   const projects = projectsOf(crew)
@@ -229,20 +263,24 @@ function shownProject(crew: Crew[], picked: string | null): string | null {
   return crew.find(c => c.isSelf)?.project ?? projects[0] ?? null
 }
 
-async function currentCrew($: EngineInterface): Promise<{ crew: Crew[]; project: string | null; all: string[] }> {
+// `roots` is the snapshot the crew was placed with: the learning goes on in the background meanwhile.
+async function currentCrew($: EngineInterface): Promise<{ crew: Crew[]; project: string | null; all: string[]; roots: Record<string, string | null> }> {
   const cards = await read($, SESSIONS)
   const jobs = await read($, JOBS)
   const managers = await read($, MANAGERS)
-  void learnRoots($, [...cards.map(c => c.cwd), ...jobs.map(j => j.cwd)]).catch(() => undefined)
+  const theirs = others.flatMap(r => r.jobs)
+  void learnRoots($, [...cards.map(c => c.cwd), ...jobs.map(j => j.cwd), ...theirs.map(j => j.cwd)]).catch(() => undefined)
   void scanAgents($, cards).catch(() => undefined)
-  const everyone = deriveCrew(cards, jobs, managers, roots, Date.now(), LINGER_MS, agents)
+  void scanRunning($).catch(() => undefined)
+  const known = roots
+  const everyone = deriveCrew(cards, jobs, managers, known, Date.now(), LINGER_MS, agents, theirs)
   const project = shownProject(everyone, await read($, PROJECT))
-  if (project === null) return { crew: [], project, all: [] }
+  if (project === null) return { crew: [], project, all: [], roots: known }
   seated = assignSeats(everyone, officeMap(), project, seated)
   // Someone leaving is drawn only while its walk to the door lasts: one never seen inside, or
   // already out of the door, is not brought back to the doorway.
   const here = seated.filter(c => c.project === project && (c.state !== 'leaving' || actors.some(a => a.id === c.id && !a.isGone)))
-  return { crew: distinctLooks(here, officeArt().sprites.length), project, all: projectsOf(everyone) }
+  return { crew: distinctLooks(here, officeArt().sprites.length), project, all: projectsOf(everyone), roots: known }
 }
 
 function selectColor(): number {
@@ -433,7 +471,7 @@ export function installScene(on: On, options: PluginOptions) {
     const sized = box.columns !== columns || box.rows !== rows || box.graphics !== graphics || box.scale !== scale
     box = { columns, rows, scale, graphics }
 
-    const { crew, project, all } = await currentCrew($)
+    const { crew, project, all, roots: known } = await currentCrew($)
     const selectedId = await read($, SELECTED)
     if (sized || lastPicture[graphics ? 'png' : 'cells'] === undefined) paint(crew, selectedId)
     startTimer($)
@@ -442,6 +480,13 @@ export function installScene(on: On, options: PluginOptions) {
     const leads = crew.filter(c => c.isSelectable)
     // Office-spawned workers only: subagents are drawn but never listed.
     const workers = crew.filter(c => !c.isSelectable && !agents.some(a => a.id === c.id))
+    // The running row: the shown office's jobs; each names its session when more than one could own it.
+    selfId ??= await $.session.id().catch(() => undefined)
+    const running = runningJobs(await read($, JOBS), cards)
+    const shownJobs = running.filter(j => (j.project || projectOf(j.cwd, known)) === project).sort((a, b) => a.startedAt - b.startedAt)
+    const withOwner = leads.length > 1 || shownJobs.some(j => !leads.some(l => l.id === j.sessionId))
+    const runningText = runningRow(shownJobs, Date.now(), withOwner)
+    const waitingOn = (id: string) => waitingText(running.filter(j => j.sessionId === id).length)
     const picked = leads.find(c => c.id === selectedId)
     const pickedCard = picked && cards.find(c => c.sessionId === picked.id)
     let claudeBudget = ''
@@ -513,6 +558,9 @@ export function installScene(on: On, options: PluginOptions) {
             {row}
           </Text>
         ))}
+        <Text key="running" dimColor wrap="truncate-end">
+          {runningText}
+        </Text>
         {debug && (
           <Text dimColor wrap="truncate-end">
             {`frames drawn ${stats.painted} · swapped ${stats.swapped} · last swap ${stats.last || 'none yet'} · timer ${timer ? `running, last tick ${Math.round((Date.now() - lastFrameAt) / 100) / 10}s ago` : 'stopped'} · ${box.graphics ? `picture ×${box.scale} ${lastPicture.file && fileFrames ? `file gen ${lastPicture.generation}` : 'inline'}` : 'cells'} · walking ${actors.filter(a => a.path.length > 0).length}`}
@@ -522,7 +570,7 @@ export function installScene(on: On, options: PluginOptions) {
         <Box flexWrap="wrap" columnGap={2}>
           {leads.length === 0 && <Text dimColor>No sessions in this office yet.</Text>}
           {leads.map((c, i) => {
-            const label = `${c.id === selectedId ? '›' : ''}${c.name}${c.role === 'manager' ? ' (manager)' : ''} · ${STATE_WORDS[c.state]}`
+            const label = `${c.id === selectedId ? '›' : ''}${c.name}${c.role === 'manager' ? ' (manager)' : ''} · ${STATE_WORDS[c.state]}${waitingOn(c.id)}`
             return i < 9 ? (
               <Button plain key={`crew:${c.id}`} label={label} hotkey={String(i + 1)} onPress={choose(c.id)} />
             ) : (
@@ -538,7 +586,7 @@ export function installScene(on: On, options: PluginOptions) {
         {picked && (
           <Box flexDirection="column">
             <Box gap={1}>
-              <Text bold>{`${picked.name} · ${STATE_WORDS[picked.state]}${picked.activity ? ` (${picked.activity})` : ''}`}</Text>
+              <Text bold>{`${picked.name} · ${STATE_WORDS[picked.state]}${picked.activity ? ` (${picked.activity})` : ''}${waitingOn(picked.id)}`}</Text>
               <Button plain key="older" label="older" hotkey="u" onPress={scrollChat(1)} />
               <Button plain key="newer" label="newer" hotkey="n" onPress={scrollChat(-1)} />
               {chatScroll > 0 && <Text dimColor>{`${chatScroll} newer below`}</Text>}

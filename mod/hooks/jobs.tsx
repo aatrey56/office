@@ -21,6 +21,8 @@ import {
 } from './gates'
 import type { CheckRun, GateResult, GitVerdict } from './gates'
 import { endLine, finishedLine, foldInbox, formatInbox, INBOX_FILE, routeLine, routedLine } from './inbox'
+import { publishPlan, runningKey, runningOf } from './running'
+import type { RunningRecord } from './running'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -326,6 +328,7 @@ export function installJobs(on: On, options: PluginOptions) {
     // Keep elapsed times moving while anything runs: only the jobs pane reads TICK.
     $.clock.every(2000, () => {
       if (RUNNING.size > 0) background($, 'the jobs tick', update($, TICK, n => (n + 1) % 1_000_000))
+      background($, 'the running jobs record', publishRunning($))
     })
     // --bg workers live outside this process: poll `claude agents --json`.
     $.clock.every(BG_POLL_MS, () => {
@@ -2399,6 +2402,21 @@ function debugLog($: EngineInterface, text: string): void {
  * unhandled. One comes when the environment that started it is gone (a reload mid-job, a test's end), as
  * the host then refuses that environment's $.state reads.
  */
+/** What this session last wrote under running:<id>, and when: other sessions' office panes read it. */
+let published: { sig: string; at: number } | undefined
+
+/** This session's running jobs, for every office pane: written on a change and as a heartbeat, deleted once none run. */
+async function publishRunning($: EngineInterface): Promise<void> {
+  const jobs = runningOf(await read($, JOBS))
+  const now = Date.now()
+  const plan = publishPlan(published, jobs, now)
+  if (plan === 'none') return
+  const sessionId = await $.session.id()
+  if (plan === 'delete') await $.store.delete(runningKey(sessionId))
+  else await $.store.set(runningKey(sessionId), { sessionId, updatedAt: now, jobs } satisfies RunningRecord)
+  published = { sig: JSON.stringify(jobs), at: now }
+}
+
 function background($: EngineInterface, what: string, work: Promise<unknown>): void {
   work.catch(err => debugLog($, `office: ${what} stopped: ${String(err)}`))
 }

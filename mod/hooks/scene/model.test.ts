@@ -60,10 +60,17 @@ describe('deriveCrew sessions', () => {
 })
 
 describe('deriveCrew workers', () => {
-  test('only worker jobs become crew, and never selectable', () => {
-    const crew = derive([], [job(), job({ id: 'j2', kind: 'codex-exec' }), job({ id: 'j3', kind: 'codex-review' })])
-    expect(crew.map(c => c.id)).toEqual(['j1'])
+  test('jobs become crew, never selectable; Codex reviews at the plain desk and walks out once it ends', () => {
+    const crew = derive([], [job(), job({ id: 'j2', kind: 'codex-exec' }), job({ id: 'j3', kind: 'codex-review', status: 'done', endedAt: NOW })])
+    expect(crew.map(c => c.id)).toEqual(['j1', 'j2', 'j3'])
     expect(crew[0]).toMatchObject({ role: 'worker', isSelectable: false, isSelf: false, state: 'working', room: 'coding' })
+    expect(crew[1]).toMatchObject({ isSelectable: false, state: 'working', room: 'review' })
+    expect(crew[2]).toMatchObject({ state: 'leaving', room: 'lobby' })
+  })
+  test("other sessions' Codex and headless jobs are drawn; their --bg workers are sessions already", () => {
+    const other = (id: string, kind: Job['kind'], mode?: Job['mode']) => ({ id, kind, label: id, startedAt: NOW, cwd: '/repo/a/sub', ...(mode ? { mode } : {}) })
+    const crew = deriveCrew([], [], {}, ROOTS, NOW, LINGER, [], [other('c1', 'codex-review'), other('h1', 'worker', 'headless'), other('b1', 'worker', 'bg')])
+    expect(crew.map(c => [c.id, c.room, c.project])).toEqual([['c1', 'review', '/repo/a'], ['h1', 'coding', '/repo/a']])
   })
   test('done worker: reporting, then leaving, then gone (boundaries)', () => {
     const at = (since: number, status: Job['status'] = 'done') => derive([], [job({ status, endedAt: NOW - since })])
