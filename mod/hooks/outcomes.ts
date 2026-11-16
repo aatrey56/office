@@ -34,7 +34,7 @@ export type SpawnFacts = {
 }
 
 export function spawnRecord(f: SpawnFacts): string {
-  return JSON.stringify({ kind: 'spawn', ...f, at: new Date(f.at).toISOString(), task: f.task.replace(/\s+/g, ' ').trim().slice(0, TASK_KEEP) })
+  return JSON.stringify({ kind: 'spawn', ...f, at: new Date(f.at).toISOString(), taskChars: f.task.length, task: f.task.replace(/\s+/g, ' ').trim().slice(0, TASK_KEEP) })
 }
 
 export type Verdict = 'passed' | 'rejected' | 'no-change' | 'unverified' | 'failed' | 'timeout' | 'stopped'

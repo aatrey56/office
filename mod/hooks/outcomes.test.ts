@@ -37,6 +37,7 @@ test('tokens count each assistant message once, at its largest usage', () => {
 test('the spawn record keeps the first 160 characters of the task', () => {
   const r = JSON.parse(spawnRecord({ job: 'j', at: 0, cwd: '/r', repo: 'r', branch: null, base: null, mode: 'bg', deliverable: 'commit', model: 'm', effort: 'low', chooser: 'router', routerPick: null, reason: null, task: 'x'.repeat(200) }))
   expect(r.task).toHaveLength(160)
+  expect(r.taskChars).toBe(200) // the full brief's length: does a longer brief push the router to opus?
   expect(r.kind).toBe('spawn')
 })
 
