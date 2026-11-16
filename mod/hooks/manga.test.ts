@@ -3,6 +3,7 @@ import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
 import { cachePath, fitPage, graphicsLikely, sipsArgv, unzipArgv } from './manga'
+import { coverCaption, coverDir, coverSource, coversPerRow, fitCaption, unzipListArgv, unzipOneArgv } from './manga-library'
 
 const HOME = '/Users/aatrey'
 const ROOT = `${HOME}/Manga`
@@ -188,6 +189,7 @@ type World = {
   cacheDirs?: Record<string, Entry[]>
   alwaysDirs?: Record<string, Entry[]> // on disk before and after, like the cache's per-series folder
   preexisting?: boolean // cache dirs are already on disk
+  zipList?: string[] // what `unzip -Z1` prints
 }
 
 function fakeCbzWorld(on: On, opts: World = {}) {
@@ -233,6 +235,7 @@ function fakeCbzWorld(on: On, opts: World = {}) {
   }))
   on('process.run', (_$, e) => {
     calls.push([...e.argv])
+    if (e.argv[1] === '-Z1') return { value: { exitCode: 0, stdout: (opts.zipList ?? []).join('\n'), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === 'unzip') unzipped.add(e.argv[6] ?? '')
     if (e.argv[0] === 'mv') made.add(e.argv[3] ?? '')
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -346,5 +349,53 @@ describe('/manga with cbz chapters', () => {
     expect(removed).toEqual(new Set([`${base}/old-2`, `${base}/old-3`])) // old-1 is oldest but resolves outside: refused
     expect(calls.some(c => c.includes('/Users/aatrey/Documents/old-1'))).toBe(false)
     for (const c of calls.filter(c => c[0] === 'rm')) expect(c[3]?.startsWith(`${CACHE}/`)).toBe(true)
+  })
+})
+
+describe('library', () => {
+  test('a cover file wins, then the first chapter; a folder with neither has none', () => {
+    const file = (name: string) => ({ name, kind: 'file' })
+    expect(coverSource([file('cover.webp'), file('Cover.PNG'), file('1.cbz')], '1.cbz')).toEqual({ kind: 'file', name: 'Cover.PNG' })
+    expect(coverSource([file('9.cbz')], '9.cbz')).toEqual({ kind: 'cbz', name: '9.cbz' })
+    expect(coverSource([{ name: '1', kind: 'dir' }], '1')).toEqual({ kind: 'dir', name: '1' })
+    expect(coverSource([file('notes.txt')], undefined)).toEqual({ kind: 'none' })
+  })
+
+  test('covers per row follow the pane width; captions fit under a cover', () => {
+    expect([coversPerRow(19), coversPerRow(42), coversPerRow(80), coversPerRow(100)]).toEqual([1, 2, 3, 4])
+    expect(coverCaption('Kingdom', '458')).toBe('Kingdom · ch 458')
+    expect(coverCaption('Kingdom', undefined)).toBe('Kingdom')
+    expect(fitCaption('Vagabond · ch 1234', 17)).toBe('Vagabond · ch 12…')
+  })
+
+  test('opening with no series shows the covers; a digit opens that series where it was left', async ($, on) => {
+    const store = fakeStore(on, { position: { series: 'Kingdom', chapter: cbzName(459), page: 1 } })
+    const opened = fakePanes(on)
+    const clock = mock.clock(on, { now: 1_000_000 })
+    const COVERS = coverDir(CACHE, 'Kingdom')
+    const { calls } = fakeCbzWorld(on, {
+      zipList: ['Kingdom 458/', 'Kingdom 458/10.jpg', 'Kingdom 458/2.jpg', 'Kingdom 458/1.jpg', '__MACOSX/Kingdom 458/._1.jpg', 'ComicInfo.xml'],
+    })
+    const ui = await $.ui.mount({ plugin: 'office', surface: 'terminal', component: 'Pane', requestId: 'manga', props: PANE_PROPS, viewport: { columns: 100, rows: 40 } })
+    expect(await ui.find({ type: 'Text', text: /Library · 1 series/ })).toBeDefined()
+    const pick = await ui.find({ type: 'Button', key: 'series-Kingdom' })
+    expect(pick?.props).toMatchObject({ hotkey: '1', label: 'Kingdom · ch 459' })
+    expect(await ui.find({ type: 'Image' })).toBeUndefined() // the title box until the cover is built
+
+    await clock.advance(0)
+    // Only the first page of the first chapter leaves the archive, converted into the cover cache.
+    expect(calls).toContainEqual(unzipListArgv(CBZ458))
+    expect(calls).toContainEqual(unzipOneArgv(CBZ458, 'Kingdom 458/1.jpg', COVERS))
+    expect(calls).not.toContainEqual(unzipArgv(CBZ458, DIR458))
+    expect(sipsCalls(calls)).toEqual([sipsArgv(`${COVERS}/1.jpg`, `${COVERS}/.cover.png.part.png`)])
+    expect((await ui.find({ type: 'Image', key: 'cover-Kingdom' }))?.props.source).toMatchObject({ file: `${COVERS}/cover.png` })
+
+    await ui.press({ key: 'series-Kingdom' })
+    expect(store.get('position')).toEqual({ series: 'Kingdom', chapter: cbzName(459), page: 1 })
+    expect(opened.at(-1)).toMatchObject({ id: 'manga', title: 'Manga: Kingdom', focus: true })
+    expect(await ui.find({ type: 'Text', text: /Ch 459 · 2\/3/ })).toBeDefined()
+    await ui.press({ key: 'library' }) // b, from the reader
+    expect(await ui.find({ type: 'Button', key: 'reader' })).toBeDefined()
+    await ui.unmount()
   })
 })
