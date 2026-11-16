@@ -2414,6 +2414,7 @@ async function publishRunning($: EngineInterface): Promise<void> {
   try {
     const jobs = runningOf(await read($, JOBS))
     const sessionId = await $.session.id()
+    if (endedSessions.has(sessionId)) return // its record went with session.end; never written back
     if (published !== undefined && published.sessionId !== sessionId) {
       await $.store.delete(runningKey(published.sessionId))
       published = undefined
@@ -2430,7 +2431,10 @@ async function publishRunning($: EngineInterface): Promise<void> {
 }
 
 /** A session that ends takes its running record with it; the process may go on under a new id (/clear, a resume). */
+const endedSessions = new Set<string>() // ids whose session.end came: their record is never published again
+
 async function dropRunning($: EngineInterface, sessionId: string): Promise<void> {
+  endedSessions.add(sessionId)
   await $.store.delete(runningKey(sessionId))
   if (published?.sessionId === sessionId) published = undefined
 }

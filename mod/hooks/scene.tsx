@@ -235,10 +235,11 @@ let shownRunning = '[]' // otherRecords' jobs when the list was last redrawn
 let self: Self | undefined
 
 // The session id is read again at each scan: after /clear or a resume the process goes on under a new
-// one, and what was read under the old identity is read again.
+// one; its own records under either id are dropped from what was read.
 function noteSelf(id: string): void {
   const next = selfAfter(self, id)
-  if (next !== self && self !== undefined) readRecords = new Map()
+  // Only this session's own keys (old and new id) go; other sessions' reads stay, in case the next key list fails.
+  if (next !== self && self !== undefined) readRecords = new Map([...readRecords].filter(([key]) => !isOwnKey(next, key)))
   self = next
 }
 

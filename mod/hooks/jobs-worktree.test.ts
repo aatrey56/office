@@ -1225,6 +1225,8 @@ describe('the office pane shows running jobs', () => {
     expect(keys()).toEqual(['running:self-2'])
     await $.session.end({ reason: 'clear', sessionId: 'self-2', resume: { id: 'self-2' } })
     expect(keys()).toEqual([])
+    await clock.advance(2_000) // the review still runs: the ended id's record is not written back
+    expect(keys()).toEqual([])
   })
 
   test('a running Codex review gets the running row and a crew member, and both go once it finishes', { options: { workerWorktree: 'off' } }, async ($, on) => {
