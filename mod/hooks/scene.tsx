@@ -508,13 +508,9 @@ export function installScene(on: On, options: PluginOptions) {
           <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', title: mangaTitle, focus: true })} />
         </Box>
         {picture}
-        {(claudeBudget || claudeContext) && (
-          <Box width={columns} justifyContent="space-between">
-            <Text dimColor wrap="truncate-end">{claudeBudget ? `claude ${claudeBudget}` : ''}</Text>
-            {claudeContext && <Text dimColor>{claudeContext}</Text>}
-          </Box>
-        )}
+        {claudeBudget && <Text dimColor wrap="truncate-end">{`claude ${claudeBudget}`}</Text>}
         {codex && <Text dimColor wrap="truncate-end">{codex}</Text>}
+        {claudeContext && <Text dimColor wrap="truncate-end">{claudeContext}</Text>}
         {debug && (
           <Text dimColor wrap="truncate-end">
             {`frames drawn ${stats.painted} · swapped ${stats.swapped} · last swap ${stats.last || 'none yet'} · timer ${timer ? `running, last tick ${Math.round((Date.now() - lastFrameAt) / 100) / 10}s ago` : 'stopped'} · ${box.graphics ? `picture ×${box.scale} ${lastPicture.file && fileFrames ? `file gen ${lastPicture.generation}` : 'inline'}` : 'cells'} · walking ${actors.filter(a => a.path.length > 0).length}`}
