@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { Job } from '../types'
-import { freshRecord, jobLabel, publishPlan, runningOf, runningRow, RUNNING_BEAT_MS, RUNNING_STALE_MS } from './running'
+import { freshRecord, freshRecords, isOwnKey, jobLabel, publishPlan, runningOf, runningRow, scanned, selfAfter, RUNNING_BEAT_MS, RUNNING_FUTURE_SKEW_MS, RUNNING_STALE_MS } from './running'
 import type { ShownJob } from './running'
 
 const NOW = 10_000_000
@@ -13,6 +13,25 @@ describe('running jobs', () => {
     expect(freshRecord(record, NOW)?.jobs.map(j => j.id)).toEqual(['a'])
     expect(freshRecord({ ...record, updatedAt: NOW - RUNNING_STALE_MS - 1 }, NOW)).toBeUndefined()
     expect(freshRecord('junk', NOW)).toBeUndefined()
+    // A heartbeat dated far ahead (a writer's clock set wrong) would otherwise never go stale.
+    expect(freshRecord({ ...record, updatedAt: NOW + RUNNING_FUTURE_SKEW_MS }, NOW)).toBeDefined()
+    expect(freshRecord({ ...record, updatedAt: NOW + RUNNING_FUTURE_SKEW_MS + 1 }, NOW)).toBeUndefined()
+  })
+
+  test('a failed read keeps what the last scan read there; freshness is checked at each use', () => {
+    const rec = (sessionId: string) => ({ sessionId, updatedAt: NOW, jobs: [{ id: 'a', kind: 'worker', label: 'x', startedAt: 1, cwd: '/r' }] })
+    const last = new Map<string, unknown>([['running:s1', rec('s1')], ['running:gone', rec('gone')]])
+    const held = scanned(last, [['running:s1', 'failed'], ['running:s2', { value: rec('s2') }], ['running:new', 'failed']])
+    expect([...held.keys()]).toEqual(['running:s1', 'running:s2'])
+    expect(freshRecords(held.values(), NOW + RUNNING_STALE_MS).map(r => r.sessionId)).toEqual(['s1', 's2'])
+    expect(freshRecords(held.values(), NOW + RUNNING_STALE_MS + 1)).toEqual([]) // a crashed session's jobs go though no scan ran
+  })
+
+  test('after /clear or a resume (a new id), records under the old id and the new are both its own', () => {
+    const first = selfAfter(undefined, 'old')
+    expect(selfAfter(first, 'old')).toBe(first)
+    const now = selfAfter(first, 'new')
+    expect(['running:old', 'running:new', 'running:other'].map(k => isOwnKey(now, k))).toEqual([true, true, false])
   })
 
   test('labels, and only live jobs are published: on a change, as a heartbeat, deleted once none run', () => {

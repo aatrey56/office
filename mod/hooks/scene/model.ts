@@ -2,7 +2,7 @@ import type { AgentRecord, Crew, CrewRole, CrewState, Job, ManagerEntry, RoomId,
 import { LOOKS } from './art'
 import { clip } from '../sessions'
 import { isRunning, jobLabel } from '../running'
-import type { RunningJob } from '../running'
+import type { OwnedJob } from '../running'
 
 // Who is in the office and where they belong. Pure: cards and jobs in, crew out.
 
@@ -13,6 +13,9 @@ const TAG_MAX = 24
 export function projectOf(cwd: string, roots: Record<string, string | null>): string {
   return roots[cwd] || cwd
 }
+
+// A job's character: job ids are unique only within one session, so its session goes first.
+export const jobCrewId = (sessionId: string, jobId: string): string => `${sessionId}:${jobId}`
 
 // Registry status ('busy' | 'idle' | 'waiting' | 'blocked' | ...) or a job status, as a crew state.
 export function stateOf(status: string, role: CrewRole): CrewState {
@@ -53,7 +56,8 @@ function workerTag(job: Job): string | undefined {
 // A `claude --bg` worker is also a registered session: it is drawn once, as the worker.
 // A Codex job reviews at the plain desk while it runs and walks out once it ends. `others` are
 // other sessions' running jobs (running.ts): their Codex and headless jobs are drawn too; their
-// --bg workers are sessions, and their subagent workers subagents, drawn already.
+// --bg workers are sessions, and their subagent workers subagents, drawn already. A job's
+// character is jobCrewId(its session, its id): `selfId` is this session's, for its own jobs.
 // `managers` is project → manager; that session's role is 'manager'. Seats are not set here.
 export function deriveCrew(
   cards: SessionCard[],
@@ -63,7 +67,8 @@ export function deriveCrew(
   now: number,
   lingerMs: number,
   agents: AgentRecord[] = [],
-  others: RunningJob[] = [],
+  others: OwnedJob[] = [],
+  selfId = '',
 ): Crew[] {
   const crew: Crew[] = []
   const workers = jobs.filter(j => j.kind === 'worker')
@@ -104,8 +109,9 @@ export function deriveCrew(
       if (state === 'reporting' && since >= lingerMs / 2) state = 'leaving'
     }
     const tag = workerTag(job)
+    const id = jobCrewId(selfId, job.id)
     crew.push({
-      id: job.id,
+      id,
       name: job.title.slice(0, NAME_MAX),
       role: 'worker',
       project: workerProject(job),
@@ -113,7 +119,7 @@ export function deriveCrew(
       room: roomFor(state, 'worker'),
       seat: { x: 0, y: 0 },
       facing: 'down',
-      look: lookOf(job.id, LOOKS),
+      look: lookOf(id, LOOKS),
       ...(tag ? { tag } : {}),
       isSelectable: false,
       isSelf: false,
@@ -163,12 +169,16 @@ export function deriveCrew(
   }
   for (const job of jobs) {
     if (job.kind === 'worker' || (job.endedAt !== undefined && now - job.endedAt > lingerMs)) continue
-    jobCrew(job.id, jobLabel(job), projectOf(job.cwd, roots), isRunning(job) ? 'working' : 'leaving', 'reviewing')
+    jobCrew(jobCrewId(selfId, job.id), jobLabel(job), projectOf(job.cwd, roots), isRunning(job) ? 'working' : 'leaving', 'reviewing')
   }
+  // A subagent worker not yet found in its session's transcripts stands in under its agent's id,
+  // the id it is drawn with once found: one character throughout, never two.
   for (const job of others) {
     const project = job.project || projectOf(job.cwd, roots)
-    if (job.kind !== 'worker') jobCrew(job.id, job.label, project, 'working', 'reviewing')
-    else if (job.mode === 'headless' || (job.mode === 'subagent' && !agents.some(a => a.id === job.agentId))) jobCrew(job.id, job.label, project, 'working')
+    const id = jobCrewId(job.sessionId, job.id)
+    if (job.kind !== 'worker') jobCrew(id, job.label, project, 'working', 'reviewing')
+    else if (job.mode === 'headless') jobCrew(id, job.label, project, 'working')
+    else if (job.mode === 'subagent' && !agents.some(a => a.id === job.agentId)) jobCrew(job.agentId ?? id, job.label, project, 'working')
   }
 
   return crew

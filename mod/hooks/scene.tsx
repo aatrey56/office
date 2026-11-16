@@ -7,8 +7,8 @@ import type { AgentFile } from './agents'
 import { budgetLine, contextLine, usageRows } from './budget'
 import { CODEX_LIMITS_REQUEST, codexLimitsArgv, codexLimitsFrom, codexUsageLine } from './codex-budget'
 import type { CodexLimits } from './codex-budget'
-import { freshRecord, isDroppable, RUNNING_PREFIX, runningKey, runningOf, runningRow, waitingText } from './running'
-import type { RunningRecord, ShownJob } from './running'
+import { freshRecords, isOwnKey, RUNNING_PREFIX, runningOf, runningRow, scanned, selfAfter, waitingText } from './running'
+import type { OwnedJob, RunningRecord, Self, ShownJob } from './running'
 import { chatLines, projectSlug, SLUG_MAX } from './sessions'
 import { officeArt, officeMap } from './scene/art'
 import { toCells, toPng } from './scene/encode'
@@ -225,35 +225,67 @@ async function scanAgents($: EngineInterface, cards: SessionCard[]): Promise<voi
   }
 }
 
-// Other sessions' running jobs, read from $.store every RUNNING_SCAN_MS in the background; this
-// session's own come from its job list. A record with an old heartbeat is ignored, a very old one deleted.
-let others: RunningRecord[] = []
-let runningScanAt = 0
-let selfId: string | undefined
+// Other sessions' running jobs, read from $.store every RUNNING_SCAN_MS in the background (one scan
+// at a time, timed by the monotonic clock); this session's own come from its job list. Readers never
+// delete a record, only ignore a stale one, checked at each use (otherRecords).
+let readRecords = new Map<string, unknown>() // running:<id> → what the last scan read there
+let runningScanAt = -Infinity
+let isScanningRunning = false
+let shownRunning = '[]' // otherRecords' jobs when the list was last redrawn
+let self: Self | undefined
+
+// The session id is read again at each scan: after /clear or a resume the process goes on under a new
+// one, and what was read under the old identity is read again.
+function noteSelf(id: string): void {
+  const next = selfAfter(self, id)
+  if (next !== self && self !== undefined) readRecords = new Map()
+  self = next
+}
+
+async function knowSelf($: EngineInterface): Promise<Self | undefined> {
+  if (self === undefined) noteSelf(await $.session.id())
+  return self
+}
+
+function otherRecords(): RunningRecord[] {
+  return freshRecords(readRecords.values(), Date.now())
+}
 
 async function scanRunning($: EngineInterface): Promise<void> {
-  if (Date.now() - runningScanAt < RUNNING_SCAN_MS) return
-  runningScanAt = Date.now()
-  selfId ??= await $.session.id()
-  const now = Date.now()
-  const found: RunningRecord[] = []
-  for (const key of await $.store.keys()) {
-    if (!key.startsWith(RUNNING_PREFIX) || key === runningKey(selfId)) continue
-    const raw = await $.store.get(key).catch(() => undefined)
-    if (isDroppable(raw, now)) await $.store.delete(key).catch(() => undefined)
-    const record = freshRecord(raw, now)
-    if (record && record.jobs.length > 0) found.push(record)
+  if (isScanningRunning || performance.now() - runningScanAt < RUNNING_SCAN_MS) return
+  isScanningRunning = true
+  runningScanAt = performance.now()
+  try {
+    noteSelf(await $.session.id())
+    const me = self!
+    const reads: [string, { value: unknown } | 'failed'][] = []
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(RUNNING_PREFIX) || isOwnKey(me, key)) continue
+      reads.push([key, await $.store.get(key).then(value => ({ value }), () => 'failed' as const)])
+    }
+    readRecords = scanned(readRecords, reads)
+  } catch {
+    // keep the last reads; each is still dropped once stale
+  } finally {
+    isScanningRunning = false
   }
-  const isChanged = JSON.stringify(found.map(r => r.jobs)) !== JSON.stringify(others.map(r => r.jobs))
-  others = found
-  if (isChanged) await update($, TICK, n => (n + 1) % 1_000_000)
+  const shown = JSON.stringify(otherRecords().map(r => r.jobs))
+  if (shown !== shownRunning) {
+    shownRunning = shown
+    await update($, TICK, n => (n + 1) % 1_000_000)
+  }
+}
+
+// Other sessions' fresh running jobs, each with its session.
+function otherJobs(): OwnedJob[] {
+  return otherRecords().flatMap(r => r.jobs.map(j => ({ ...j, sessionId: r.sessionId })))
 }
 
 // Every running job, this session's first, each with the session that started it.
-function runningJobs(jobs: Job[], cards: SessionCard[]): ShownJob[] {
+function runningJobs(jobs: Job[], cards: SessionCard[], selfId: string): ShownJob[] {
   const name = (id: string) => cards.find(c => c.sessionId === id)?.name ?? id.slice(0, 8)
-  const own = runningOf(jobs).map(j => ({ ...j, sessionId: selfId ?? '', owner: cards.find(c => c.isSelf)?.name ?? 'this session' }))
-  return [...own, ...others.flatMap(r => r.jobs.map(j => ({ ...j, sessionId: r.sessionId, owner: name(r.sessionId) })))]
+  const own = runningOf(jobs).map(j => ({ ...j, sessionId: selfId, owner: cards.find(c => c.isSelf)?.name ?? 'this session' }))
+  return [...own, ...otherJobs().map(j => ({ ...j, owner: name(j.sessionId) }))]
 }
 
 // The project shown: the one picked with [ ], else this session's, else the busiest.
@@ -268,12 +300,13 @@ async function currentCrew($: EngineInterface): Promise<{ crew: Crew[]; project:
   const cards = await read($, SESSIONS)
   const jobs = await read($, JOBS)
   const managers = await read($, MANAGERS)
-  const theirs = others.flatMap(r => r.jobs)
+  const selfId = (await knowSelf($).catch(() => undefined))?.id ?? ''
+  const theirs = otherJobs()
   void learnRoots($, [...cards.map(c => c.cwd), ...jobs.map(j => j.cwd), ...theirs.map(j => j.cwd)]).catch(() => undefined)
   void scanAgents($, cards).catch(() => undefined)
   void scanRunning($).catch(() => undefined)
   const known = roots
-  const everyone = deriveCrew(cards, jobs, managers, known, Date.now(), LINGER_MS, agents, theirs)
+  const everyone = deriveCrew(cards, jobs, managers, known, Date.now(), LINGER_MS, agents, theirs, selfId)
   const project = shownProject(everyone, await read($, PROJECT))
   if (project === null) return { crew: [], project, all: [], roots: known }
   seated = assignSeats(everyone, officeMap(), project, seated)
@@ -481,8 +514,7 @@ export function installScene(on: On, options: PluginOptions) {
     // Office-spawned workers only: subagents are drawn but never listed.
     const workers = crew.filter(c => !c.isSelectable && !agents.some(a => a.id === c.id))
     // The running row: the shown office's jobs; each names its session when more than one could own it.
-    selfId ??= await $.session.id().catch(() => undefined)
-    const running = runningJobs(await read($, JOBS), cards)
+    const running = runningJobs(await read($, JOBS), cards, self?.id ?? '')
     const shownJobs = running.filter(j => (j.project || projectOf(j.cwd, known)) === project).sort((a, b) => a.startedAt - b.startedAt)
     const withOwner = leads.length > 1 || shownJobs.some(j => !leads.some(l => l.id === j.sessionId))
     const runningText = runningRow(shownJobs, Date.now(), withOwner)

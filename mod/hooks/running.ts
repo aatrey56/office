@@ -18,16 +18,18 @@ export type RunningJob = {
 }
 /** What one session publishes; `updatedAt` is its heartbeat. */
 export type RunningRecord = { sessionId: string; updatedAt: number; jobs: RunningJob[] }
+/** A running job with the session that started it: job ids are unique only within one session. */
+export type OwnedJob = RunningJob & { sessionId: string }
 /** A running job in a pane, with the session that started it. */
-export type ShownJob = RunningJob & { sessionId: string; owner: string }
+export type ShownJob = OwnedJob & { owner: string }
 
 export const RUNNING_PREFIX = 'running:'
 /** A record whose heartbeat is older than this is ignored: its session crashed or went away. */
 export const RUNNING_STALE_MS = 2 * 60_000
+/** A record dated further ahead than this is ignored too: its writer's clock is wrong. */
+export const RUNNING_FUTURE_SKEW_MS = 2 * 60_000
 /** A session with jobs running writes its record again this often, even when nothing changed. */
 export const RUNNING_BEAT_MS = 30_000
-/** Readers delete a record this old: no live session leaves its heartbeat that long. */
-export const RUNNING_DROP_MS = 60 * 60_000
 
 export const runningKey = (sessionId: string): string => `${RUNNING_PREFIX}${sessionId}`
 
@@ -72,7 +74,8 @@ export function runningOf(jobs: Job[]): RunningJob[] {
     }))
 }
 
-/** What the publisher does now: write on a change or a due heartbeat, delete once nothing runs. */
+/** What the publisher does now: write on a change or a due heartbeat, delete once nothing runs.
+ *  `now` and `last.at` are a monotonic clock's (performance.now()), so a wall clock set back never stops the beat. */
 export function publishPlan(last: { sig: string; at: number } | undefined, jobs: RunningJob[], now: number): 'set' | 'delete' | 'none' {
   const sig = JSON.stringify(jobs)
   if (last !== undefined && last.sig === sig && (jobs.length === 0 || now - last.at < RUNNING_BEAT_MS)) return 'none'
@@ -81,12 +84,14 @@ export function publishPlan(last: { sig: string; at: number } | undefined, jobs:
 
 const KINDS: readonly string[] = ['worker', 'codex-review', 'codex-exec']
 
-/** A stored record when it is well formed and its heartbeat is fresh; else undefined (ignored). */
+/** A stored record when it is well formed and its heartbeat is fresh (at most RUNNING_STALE_MS old, at
+ *  most RUNNING_FUTURE_SKEW_MS ahead); else undefined (ignored). Readers never delete: only its session does. */
 export function freshRecord(raw: unknown, now: number): RunningRecord | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined
   const r = raw as Partial<RunningRecord>
   if (typeof r.sessionId !== 'string' || typeof r.updatedAt !== 'number' || !Array.isArray(r.jobs)) return undefined
-  if (now - r.updatedAt > RUNNING_STALE_MS) return undefined
+  const age = now - r.updatedAt
+  if (age > RUNNING_STALE_MS || age < -RUNNING_FUTURE_SKEW_MS) return undefined
   const jobs = r.jobs.filter(
     (j): j is RunningJob =>
       typeof j === 'object' && j !== null && typeof j.id === 'string' && KINDS.includes(j.kind) &&
@@ -95,11 +100,30 @@ export function freshRecord(raw: unknown, now: number): RunningRecord | undefine
   return { sessionId: r.sessionId, updatedAt: r.updatedAt, jobs }
 }
 
-/** True for a record no live session would leave behind (old heartbeat, or junk): safe to delete. */
-export function isDroppable(raw: unknown, now: number): boolean {
-  const at = typeof raw === 'object' && raw !== null ? (raw as { updatedAt?: unknown }).updatedAt : undefined
-  return typeof at !== 'number' || now - at > RUNNING_DROP_MS
+/** The records with jobs that are fresh `now`, of what the scans read: checked at each use, so a crashed
+ *  session's jobs go after RUNNING_STALE_MS even while the store cannot be read again. */
+export function freshRecords(raws: Iterable<unknown>, now: number): RunningRecord[] {
+  return [...raws].map(raw => freshRecord(raw, now)).filter((r): r is RunningRecord => r !== undefined && r.jobs.length > 0)
 }
+
+/** What one scan holds: each key it read, or, where a read failed, what the last scan held for that key. */
+export function scanned(last: ReadonlyMap<string, unknown>, reads: [key: string, read: { value: unknown } | 'failed'][]): Map<string, unknown> {
+  const out = new Map<string, unknown>()
+  for (const [key, read] of reads) {
+    if (read !== 'failed') out.set(key, read.value)
+    else if (last.has(key)) out.set(key, last.get(key))
+  }
+  return out
+}
+
+/** Who this process is and has been: after /clear or a resume it goes on under a new session id, with no
+ *  session.start; a record under any of its ids is its own, never another session's. */
+export type Self = { id: string; past: string[] }
+export function selfAfter(self: Self | undefined, id: string): Self {
+  if (self === undefined) return { id, past: [] }
+  return self.id === id ? self : { id, past: [...self.past.filter(p => p !== id), self.id] }
+}
+export const isOwnKey = (self: Self, key: string): boolean => key === runningKey(self.id) || self.past.some(id => key === runningKey(id))
 
 /** "<1m", "6m", "1h5m". */
 export function elapsedText(ms: number): string {

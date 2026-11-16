@@ -281,6 +281,11 @@ function labelOf(job: Job): string {
 }
 
 export function installJobs(on: On, options: PluginOptions) {
+  // A distinct matcher: manage.tsx holds the other session.end hook.
+  on('session.end', { sessionId: /./ }, async ($, e, next) => {
+    await dropRunning($, e.sessionId).catch(() => undefined) // ending is never held up by this
+    return next(e)
+  })
   // A distinct matcher: the module holds other session.start hooks.
   on('session.start', { cwd: /^\// }, async ($, e, next) => {
     const started = await next(e)
@@ -2397,26 +2402,44 @@ function debugLog($: EngineInterface, text: string): void {
   }
 }
 
+/** What this session last wrote under running:<sessionId>, and when (performance.now()): other sessions' office panes read it. */
+let published: { sessionId: string; sig: string; at: number } | undefined
+let isPublishing = false
+
+/** This session's running jobs, for every office pane: written on a change and as a heartbeat, deleted once none run.
+ *  It only ever deletes its own record; after /clear or a resume (a new id, no session.start) the old one goes first. */
+async function publishRunning($: EngineInterface): Promise<void> {
+  if (isPublishing) return
+  isPublishing = true
+  try {
+    const jobs = runningOf(await read($, JOBS))
+    const sessionId = await $.session.id()
+    if (published !== undefined && published.sessionId !== sessionId) {
+      await $.store.delete(runningKey(published.sessionId))
+      published = undefined
+    }
+    const at = performance.now()
+    const plan = publishPlan(published, jobs, at)
+    if (plan === 'none') return
+    if (plan === 'delete') await $.store.delete(runningKey(sessionId))
+    else await $.store.set(runningKey(sessionId), { sessionId, updatedAt: Date.now(), jobs } satisfies RunningRecord)
+    published = { sessionId, sig: JSON.stringify(jobs), at }
+  } finally {
+    isPublishing = false
+  }
+}
+
+/** A session that ends takes its running record with it; the process may go on under a new id (/clear, a resume). */
+async function dropRunning($: EngineInterface, sessionId: string): Promise<void> {
+  await $.store.delete(runningKey(sessionId))
+  if (published?.sessionId === sessionId) published = undefined
+}
+
 /**
  * Work nothing awaits (a timer's, or one left running past its hook): a rejection is logged, never left
  * unhandled. One comes when the environment that started it is gone (a reload mid-job, a test's end), as
  * the host then refuses that environment's $.state reads.
  */
-/** What this session last wrote under running:<id>, and when: other sessions' office panes read it. */
-let published: { sig: string; at: number } | undefined
-
-/** This session's running jobs, for every office pane: written on a change and as a heartbeat, deleted once none run. */
-async function publishRunning($: EngineInterface): Promise<void> {
-  const jobs = runningOf(await read($, JOBS))
-  const now = Date.now()
-  const plan = publishPlan(published, jobs, now)
-  if (plan === 'none') return
-  const sessionId = await $.session.id()
-  if (plan === 'delete') await $.store.delete(runningKey(sessionId))
-  else await $.store.set(runningKey(sessionId), { sessionId, updatedAt: now, jobs } satisfies RunningRecord)
-  published = { sig: JSON.stringify(jobs), at: now }
-}
-
 function background($: EngineInterface, what: string, work: Promise<unknown>): void {
   work.catch(err => debugLog($, `office: ${what} stopped: ${String(err)}`))
 }
