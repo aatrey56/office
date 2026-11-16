@@ -93,9 +93,24 @@ export function budgetLine(windows: RateWindow[]): string {
 
 const kTokens = (n: number) => `${Math.round(n / 1000)}k`
 
-// "ctx 42% · 116k left" beside the budget line; '' before the first response reports a fill.
+// "context 42% · 116k left" under the Codex row; '' before the first response reports a fill.
 export function contextLine(context: { tokens?: number; window: number; percent?: number }): string {
   if (context.tokens === undefined || context.window <= 0) return ''
   const percent = context.percent ?? Math.round((context.tokens / context.window) * 100)
-  return `ctx ${percent}% · ${kTokens(Math.max(0, context.window - context.tokens))} left`
+  return `context ${percent}% · ${kTokens(Math.max(0, context.window - context.tokens))} left`
+}
+
+// The usage rows ("claude 5h 7% · week 2%", "context 5% · 950k left") lined up in columns: label, then each
+// " · " part padded to the widest in its column. Empty rows are dropped.
+export function usageRows(rows: string[]): string[] {
+  const split = rows.filter(Boolean).map(r => {
+    const at = r.indexOf(' ')
+    return at < 0 ? [r] : [r.slice(0, at), ...r.slice(at + 1).split(' · ')]
+  })
+  const widths: number[] = []
+  for (const cells of split) cells.forEach((c, i) => (widths[i] = Math.max(widths[i] ?? 0, c.length)))
+  return split.map(cells => {
+    const [label, ...parts] = cells.map((c, i) => (i < cells.length - 1 ? c.padEnd(widths[i]!) : c))
+    return parts.length ? `${label} ${parts.join(' · ')}` : label!.trimEnd()
+  })
 }

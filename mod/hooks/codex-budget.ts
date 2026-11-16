@@ -1,4 +1,5 @@
 import type { RateWindow } from '../types'
+import { budgetLine } from './budget'
 
 // The Codex budget guard's pure half: reading the account's rate limits from
 // `codex app-server`, parsing a quota hit's reset time, and the verdict before
@@ -146,6 +147,58 @@ export function codexGuardVerdict(
   return { isAllowed: false, reason: `Codex budget guard refused: ${what} (limit ${CODEX_REFUSE_PCT}%).` }
 }
 
+/** Lines changed above which a deep review needs the person's yes: one huge diff can drain the deep model's quota in a single run. */
+export const CODEX_DEEP_MAX_LINES = 5000
+
+/** A deep size check: allowed, or the person must confirm (`reason` is the refusal when they do not, or cannot be asked). */
+export type CodexDeepSizeVerdict =
+  | { isAllowed: true; warning?: string }
+  | { isAllowed: false; needsConfirmation: true; lines: string; reason: string }
+
+function deepSizeText(changedLines: number): { lines: string; limit: string } {
+  return { lines: `${changedLines.toLocaleString('en-US')} changed lines`, limit: CODEX_DEEP_MAX_LINES.toLocaleString('en-US') }
+}
+
+/**
+ * Before a deep review: a diff over CODEX_DEEP_MAX_LINES changed lines needs the person's confirmation.
+ * `changedLines` undefined (git could not measure it) is allowed. `isForced` (only the person's typed
+ * /codex-review --force) lets it start, with a warning. The caller asks; its `reason` stands when no yes comes.
+ */
+export function codexDeepSizeVerdict(changedLines: number | undefined, isForced: boolean): CodexDeepSizeVerdict {
+  if (changedLines === undefined || changedLines <= CODEX_DEEP_MAX_LINES) return { isAllowed: true }
+  const { lines, limit } = deepSizeText(changedLines)
+  if (isForced) return { isAllowed: true, warning: `Forced past the deep size limit: this review is ${lines} (limit ${limit}).` }
+  return {
+    isAllowed: false,
+    needsConfirmation: true,
+    lines,
+    reason:
+      `DEEP REVIEW REFUSED: this review is ${lines}, over the deep limit of ${limit}, and the person was not asked or did not confirm. ` +
+      'To run it anyway, the person types /codex-review --deep --force (plus the target). ' +
+      'Otherwise review without deep, or a narrower target (--commit <sha>, or a smaller branch).',
+  }
+}
+
+/** The question put to the person for a deep review that needs confirmation. */
+export function codexDeepConfirmQuestion(model: string, lines: string): string {
+  return `Deep review (${model}) of ${lines}, over the ${CODEX_DEEP_MAX_LINES.toLocaleString('en-US')}-line limit. It can use a large share of the deep quota. Run it?`
+}
+
+export const CODEX_DEEP_CONFIRM_YES = 'Run deep review'
+export const CODEX_DEEP_CONFIRM_OPTIONS = [CODEX_DEEP_CONFIRM_YES, 'Cancel']
+
+/** What follows the person's answer: 'Run deep review' starts it with a warning; anything else refuses (a Cancel says so). */
+export function codexDeepAnswerVerdict(
+  verdict: Extract<CodexDeepSizeVerdict, { needsConfirmation: true }>,
+  answer: string | undefined,
+): CodexVerdict {
+  if (answer === CODEX_DEEP_CONFIRM_YES) return { isAllowed: true, warning: `Confirmed past the deep size limit: this review is ${verdict.lines} (limit ${CODEX_DEEP_MAX_LINES.toLocaleString('en-US')}).` }
+  if (answer === 'Cancel') {
+    return { isAllowed: false, reason: `Deep review cancelled: the person declined to run ${verdict.lines}. Review without deep, or a narrower target (--commit <sha>).` }
+  }
+  return { isAllowed: false, reason: verdict.reason }
+}
+
 /** `/codex-review` args: `--deep`, `--force` and `--model <m>` anywhere; the rest is the target. */
 export function parseCodexReviewArgs(raw: string | undefined): { deep: boolean; force: boolean; model?: string; rest: string } {
   const words = (raw ?? '').trim().split(/\s+/).filter(Boolean)
@@ -161,4 +214,20 @@ export function parseCodexReviewArgs(raw: string | undefined): { deep: boolean; 
     else rest.push(w)
   }
   return { deep, force, model, rest: rest.join(' ') }
+}
+
+/** A reading older than this no longer stands for the 5-hour window, so the office shows none. */
+export const CODEX_USAGE_STALE_MS = 60 * 60_000
+
+/** "codex 5h 30% · week 12%" for the scene header, each window at its most used bucket; a window past its reset is left out, '' with no fresh reading. */
+export function codexUsageLine(limits: CodexLimits | undefined, now: number): string {
+  if (!limits || !Array.isArray(limits.buckets) || now - limits.at > CODEX_USAGE_STALE_MS) return ''
+  const byKind = new Map<string, RateWindow>()
+  const live = limits.buckets.flatMap(b => b.windows).filter(w => w.resetsAt === undefined || Date.parse(w.resetsAt) > now)
+  for (const w of live) {
+    const seen = byKind.get(w.kind)
+    if (seen === undefined || w.percentUsed > seen.percentUsed) byKind.set(w.kind, w)
+  }
+  const line = budgetLine([...byKind.values()])
+  return line ? `codex ${line}` : ''
 }
