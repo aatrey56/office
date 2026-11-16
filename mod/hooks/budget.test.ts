@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { budgetVerdict, contextLine, DEFAULT_CAPS } from './budget'
+import { budgetVerdict, contextLine, DEFAULT_CAPS, usageRows } from './budget'
 
 const none = { isSmall: false, isExplicit: false, isForced: false }
 const five = (percentUsed: number, resetsAt?: string) => ({ kind: 'five_hour', percentUsed, resetsAt })
@@ -49,5 +49,15 @@ describe('contextLine', () => {
   })
   test('empty before the first reading', () => {
     expect(contextLine({ window: 200_000 })).toBe('')
+  })
+})
+
+describe('usageRows', () => {
+  test('labels and parts line up in columns; empty rows drop out', () => {
+    expect(usageRows(['claude 5h 0% · week 24%', 'codex 5h 100% · week 22%', '', 'ctx 4% · 959k left'])).toEqual([
+      'claude 5h 0%   · week 24%',
+      'codex  5h 100% · week 22%',
+      'ctx    4%      · 959k left',
+    ])
   })
 })

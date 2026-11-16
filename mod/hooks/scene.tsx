@@ -4,7 +4,7 @@ import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import type { Actor, AgentRecord, ChatLine, Crew, Job, MangaShelf, ManagerEntry, RateWindow, SessionCard } from '../types'
 import { freshAgentFiles, parseAgent, subagentsDir } from './agents'
 import type { AgentFile } from './agents'
-import { budgetLine, contextLine } from './budget'
+import { budgetLine, contextLine, usageRows } from './budget'
 import { CODEX_LIMITS_REQUEST, codexLimitsArgv, codexLimitsFrom, codexUsageLine } from './codex-budget'
 import type { CodexLimits } from './codex-budget'
 import { chatLines, projectSlug, SLUG_MAX } from './sessions'
@@ -508,9 +508,11 @@ export function installScene(on: On, options: PluginOptions) {
           <Button plain key="manga" label="manga" hotkey="b" onPress={() => $.ui.open({ id: 'manga', title: mangaTitle, focus: true })} />
         </Box>
         {picture}
-        {claudeBudget && <Text dimColor wrap="truncate-end">{`claude ${claudeBudget}`}</Text>}
-        {codex && <Text dimColor wrap="truncate-end">{codex}</Text>}
-        {claudeContext && <Text dimColor wrap="truncate-end">{claudeContext}</Text>}
+        {usageRows([claudeBudget && `claude ${claudeBudget}`, codex, claudeContext]).map(row => (
+          <Text key={row.split(' ')[0]} dimColor wrap="truncate-end">
+            {row}
+          </Text>
+        ))}
         {debug && (
           <Text dimColor wrap="truncate-end">
             {`frames drawn ${stats.painted} · swapped ${stats.swapped} · last swap ${stats.last || 'none yet'} · timer ${timer ? `running, last tick ${Math.round((Date.now() - lastFrameAt) / 100) / 10}s ago` : 'stopped'} · ${box.graphics ? `picture ×${box.scale} ${lastPicture.file && fileFrames ? `file gen ${lastPicture.generation}` : 'inline'}` : 'cells'} · walking ${actors.filter(a => a.path.length > 0).length}`}
