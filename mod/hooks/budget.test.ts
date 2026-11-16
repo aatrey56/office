@@ -45,7 +45,7 @@ describe('budgetVerdict', () => {
 
 describe('contextLine', () => {
   test('percent used and tokens left', () => {
-    expect(contextLine({ tokens: 84_000, window: 200_000, percent: 42 })).toBe('ctx 42% · 116k left')
+    expect(contextLine({ tokens: 84_000, window: 200_000, percent: 42 })).toBe('context 42% · 116k left')
   })
   test('empty before the first reading', () => {
     expect(contextLine({ window: 200_000 })).toBe('')
@@ -54,10 +54,10 @@ describe('contextLine', () => {
 
 describe('usageRows', () => {
   test('labels and parts line up in columns; empty rows drop out', () => {
-    expect(usageRows(['claude 5h 0% · week 24%', 'codex 5h 100% · week 22%', '', 'ctx 4% · 959k left'])).toEqual([
-      'claude 5h 0%   · week 24%',
-      'codex  5h 100% · week 22%',
-      'ctx    4%      · 959k left',
+    expect(usageRows(['claude 5h 0% · week 24%', 'codex 5h 100% · week 22%', '', 'context 4% · 959k left'])).toEqual([
+      'claude  5h 0%   · week 24%',
+      'codex   5h 100% · week 22%',
+      'context 4%      · 959k left',
     ])
   })
 })
