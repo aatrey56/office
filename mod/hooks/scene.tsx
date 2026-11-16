@@ -226,8 +226,8 @@ async function currentCrew($: EngineInterface): Promise<{ crew: Crew[]; project:
   const cards = await read($, SESSIONS)
   const jobs = await read($, JOBS)
   const managers = await read($, MANAGERS)
-  void learnRoots($, [...cards.map(c => c.cwd), ...jobs.map(j => j.cwd)])
-  void scanAgents($, cards)
+  void learnRoots($, [...cards.map(c => c.cwd), ...jobs.map(j => j.cwd)]).catch(() => undefined)
+  void scanAgents($, cards).catch(() => undefined)
   const everyone = deriveCrew(cards, jobs, managers, roots, Date.now(), LINGER_MS, agents)
   const project = shownProject(everyone, await read($, PROJECT))
   if (project === null) return { crew: [], project, all: [] }
@@ -319,7 +319,7 @@ function startTimer($: EngineInterface): void {
   timer?.cancel()
   lastFrameAt = Date.now()
   timer = $.clock.every(FRAME_MS, () => {
-    void frame($)
+    void frame($).catch(() => undefined)
   })
 }
 
