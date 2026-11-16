@@ -17,12 +17,22 @@ export type ReviewRound = {
 /** Branch key (git common dir + branch) → its rounds, oldest first. */
 export type RoundLedger = Record<string, ReviewRound[]>
 
+/** Any branch's rounds go this long after its last round, whatever git says: the store cannot grow without bound. */
+export const ROUND_CAP_MS = 90 * 86_400_000
+/** The default branch's and a detached HEAD's rounds: each kept this long, as these never merge or go away. */
 export const ROUND_TTL_MS = 14 * 86_400_000
 export const FINDINGS_MAX = 4096
 
+const MAIN_BRANCHES = ['main', 'master']
+
+/** The key prefix of one repo's branches. */
+export function repoPrefix(commonDir: string): string {
+  return `${commonDir.trim().replace(/\/+$/, '')}#`
+}
+
 /** One key per branch of a repo, the same from its main checkout and from every worktree. */
 export function branchKey(commonDir: string, branch: string): string {
-  return `${commonDir.trim().replace(/\/+$/, '')}#${branch.trim() || 'HEAD'}`
+  return `${repoPrefix(commonDir)}${branch.trim() || 'HEAD'}`
 }
 
 function isRound(r: unknown): r is ReviewRound {
@@ -30,12 +40,72 @@ function isRound(r: unknown): r is ReviewRound {
   return typeof o?.sha === 'string' && typeof o.jobId === 'string' && typeof o.at === 'number'
 }
 
-/** The stored ledger, read defensively, without rounds older than ROUND_TTL_MS or branches left empty. */
+/** The stored ledger, read defensively, without branches whose last round is ROUND_CAP_MS old or that are left empty. */
 export function parseLedger(raw: unknown, now: number): RoundLedger {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
   const out: RoundLedger = {}
   for (const [key, rounds] of Object.entries(raw)) {
-    const kept = Array.isArray(rounds) ? rounds.filter(isRound).filter(r => now - r.at < ROUND_TTL_MS) : []
+    const kept = Array.isArray(rounds) ? rounds.filter(isRound) : []
+    if (kept.length > 0 && now - Math.max(...kept.map(r => r.at)) < ROUND_CAP_MS) out[key] = kept
+  }
+  return out
+}
+
+/** Whether a branch is the default branch or a detached HEAD: its rounds keep the fixed ROUND_TTL_MS, not the branch's life. */
+export function isDefaultBranch(branch: string): boolean {
+  return branch === 'HEAD' || MAIN_BRANCHES.includes(branch)
+}
+
+/**
+ * The repo's branches with rounds whose life can end, each with the sha whose merge ends it: its newest
+ * covering round's HEAD (a round of uncommitted changes on a fresh branch sits on main already). No such round: no sha.
+ */
+export function branchProbes(ledger: RoundLedger, commonDir: string): { branch: string; sha?: string }[] {
+  const prefix = repoPrefix(commonDir)
+  return Object.entries(ledger).flatMap(([key, rounds]) => {
+    const branch = key.slice(prefix.length)
+    if (!key.startsWith(prefix) || isDefaultBranch(branch)) return []
+    const sha = rounds.filter(r => r.isCovering === true).at(-1)?.sha
+    return [{ branch, ...(sha !== undefined ? { sha } : {}) }]
+  })
+}
+
+/** The main-branch refs among a repo's refs (`git for-each-ref` of refs/heads and refs/remotes/origin), local and on origin. */
+export function mainRefs(refs: readonly string[] | undefined): string[] {
+  const wanted = MAIN_BRANCHES.flatMap(b => [`refs/heads/${b}`, `refs/remotes/origin/${b}`])
+  return wanted.filter(ref => refs?.includes(ref) === true)
+}
+
+/** What git says of a branch; undefined when git could not tell, which keeps its rounds. */
+export type BranchLife = { isGone?: boolean; isMerged?: boolean }
+
+/** A branch is gone when neither it nor origin's copy is among the refs; undefined refs (git failed): unknown. */
+export function isGoneIn(branch: string, refs: readonly string[] | undefined): boolean | undefined {
+  return refs === undefined ? undefined : !refs.includes(`refs/heads/${branch}`) && !refs.includes(`refs/remotes/origin/${branch}`)
+}
+
+/** Merged when any main ref holds the sha; not merged only when every answer is a clear no. */
+export function mergedOf(answers: readonly (boolean | undefined)[]): boolean | undefined {
+  if (answers.includes(true)) return true
+  return answers.length > 0 && answers.every(a => a === false) ? false : undefined
+}
+
+/**
+ * The ledger with one repo's finished rounds dropped: a branch merged into main/master or gone
+ * locally and on origin loses all of them; the default branch and a detached HEAD lose the ones
+ * past ROUND_TTL_MS. A branch git could not tell about, and every other repo's branch, keeps them.
+ */
+export function retainedLedger(ledger: RoundLedger, commonDir: string, lives: Readonly<Record<string, BranchLife>>, now: number): RoundLedger {
+  const prefix = repoPrefix(commonDir)
+  const out: RoundLedger = {}
+  for (const [key, rounds] of Object.entries(ledger)) {
+    const branch = key.slice(prefix.length)
+    const life = lives[branch]
+    const kept = !key.startsWith(prefix)
+      ? rounds
+      : isDefaultBranch(branch)
+        ? rounds.filter(r => now - r.at < ROUND_TTL_MS)
+        : life?.isGone === true || life?.isMerged === true ? [] : rounds
     if (kept.length > 0) out[key] = kept
   }
   return out

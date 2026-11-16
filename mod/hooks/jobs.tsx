@@ -51,10 +51,11 @@ import {
 } from './codex-budget'
 import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
 import {
-  branchKey, CODEX_OUT_FALLBACK_TEXT, isUsageLimit, parseLedger, parsePending, planCovers, planReviewRound, roundOf, roundTiers,
-  roundTitle, settledAll, SETTLE_PREFIX, shortstatLines, textLines, UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
+  branchKey, branchProbes, CODEX_OUT_FALLBACK_TEXT, isGoneIn, isUsageLimit, mainRefs, mergedOf, parseLedger, parsePending, planCovers,
+  planReviewRound, retainedLedger, roundOf, roundTiers, roundTitle, settledAll, SETTLE_PREFIX, shortstatLines, textLines,
+  UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
 } from './codex-rounds'
-import type { PendingSettle, RoundFacts, RoundLedger, RoundPlan, RoundPolicy } from './codex-rounds'
+import type { BranchLife, PendingSettle, RoundFacts, RoundLedger, RoundPlan, RoundPolicy } from './codex-rounds'
 import {
   CLAUDE_SYSTEM,
   claudePrompt,
@@ -1991,8 +1992,11 @@ async function bookRound(
   if (!head || !commonDir) return undefined
   const key = branchKey(commonDir, (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD'])) ?? '')
   const isIncremental = !facts.isPerson && facts.target === undefined && !facts.isFull
+  // this repo's merged or deleted branches lose their rounds; asked before the lock, like the diff size
+  const lives = await branchLives($, cwd, commonDir, (await readLedgerLocked($, now)).ledger)
+  const retained = (ledger: RoundLedger) => retainedLedger(ledger, commonDir, lives, now)
   const measureLast = async () => {
-    const last = (await readLedgerLocked($, now)).ledger[key]?.at(-1) // the reconciled ledger, as the lock will see it
+    const last = retained((await readLedgerLocked($, now)).ledger)[key]?.at(-1) // the reconciled ledger, as the lock will see it
     return last !== undefined && last.isCovering === true && isIncremental
       ? { sha: last.sha, since: await sinceSha($, cwd, last.sha) }
       : undefined
@@ -2001,7 +2005,9 @@ async function bookRound(
   try {
     for (let attempt = 1; ; attempt++) {
       const booked = await withLock($, ROUNDS_LOCK, async () => {
-        const { stored, ledger, pending } = await readLedgerLocked($, now)
+        const read = await readLedgerLocked($, now)
+        const { stored, pending } = read
+        const ledger = retained(read.ledger)
         const rounds = ledger[key] ?? []
         const last = rounds.at(-1)
         const isMeasured = measured !== undefined && measured.sha === last?.sha
@@ -2031,6 +2037,31 @@ async function bookRound(
     if (err instanceof CapLockBusy) return ROUNDS_BUSY_TEXT
     throw err
   }
+}
+
+/**
+ * What git says of this repo's branches with rounds: gone (no ref here or on origin), or merged (the
+ * sha that ends them is on main/master, local or origin's). A failed git call leaves the answer undefined.
+ */
+async function branchLives($: EngineInterface, cwd: string, commonDir: string, ledger: RoundLedger): Promise<Record<string, BranchLife>> {
+  const probes = branchProbes(ledger, commonDir)
+  if (probes.length === 0) return {}
+  const listed = await gitOut($, cwd, ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes/origin'])
+  const refs = listed?.split('\n').filter(Boolean)
+  const mains = mainRefs(refs)
+  const lives: Record<string, BranchLife> = {}
+  for (const { branch, sha } of probes) {
+    const isGone = isGoneIn(branch, refs)
+    const answers = isGone === false && sha !== undefined ? await Promise.all(mains.map(main => isAncestorOf($, cwd, sha, main))) : []
+    lives[branch] = { isGone, isMerged: mergedOf(answers) }
+  }
+  return lives
+}
+
+/** `git merge-base --is-ancestor`: exit 0 yes, 1 no, anything else (an unknown sha, a failed run) undefined. */
+async function isAncestorOf($: EngineInterface, cwd: string, sha: string, ref: string): Promise<boolean | undefined> {
+  const r = await $.process.run(['git', 'merge-base', '--is-ancestor', sha, ref], { cwd, timeoutMs: 30000 }).catch(() => undefined)
+  return r?.exitCode === 0 ? true : r?.exitCode === 1 ? false : undefined
 }
 
 /** The ledger as stored, with the pending settlements applied. Only reads: safe with or without the rounds lock. */
