@@ -85,6 +85,8 @@ export type MangaShelf = {
   ready: boolean[]
   loading: boolean
 }
+// A series' cover PNG in the cache, ready to draw; generation changes when it is rebuilt.
+export type MangaCover = { file: string; generation: number }
 
 // ── scene (scene/*.ts / scene.tsx) ───────────────────────────────────────
 // The pixel office. Everything under hooks/scene/ is pure: the map and the crew go in,
@@ -212,6 +214,8 @@ declare module 'claude-code' {
       shelf: MangaShelf
       chapter: number
       page: number
+      covers: Record<string, MangaCover> // series -> its built cover
+      library: boolean // the manga pane shows the library over an open series
       // scene
       sceneTick: number // bumped by the animation timer while the scene is up; read only by the scene
       sceneSelected: string | null // the selected crew id (leads and managers only)

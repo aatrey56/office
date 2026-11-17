@@ -1,7 +1,36 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On } from 'claude-code'
 
-import type { MangaShelf } from '../types'
+import type { MangaCover, MangaShelf } from '../types'
+import {
+  COVER_COLUMNS,
+  COVER_GAP,
+  COVER_PNG,
+  COVER_ROWS,
+  PROGRESS_PREFIX,
+  archivePages,
+  baseName,
+  coverCaption,
+  coverDir,
+  coverFresh,
+  coverHotkey,
+  coverLockPath,
+  coverSource,
+  coverStaging,
+  coversPerRow,
+  fitCaption,
+  inRows,
+  legacyProgress,
+  mergedProgress,
+  ownProgress,
+  progressKey,
+  toMigrate,
+  unzipListArgv,
+  unzipOneArgv,
+  zipListing,
+} from './manga-library'
+import type { Position } from './manga-library'
+import { CAP_LOCK_HELD, capLockArgv } from './spawn'
 
 // ~/Manga/<Series>/<chapter>: a chapter is a folder of PNGs or a .cbz/.zip of images.
 // A cbz is unpacked into ~/Library/Caches/office-manga (never into ~/Manga) and its pages
@@ -17,8 +46,8 @@ const EMPTY_HINT = 'Drop chapter folders of PNGs into ~/Manga/<Series>/ (convert
 const shelf = atom({ plugin: 'office', key: 'shelf' } as const, { series: '', chapters: [], pages: [], dir: '', ready: [], loading: false } as MangaShelf)
 const chapter = atom({ plugin: 'office', key: 'chapter' } as const, 0)
 const page = atom({ plugin: 'office', key: 'page' } as const, 0)
-
-type Position = { series: string; chapter: string | null; page: number }
+const covers = atom({ plugin: 'office', key: 'covers' } as const, {} as Record<string, MangaCover>)
+const library = atom({ plugin: 'office', key: 'library' } as const, false)
 
 // ── pure logic (no `$`), covered by manga.test.ts ────────────────────────
 export const LAST = Number.MAX_SAFE_INTEGER // "last page", clamped once the chapter is listed
@@ -279,7 +308,144 @@ function prefetchNext($: EngineInterface, series: string, chapters: string[], c:
   $.clock.after(0, () => void prefetchChapter($, series, name).catch(() => prefetched.delete(`${series}/${name}`)))
 }
 
+// A wait for another session's build of the same cover: longer than one build's unzips and sips.
+const COVER_LOCK_WAIT_MS = 150_000
+let coverBuilds = 0
+
+// The per-series cover lock, the way jobs.tsx takes its capacity lock: the kernel's flock on `path`, held
+// by a perl child (capLockArgv) until `release` ends it, and dropped with that child however it ends, so a
+// crashed build leaves no stale lock. Undefined when another session held it past the wait; a release that
+// does nothing when perl cannot run (each build's own staging still keeps the files apart).
+async function takeCoverLock($: EngineInterface, path: string): Promise<(() => Promise<void>) | undefined> {
+  let holder: ReturnType<EngineInterface['process']['spawn']> | undefined
+  const release = async () => {
+    await holder?.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
+  }
+  let isTimedOut = false
+  try {
+    holder = $.process.spawn({ argv: capLockArgv(path, COVER_LOCK_WAIT_MS) })
+    void holder.result.catch(() => undefined)
+    let out = ''
+    for (let piece = await holder.next(); ; piece = await holder.next()) {
+      if (piece.done) {
+        isTimedOut = out === '' && piece.value?.code === 1
+        break
+      }
+      if (piece.value.stream === 'stdout') out += piece.value.text
+      if (out.startsWith(CAP_LOCK_HELD)) return release
+    }
+  } catch {
+    // perl missing or refused: no cross-session lock
+  }
+  await release()
+  return isTimedOut ? undefined : async () => undefined
+}
+
+// Builds the cover in a staging folder of this build's own, renames the finished PNG over `file` and then
+// writes the marker; the staging folder, and only it, is removed after. False when no cover came out.
+async function stageCover($: EngineInterface, pick: { kind: string }, source: string, dir: string, stat: { size: number; mtimeMs: number }) {
+  const staging = coverStaging(dir, `${await $.clock.now()}-${Math.random().toString(36).slice(2, 8)}-${++coverBuilds}`)
+  await $.process.run(['mkdir', '-p', staging])
+  try {
+    let src = baseName(source)
+    if (pick.kind === 'cbz') {
+      const listed = await $.process.run(unzipListArgv(source), { timeoutMs: 30000 })
+      if (listed.exitCode > 1) throw new Error(`unzip -Z1 exited ${listed.exitCode}`)
+      const pages = archivePages(zipListing(listed.stdout))
+      const first = planPages(pages.map(baseName))[0]
+      const entry = first && pages.find(x => baseName(x) === first.src)
+      if (!first || !entry) return false
+      const ran = await $.process.run(unzipOneArgv(source, entry, staging), { timeoutMs: 60000 })
+      if (ran.exitCode > 1) throw new Error(`unzip exited ${ran.exitCode}`)
+      src = first.src
+    } else {
+      await $.process.run(['cp', '-f', source, `${staging}/${src}`])
+    }
+    if (!(await convertPage($, staging, { src, png: COVER_PNG }))) return false
+    // One rename within the cover dir: a reader sees the old cover or the new one, never part of one.
+    const moved = await $.process.run(['mv', '-f', `${staging}/${COVER_PNG}`, `${dir}/${COVER_PNG}`])
+    if (moved.exitCode !== 0) return false
+    await $.fs.write(`${dir}/${MARKER}`, JSON.stringify({ source, size: stat.size, mtimeMs: stat.mtimeMs }))
+    return true
+  } finally {
+    await removeCacheDir($, staging)
+  }
+}
+
+// The cover of one series, built once into its cache dir and reused while its source is unchanged:
+// cover.* in the folder, else the first page of the first chapter (one file out of a cbz).
+// Sessions share the cache, so a build holds the series' lock and checks again once it has it.
+async function buildCover($: EngineInterface, series: string) {
+  const { manga, cache } = await roots($)
+  const base = `${manga}/${series}`
+  const pick = coverSource(await $.fs.list(base), (await listChapters($, series))[0])
+  if (pick.kind === 'none') return
+  let source = `${base}/${pick.name}` // the file whose size and mtime say the cover is current
+  if (pick.kind === 'dir') {
+    const files = (await $.fs.list(source)).filter(x => x.kind === 'file').map(x => x.name)
+    const first = planPages(files)[0]
+    if (!first) return
+    source = `${source}/${first.src}`
+  }
+  const dir = coverDir(cache, series)
+  const file = `${dir}/${COVER_PNG}`
+  const stat = await $.fs.stat(source)
+  const current = async () => coverFresh(await readMarker($, dir), source, stat) && (await $.fs.exists(file))
+  if (!(await current())) {
+    const release = await takeCoverLock($, coverLockPath(cache, series))
+    if (!release) return
+    try {
+      if (!(await current()) && !(await stageCover($, pick, source, dir, stat))) return
+    } finally {
+      await release()
+    }
+  }
+  await update($, covers, cur => ({ ...cur, [series]: { file, generation: Math.floor(stat.mtimeMs) } }))
+}
+
+// Once per series per session, one after another, off the render; a failure leaves the title box.
+const coversTried = new Set<string>()
+function startCovers($: EngineInterface, all: string[]) {
+  const fresh = all.filter(s => !coversTried.has(s))
+  if (fresh.length === 0) return
+  for (const s of fresh) coversTried.add(s)
+  $.clock.after(0, () => {
+    void (async () => {
+      for (const s of fresh) await buildCover($, s).catch(() => undefined)
+    })()
+  })
+}
+
 // ── state writers (handlers only, never while rendering) ─────────────────
+// The legacy map of every series' place, from before each had its own key (manga-library.ts).
+const LEGACY_PROGRESS = 'progress'
+
+async function readProgress($: EngineInterface) {
+  const keys = (await $.store.keys()).filter(k => k.startsWith(PROGRESS_PREFIX))
+  const own = ownProgress(await Promise.all(keys.map(async k => [k, await $.store.get(k)] as [string, unknown])))
+  const map = await $.store.get(LEGACY_PROGRESS)
+  return { own, map, legacy: legacyProgress(map, await $.store.get('position')) }
+}
+
+// Each series' place under its own key, so the library can resume any of them, and `position` for the
+// last series read. The legacy records move to their own keys first: `position` may hold another
+// series' only bookmark, and it is about to be replaced.
+async function savePosition($: EngineInterface, at: Position) {
+  const { own, map, legacy } = await readProgress($)
+  for (const [s, p] of Object.entries(toMigrate(own, legacy))) {
+    // checked again just before: another session may have saved that series meanwhile
+    if (s !== at.series && (await $.store.get(progressKey(s))) === undefined) await $.store.set(progressKey(s), p)
+  }
+  await $.store.set(progressKey(at.series), at)
+  await $.store.set('position', at)
+  if (map !== undefined) await $.store.delete(LEGACY_PROGRESS)
+}
+
+async function savedProgress($: EngineInterface): Promise<Record<string, Position>> {
+  const { own, legacy } = await readProgress($)
+  return mergedProgress(own, legacy)
+}
+
 async function openChapter($: EngineInterface, series: string, index: number, atPage: number) {
   const chapters = await listChapters($, series)
   const i = clamp(index, 0, chapters.length - 1)
@@ -315,7 +481,7 @@ async function openChapter($: EngineInterface, series: string, index: number, at
   await update($, shelf, () => ({ series, chapters, pages, dir, ready, loading: false }))
   await update($, chapter, () => i)
   await update($, page, () => p)
-  await $.store.set('position', { series, chapter: name ?? null, page: p } satisfies Position)
+  await savePosition($, { series, chapter: name ?? null, page: p })
 
   if (ready.some(r => !r)) $.clock.after(0, () => void convertRest($, dir, plans, p).catch(() => undefined))
   if (needsPrefetch(p, pages.length)) prefetchNext($, series, chapters, i)
@@ -327,7 +493,7 @@ async function turn($: EngineInterface, delta: number) {
   const to = step(c, await read($, page), delta, pages.length, chapters.length)
   if (to.chapter !== c) return openChapter($, series, to.chapter, to.page)
   await update($, page, () => to.page)
-  await $.store.set('position', { series, chapter: chapters[c] ?? null, page: to.page } satisfies Position)
+  await savePosition($, { series, chapter: chapters[c] ?? null, page: to.page })
   if (needsPrefetch(to.page, pages.length)) prefetchNext($, series, chapters, c)
 }
 
@@ -345,6 +511,14 @@ function noteTerminalColumns(columns: number | undefined) {
 }
 
 // Loads the saved place (or the `asked` series) into the shelf; text says what opened or why not.
+// A cover pressed in the library: that series at its own saved place, the pane retitled.
+async function openSeries($: EngineInterface, series: string) {
+  const loaded = await loadReader($, series)
+  if (!loaded.ok) return $.ui.toast(`manga: ${loaded.text}`)
+  // A press's open may not pass through this plugin's own ui.open hook, so it names the set itself.
+  await $.ui.open({ id: PANE, title: `Manga: ${series}`, closeOnEscape: true, rows: 200, focus: true })
+}
+
 async function loadReader($: EngineInterface, asked = ''): Promise<{ ok: boolean; text: string }> {
   const all = await listSeries($)
   if (all.length === 0) return { ok: false, text: EMPTY_HINT }
@@ -362,10 +536,11 @@ async function loadReader($: EngineInterface, asked = ''): Promise<{ ok: boolean
   if (chapters.length === 0) return { ok: false, text: `No chapters in ~/Manga/${series}/. ${EMPTY_HINT}` }
 
   // A saved chapter that is gone (deleted, renamed) falls back to the first one, at its page 0.
-  const resume = saved?.series === series ? saved : undefined
+  const resume = (await savedProgress($))[series]
   const found = resume?.chapter ? chapters.indexOf(resume.chapter) : -1
   const at = Math.max(0, found)
   await openChapter($, series, at, found >= 0 ? (resume?.page ?? 0) : 0)
+  await update($, library, () => false)
   return { ok: true, text: `Opened ${series} / Ch ${chapterLabel(chapters[at])}.` }
 }
 
@@ -377,7 +552,7 @@ export function installManga(on: On) {
   // Fullscreen docks the pane beside the transcript, floor to ceiling, `columns` wide;
   // the main screen seats it inline, `rows` asking for all the height the layout spares.
   on('ui.open', { id: PANE }, async ($, e, next) => {
-    if (!(await read($, shelf)).series) await loadReader($)
+    // No series open: the pane shows the library, so nothing loads here.
     const { series } = await read($, shelf)
     return next({
       ...e,
@@ -408,7 +583,7 @@ export function installManga(on: On) {
     const opened = await $.ui.open({ id: PANE, focus: true })
     const where = opened.isPlaced ? '' : ` (pane waits: ${opened.reason})`
     const tip = e.presentation.isFullscreen ? '' : ' Tip: /tui fullscreen docks the reader beside the chat.'
-    return { text: `${loaded.text} Keys: j/k page, h/l chapter, o office tab, Tab switches tabs, Esc closes.${where}${tip}` }
+    return { text: `${loaded.text} Keys: j/k page, h/l chapter, b library, o office tab, Tab switches tabs, Esc closes.${where}${tip}` }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -429,6 +604,7 @@ export function installManga(on: On) {
         <Button plain key="prev" label="Prev" hotkey="j" onPress={() => turn($, -1)} />
         <Button plain autoFocus key="next" label="Next" hotkey="k" onPress={() => turn($, 1)} />
         <Button plain key="next-ch" label="Next ch" hotkey="l" onPress={() => jump($, 1)} />
+        <Button plain key="library" label="Library" hotkey="b" onPress={() => update($, library, () => true)} />
         <Button plain key="office" label="Office" hotkey="o" onPress={() => $.ui.open({ id: 'office', title: 'Office', focus: true })} />
         <Text dimColor>
           {chapters[c] ? `Ch ${chapterLabel(chapters[c])}` : '-'} · {pages.length ? p + 1 : 0}/{pages.length}
@@ -436,6 +612,58 @@ export function installManga(on: On) {
         <Text dimColor>Esc closes</Text>
       </Box>
     )
+
+    const all = !series || (await read($, library)) ? await listSeries($) : []
+    if (all.length > 0) {
+      const drawCovers = !!Image && graphics
+      if (drawCovers) startCovers($, all)
+      const built = await read($, covers)
+      const progress = await savedProgress($)
+      const perRow = coversPerRow(e.props.bodyColumns || 80)
+      const tile = (s: string, i: number, width?: number) => {
+        const hotkey = coverHotkey(i)
+        const caption = coverCaption(s, progress[s]?.chapter ? chapterLabel(progress[s]?.chapter ?? undefined) : undefined)
+        const label = width ? fitCaption(caption, width - (hotkey ? 3 : 0)) : caption
+        return <Button plain key={`series-${s}`} label={label} {...(hotkey ? { hotkey } : {})} onPress={() => openSeries($, s)} />
+      }
+      const cover = (s: string) => {
+        const art = built[s]
+        return Image && art ? (
+          <Image key={`cover-${s}`} source={{ file: art.file, format: 'png', generation: art.generation }} columns={COVER_COLUMNS} rows={COVER_ROWS} alt={s} />
+        ) : (
+          <Box width={COVER_COLUMNS} height={COVER_ROWS} borderStyle="round" borderDimColor justifyContent="center" alignItems="center">
+            <Text dimColor wrap="truncate">{s}</Text>
+          </Box>
+        )
+      }
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Box gap={1}>
+            {series ? <Button plain key="reader" label="Reader" hotkey="b" onPress={() => update($, library, () => false)} /> : null}
+            <Button plain key="office" label="Office" hotkey="o" onPress={() => $.ui.open({ id: 'office', title: 'Office', focus: true })} />
+            <Text dimColor>
+              Library · {all.length} series{all.length > 9 ? ' · 1-9 the first nine' : ''}
+            </Text>
+            <Text dimColor>Esc closes</Text>
+          </Box>
+          {drawCovers ? (
+            inRows(all, perRow).map((row, r) => (
+              <Box key={`row-${r}`} gap={COVER_GAP}>
+                {row.map((s, j) => (
+                  <Box key={`tile-${s}`} flexDirection="column" width={COVER_COLUMNS}>
+                    {cover(s)}
+                    {tile(s, r * perRow + j, COVER_COLUMNS)}
+                  </Box>
+                ))}
+              </Box>
+            ))
+          ) : (
+            <Box flexDirection="column">{all.map((s, i) => tile(s, i))}</Box>
+          )}
+          {!graphics && <Text dimColor>{noGraphicsHint(await $.session.id())}</Text>}
+        </Box>
+      )
+    }
 
     if (!series) {
       return (
