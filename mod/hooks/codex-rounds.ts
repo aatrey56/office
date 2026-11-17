@@ -17,12 +17,22 @@ export type ReviewRound = {
 /** Branch key (git common dir + branch) → its rounds, oldest first. */
 export type RoundLedger = Record<string, ReviewRound[]>
 
+/** Any branch's rounds go this long after its last round, whatever git says: the store cannot grow without bound. */
+export const ROUND_CAP_MS = 90 * 86_400_000
+/** The default branch's and a detached HEAD's rounds: each kept this long (applied when the ledger is read), as these never merge or go away. */
 export const ROUND_TTL_MS = 14 * 86_400_000
 export const FINDINGS_MAX = 4096
 
+const MAIN_BRANCHES = ['main', 'master']
+
+/** The key prefix of one repo's branches. */
+export function repoPrefix(commonDir: string): string {
+  return `${commonDir.trim().replace(/\/+$/, '')}#`
+}
+
 /** One key per branch of a repo, the same from its main checkout and from every worktree. */
 export function branchKey(commonDir: string, branch: string): string {
-  return `${commonDir.trim().replace(/\/+$/, '')}#${branch.trim() || 'HEAD'}`
+  return `${repoPrefix(commonDir)}${branch.trim() || 'HEAD'}`
 }
 
 function isRound(r: unknown): r is ReviewRound {
@@ -30,13 +40,89 @@ function isRound(r: unknown): r is ReviewRound {
   return typeof o?.sha === 'string' && typeof o.jobId === 'string' && typeof o.at === 'number'
 }
 
-/** The stored ledger, read defensively, without rounds older than ROUND_TTL_MS or branches left empty. */
+/**
+ * The stored ledger, read defensively: a default-branch or detached-HEAD key loses its rounds past ROUND_TTL_MS
+ * (no git needed), any other branch whose last round is ROUND_CAP_MS old goes, and so does a key left empty.
+ */
 export function parseLedger(raw: unknown, now: number): RoundLedger {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
   const out: RoundLedger = {}
   for (const [key, rounds] of Object.entries(raw)) {
-    const kept = Array.isArray(rounds) ? rounds.filter(isRound).filter(r => now - r.at < ROUND_TTL_MS) : []
-    if (kept.length > 0) out[key] = kept
+    const valid = Array.isArray(rounds) ? rounds.filter(isRound) : []
+    const kept = isDefaultKey(key) ? valid.filter(r => now - r.at < ROUND_TTL_MS) : valid
+    if (kept.length > 0 && now - Math.max(...kept.map(r => r.at)) < ROUND_CAP_MS) out[key] = kept
+  }
+  return out
+}
+
+/** A key of a default branch or a detached HEAD, without knowing its repo (a branch literally named `x#main` counts too). */
+function isDefaultKey(key: string): boolean {
+  return ['HEAD', ...MAIN_BRANCHES].some(b => key.endsWith(`#${b}`))
+}
+
+/** The branch of `git symbolic-ref -q HEAD` (refs/heads/<branch>, never git's ambiguous short form); '' for a detached HEAD. */
+export function branchOfRef(ref: string | undefined): string {
+  return ref?.startsWith('refs/heads/') === true ? ref.slice('refs/heads/'.length) : ''
+}
+
+/** Whether a branch is the default branch or a detached HEAD: its rounds keep the fixed ROUND_TTL_MS, not the branch's life. */
+export function isDefaultBranch(branch: string): boolean {
+  return branch === 'HEAD' || MAIN_BRANCHES.includes(branch)
+}
+
+/** Which round a verdict was probed for: a ledger whose newest round differs was changed since, and is not judged by it. */
+export function roundId(r: ReviewRound | undefined): string {
+  return r === undefined ? '' : `${r.jobId}@${r.sha}@${r.at}`
+}
+
+/**
+ * The repo's branches with rounds whose life can end, each with the sha whose merge ends it: its newest
+ * covering round's HEAD (a round of uncommitted changes on a fresh branch sits on main already). No such round: no sha.
+ * `last` is its newest round, the one the verdict is bound to.
+ */
+export function branchProbes(ledger: RoundLedger, commonDir: string): { branch: string; last: string; sha?: string }[] {
+  const prefix = repoPrefix(commonDir)
+  return Object.entries(ledger).flatMap(([key, rounds]) => {
+    const branch = key.slice(prefix.length)
+    if (!key.startsWith(prefix) || isDefaultBranch(branch)) return []
+    const sha = rounds.filter(r => r.isCovering === true).at(-1)?.sha
+    return [{ branch, last: roundId(rounds.at(-1)), ...(sha !== undefined ? { sha } : {}) }]
+  })
+}
+
+/** The main-branch refs, local and on origin: a branch is merged when one of them holds its sha. */
+export const MAIN_REFS = MAIN_BRANCHES.flatMap(b => [`refs/heads/${b}`, `refs/remotes/origin/${b}`])
+
+/**
+ * The refs whose existence keeps a branch alive: its own, here and on origin. A key `heads/<b>` may be
+ * git's ambiguous short form of branch <b> (stored before keys used the full ref), so <b>'s refs keep it too.
+ */
+export function liveRefs(branch: string): string[] {
+  const names = branch.startsWith('heads/') ? [branch, branch.slice('heads/'.length)] : [branch]
+  return names.flatMap(b => [`refs/heads/${b}`, `refs/remotes/origin/${b}`])
+}
+
+/** What git says of a branch, for its newest round `last`; an undefined answer (git could not tell) keeps its rounds. */
+export type BranchLife = { last: string; isGone?: boolean; isMerged?: boolean }
+
+/** Yes when any answer is yes; no only when every answer is a clear no; otherwise unknown. */
+export function anyYes(answers: readonly (boolean | undefined)[]): boolean | undefined {
+  if (answers.includes(true)) return true
+  return answers.length > 0 && answers.every(a => a === false) ? false : undefined
+}
+
+/**
+ * The ledger with one repo's finished rounds dropped: a branch merged into main/master or gone
+ * locally and on origin loses all of them, but only when its newest round is still the one git was
+ * asked about. A branch git could not tell about, one booked since, and every other repo's branch keep them.
+ */
+export function retainedLedger(ledger: RoundLedger, commonDir: string, lives: Readonly<Record<string, BranchLife>>): RoundLedger {
+  const prefix = repoPrefix(commonDir)
+  const out: RoundLedger = {}
+  for (const [key, rounds] of Object.entries(ledger)) {
+    const life = key.startsWith(prefix) ? lives[key.slice(prefix.length)] : undefined
+    const isOver = life !== undefined && life.last === roundId(rounds.at(-1)) && (life.isGone === true || life.isMerged === true)
+    if (!isOver) out[key] = rounds
   }
   return out
 }

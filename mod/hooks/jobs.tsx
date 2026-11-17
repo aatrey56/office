@@ -53,10 +53,11 @@ import {
 } from './codex-budget'
 import type { CodexLimits, CodexOut, CodexVerdict } from './codex-budget'
 import {
-  branchKey, CODEX_OUT_FALLBACK_TEXT, isUsageLimit, parseLedger, parsePending, planCovers, planReviewRound, roundOf, roundTiers,
-  roundTitle, settledAll, SETTLE_PREFIX, shortstatLines, textLines, UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
+  anyYes, branchKey, branchOfRef, branchProbes, CODEX_OUT_FALLBACK_TEXT, isUsageLimit, liveRefs, MAIN_REFS, parseLedger, parsePending,
+  planCovers, planReviewRound, retainedLedger, roundOf, roundTiers, roundTitle, settledAll, SETTLE_PREFIX, shortstatLines, textLines,
+  UNTRACKED_MAX_FILES, UNTRACKED_MAX_LINES,
 } from './codex-rounds'
-import type { PendingSettle, RoundFacts, RoundLedger, RoundPlan, RoundPolicy } from './codex-rounds'
+import type { BranchLife, PendingSettle, RoundFacts, RoundLedger, RoundPlan, RoundPolicy } from './codex-rounds'
 import {
   CLAUDE_SYSTEM,
   claudePrompt,
@@ -2127,11 +2128,17 @@ async function bookRound(
   const head = await gitOut($, cwd, ['rev-parse', 'HEAD'])
   const commonDir = await gitOut($, cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
   if (!head || !commonDir) return undefined
-  const branch = (await gitOut($, cwd, ['symbolic-ref', '--short', '-q', 'HEAD']))?.trim() || undefined
+  const branch = branchOfRef(await gitOut($, cwd, ['symbolic-ref', '-q', 'HEAD'])) || undefined
   const key = branchKey(commonDir, branch ?? '')
   const isIncremental = !facts.isPerson && facts.target === undefined && !facts.isFull
+  // this repo's merged or deleted branches lose their rounds; asked before the lock, like the diff size,
+  // each verdict bound to the branch's newest round then, so a round booked meanwhile is not dropped by it
+  let lives: Record<string, BranchLife> = {}
+  const retained = (ledger: RoundLedger) => retainedLedger(ledger, commonDir, lives)
   const measureLast = async () => {
-    const last = (await readLedgerLocked($, now)).ledger[key]?.at(-1) // the reconciled ledger, as the lock will see it
+    const read = (await readLedgerLocked($, now)).ledger
+    lives = await branchLives($, cwd, commonDir, read)
+    const last = retained(read)[key]?.at(-1) // the reconciled ledger, as the lock will see it
     return last !== undefined && last.isCovering === true && isIncremental
       ? { sha: last.sha, since: await sinceSha($, cwd, last.sha) }
       : undefined
@@ -2140,7 +2147,9 @@ async function bookRound(
   try {
     for (let attempt = 1; ; attempt++) {
       const booked = await withLock($, ROUNDS_LOCK, async () => {
-        const { stored, ledger, pending } = await readLedgerLocked($, now)
+        const read = await readLedgerLocked($, now)
+        const { stored, pending } = read
+        const ledger = retained(read.ledger)
         const rounds = ledger[key] ?? []
         const last = rounds.at(-1)
         const isMeasured = measured !== undefined && measured.sha === last?.sha
@@ -2170,6 +2179,37 @@ async function bookRound(
     if (err instanceof CapLockBusy) return ROUNDS_BUSY_TEXT
     throw err
   }
+}
+
+/**
+ * What git says of this repo's branches with rounds: gone (no ref here or on origin), or merged (the
+ * sha that ends them is on main/master, local or origin's). A failed git call leaves the answer undefined.
+ * Each ref is checked on its own, so no listing can come back cut short.
+ */
+async function branchLives($: EngineInterface, cwd: string, commonDir: string, ledger: RoundLedger): Promise<Record<string, BranchLife>> {
+  const probes = branchProbes(ledger, commonDir)
+  if (probes.length === 0) return {}
+  const mains = (await Promise.all(MAIN_REFS.map(async ref => ((await refExists($, cwd, ref)) ? [ref] : [])))).flat()
+  const lives: Record<string, BranchLife> = {}
+  for (const { branch, last, sha } of probes) {
+    const exists = anyYes(await Promise.all(liveRefs(branch).map(ref => refExists($, cwd, ref))))
+    const isGone = exists === undefined ? undefined : !exists
+    const answers = isGone === false && sha !== undefined ? await Promise.all(mains.map(main => isAncestorOf($, cwd, sha, main))) : []
+    lives[branch] = { last, isGone, isMerged: anyYes(answers) }
+  }
+  return lives
+}
+
+/** `git show-ref --verify --quiet`: exit 0 the ref exists, 1 it does not, anything else (a failed run) undefined. */
+async function refExists($: EngineInterface, cwd: string, ref: string): Promise<boolean | undefined> {
+  const r = await $.process.run(['git', 'show-ref', '--verify', '--quiet', ref], { cwd, timeoutMs: 30000 }).catch(() => undefined)
+  return r?.exitCode === 0 ? true : r?.exitCode === 1 ? false : undefined
+}
+
+/** `git merge-base --is-ancestor`: exit 0 yes, 1 no, anything else (an unknown sha, a failed run) undefined. */
+async function isAncestorOf($: EngineInterface, cwd: string, sha: string, ref: string): Promise<boolean | undefined> {
+  const r = await $.process.run(['git', 'merge-base', '--is-ancestor', sha, ref], { cwd, timeoutMs: 30000 }).catch(() => undefined)
+  return r?.exitCode === 0 ? true : r?.exitCode === 1 ? false : undefined
 }
 
 /** The ledger as stored, with the pending settlements applied. Only reads: safe with or without the rounds lock. */

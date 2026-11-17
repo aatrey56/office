@@ -2,8 +2,8 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { CODEX_DEFAULTS } from './codex'
 import {
-  CODEX_OUT_FALLBACK_TEXT, coversBranch, FINDINGS_MAX, isUsageLimit, parseLedger, planCovers, planReviewRound, ROUND_TTL_MS, roundTiers,
-  roundTitle, settledLedger, shortstatLines, textLines,
+  anyYes, branchOfRef, branchProbes, CODEX_OUT_FALLBACK_TEXT, coversBranch, FINDINGS_MAX, isUsageLimit, liveRefs, parseLedger, planCovers,
+  planReviewRound, retainedLedger, ROUND_CAP_MS, ROUND_TTL_MS, roundId, roundTiers, roundTitle, settledLedger, shortstatLines, textLines,
 } from './codex-rounds'
 import type { ReviewRound, RoundFacts } from './codex-rounds'
 
@@ -110,14 +110,50 @@ describe('codex review rounds', () => {
     expect(planReviewRound(facts({ head: A, isDirty: true }), policy)).toMatchObject({ isAllowed: true, isRereview: true })
   })
 
-  test('the ledger drops rounds past 14 days and failed rounds, and truncates kept findings', () => {
-    const now = ROUND_TTL_MS + 10
+  test('the ledger drops branches whose last round is past the safety cap and failed rounds, and truncates kept findings', () => {
+    const now = ROUND_CAP_MS + 10
     const ledger = parseLedger({ k: [{ ...round(A), at: 5 }, { ...round(B), at: 20 }], old: [{ ...round(A), at: 0 }], junk: 'x' }, now)
     expect(Object.keys(ledger)).toEqual(['k'])
-    expect(ledger.k!.map(r => r.sha)).toEqual([B])
-    const kept = settledLedger(ledger, `j-${B}`, 'x'.repeat(FINDINGS_MAX + 100))
+    expect(ledger.k!.map(r => r.sha)).toEqual([A, B]) // a live branch keeps its older rounds
+    const ledger2 = { k: [{ ...round(B), at: 20 }] }
+    const kept = settledLedger(ledger2, `j-${B}`, 'x'.repeat(FINDINGS_MAX + 100))
     expect(kept.k![0]!.findings!.length).toBeLessThan(FINDINGS_MAX + 20)
-    expect(settledLedger(ledger, `j-${B}`, undefined)).toEqual({})
+    expect(settledLedger(ledger2, `j-${B}`, undefined)).toEqual({})
+  })
+
+  test('a branch keeps its rounds while it lives: merged or deleted drops them, a failed git call keeps them', () => {
+    const DAY = 86_400_000
+    const now = 40 * DAY
+    const month = [{ ...round(A, '[P1] x.ts:3 off by one'), at: now - 30 * DAY }]
+    const last = roundId(month[0])
+    const ledger = { '/r/.git#live': month, '/r/.git#merged': month, '/r/.git#gone': month, '/r/.git#unknown': month, '/s/.git#gone': month }
+    const lives = { live: { last, isGone: false, isMerged: false }, merged: { last, isGone: false, isMerged: true }, gone: { last, isGone: true }, unknown: { last } }
+    const kept = retainedLedger(ledger, '/r/.git/', lives)
+    expect(Object.keys(kept)).toEqual(['/r/.git#live', '/r/.git#unknown', '/s/.git#gone']) // another repo's branch is not judged here
+    expect(planReviewRound(facts({ rounds: kept['/r/.git#live']! }), policy)).toMatchObject({ round: 2, isRereview: true, tier: CODEX_DEFAULTS.rereview })
+    // a verdict probed outside the lock judges only the round it was asked about: a round booked since keeps the branch
+    const rebooked = { '/r/.git#merged': [{ ...round(B), jobId: 'other', at: now }] }
+    expect(retainedLedger(rebooked, '/r/.git', lives)).toEqual(rebooked)
+    expect(branchProbes({ ...ledger, '/r/.git#main': month, '/r/.git#wip': [{ ...round(A), isCovering: false }] }, '/r/.git').map(p => [p.branch, p.sha, p.last])).toEqual(
+      [['live', A, last], ['merged', A, last], ['gone', A, last], ['unknown', A, last], ['wip', undefined, roundId(round(A))]],
+    )
+    expect([anyYes([false, true]), anyYes([false, false]), anyYes([false, undefined]), anyYes([])]).toEqual([true, false, undefined, undefined])
+  })
+
+  test('a branch is named from its full ref: a tag of the same name cannot make a live branch look deleted', () => {
+    expect([branchOfRef('refs/heads/feature'), branchOfRef('refs/heads/heads/feature'), branchOfRef(undefined)]).toEqual(['feature', 'heads/feature', ''])
+    expect(liveRefs('feature')).toEqual(['refs/heads/feature', 'refs/remotes/origin/feature'])
+    // a key stored in git's ambiguous short form `heads/feature` stays alive while either reading of it exists
+    expect(liveRefs('heads/feature')).toEqual(['refs/heads/heads/feature', 'refs/remotes/origin/heads/feature', 'refs/heads/feature', 'refs/remotes/origin/feature'])
+  })
+
+  test('the default branch and a detached HEAD lose each round past 14 days when the ledger is read, with no git', () => {
+    const DAY = 86_400_000
+    const now = 40 * DAY
+    const old = { ...round(A), at: now - ROUND_TTL_MS }
+    const fresh = { ...round(B), at: now - DAY }
+    const ledger = parseLedger({ '/r/.git#main': [old, fresh], '/r/.git#master': [old], '/r/.git#HEAD': [old], '/r/.git#feature': [old] }, now)
+    expect(ledger).toEqual({ '/r/.git#main': [fresh], '/r/.git#feature': [old] })
   })
 
   test('a Codex usage / rate limit failure is matched case-insensitively; other failures are not', () => {

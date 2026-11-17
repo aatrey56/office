@@ -14,6 +14,8 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 // `afterStop` is what `claude agents` prints once a stop was asked (`'slow'`: its first runs out its timeout on `wait`, the mock clock's sleep, exiting 124);
 // `whole` is the whole transcript `grep` searches (default: `transcript()`);
 // `dirty` leaves src/x.ts and big.bin uncommitted until a commit (exiting `commitExit`) takes them;
+// `refs` are the refs show-ref finds when no `branches` are given (default main and feature; 'fail' exits 128), `merged` the shas on a main ref,
+// `onProbe` runs as one is asked about (another session can book meanwhile);
 // `noHead`: a repo with no commits (rev-parse HEAD fails); `staged` lists what `diff --cached` shows while dirty; `claude stop <id>` lists that session as stopped from then on, unless `stopIgnored`;
 // `store` seeds $.store (`runs.store` holds it, `runs.sets` the keys written). The capacity lock's perl
 // holder takes `runs.flock`, as the kernel's flock would: one holder at a time, the others queued, and
@@ -26,7 +28,7 @@ const NO_LIMITS = { value: { startedAt: 0, context: { window: 1_000_000 }, rateL
 type Flock = { expired: Promise<void>; holders: number; most: number; take: { (): Promise<() => void>; (until: Promise<void>): Promise<(() => void) | undefined> }; queued: () => Promise<void>; expire: () => void }
 type Runs = { argv: string[]; cwd?: string }[] & { store: Map<string, unknown>; sets: string[]; flock: Flock; roundsFlock: Flock; outcomes: Record<string, unknown>[] }
 type Check = (line: string) => { code: number; out?: string } | Promise<{ code: number; out?: string }>
-type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string; untracked?: string; failSet?: string; codexLogin?: number; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
+type Fake = { checksFile?: string; check?: Check; head?: string; renamed?: string; commits?: number; perl?: 'missing'; spawn?: (e: { argv: readonly string[]; cwd?: string; input?: string }) => AsyncGenerator<{ stream: 'stdout'; text: string }, void>; bg?: string | (() => string); bgExit?: number; bgGate?: Promise<void>; agents?: () => string; rawAgents?: { stdout: string; isStdoutTruncated?: boolean }; transcript?: () => string; store?: Record<string, unknown>; branches?: string[]; worktrees?: string; dirty?: boolean; commitExit?: number; stopIgnored?: boolean; staged?: string[]; noHead?: boolean; afterStop?: string; wait?: (ms: number) => Promise<void>; whole?: () => string; untracked?: string; failSet?: string; codexLogin?: number; refs?: string[] | 'fail'; merged?: string[]; onProbe?: () => void; rateLimits?: { kind: string; percentUsed: number; resetsAt?: string }[] }
 function fakeRepo(on: On, fake: Fake = {}): Runs {
   const runs = Object.assign([], { store: new Map(Object.entries(fake.store ?? {})), sets: [] as string[], flock: fakeFlock(), roundsFlock: fakeFlock(), outcomes: [] }) as Runs
   const { store, flock } = runs
@@ -92,9 +94,17 @@ function fakeRepo(on: On, fake: Fake = {}): Runs {
     if (argv[3] === 'show') return fake.checksFile === undefined ? out('', 128) : out(fake.checksFile)
     if (cmd.endsWith('rev-parse HEAD')) return fake.noHead ? out('', 128) : out(`${BASE}\n`)
     if (cmd.endsWith('^{commit}')) return out(`${OTHER}\n`)
-    if (argv.includes('show-ref')) return out('', fake.branches?.some(b => cmd.endsWith(`refs/heads/${b}`)) ? 0 : 1)
+    if (argv.includes('show-ref') && fake.branches === undefined && fake.refs === 'fail') return out('', 128)
+    if (argv.includes('show-ref')) {
+      const refs = fake.branches?.map(b => `refs/heads/${b}`) ?? (fake.refs as string[] | undefined) ?? ['refs/heads/main', 'refs/heads/feature']
+      return out('', refs.includes(argv.at(-1)!) ? 0 : 1)
+    }
     if (cmd.endsWith('worktree list --porcelain')) return out(fake.worktrees ?? '')
-    if (cmd.includes('symbolic-ref')) return out('feature\n')
+    if (cmd.includes('symbolic-ref')) return out('refs/heads/feature\n')
+    if (argv.includes('--is-ancestor') && argv.at(-1)!.startsWith('refs/')) {
+      fake.onProbe?.()
+      return out('', fake.merged?.includes(argv.at(-2)!) ? 0 : 1)
+    }
     if (cmd.includes(' log --oneline ')) return out('f00d123 rename x to y\n')
     if (cmd.includes('ls-files') && !argv.includes('--modified')) return out(fake.untracked ?? '') // the re-review's untracked count; the WIP commit's listing is below
     if (cmd.includes(' diff --stat ')) return out(' src/x.ts | 2 +-\n 1 file changed\n')
@@ -1138,6 +1148,34 @@ describe('codex review rounds', () => {
     ])
     await clock.settle()
     expect(runs.outcomes).toMatchObject([{ kind: 'review', branch: 'feature', round: 2, model: 'gpt-6-luna', findings: { p1: 0, p2: 0, p3: 0 }, clean: true }])
+  })
+
+  for (const [name, over, result] of [
+    ['a live, unmerged branch keeps a 30-day-old round: round 2 is a Luna re-review', {}, 'round 2/3 (vs f00df00, gpt-6-luna)'],
+    ['a failed git call keeps the rounds', { refs: 'fail' }, 'round 2/3 (vs f00df00, gpt-6-luna)'],
+    ['a branch merged into main starts over at round 1', { merged: [OLD] }, 'round 1/3 (vs main, gpt-6.1-sol)'],
+    ['a branch deleted here and on origin starts over at round 1', { refs: ['refs/heads/main', 'refs/remotes/origin/main'] }, 'round 1/3 (vs main, gpt-6.1-sol)'],
+  ] as const) {
+    test(name, { options: { workerWorktree: 'off' } }, async ($, on) => {
+      const { fake } = reviewRuns(on, { codexRounds: { [KEY]: [{ ...round(OLD, '[P1] x'), at: Date.now() - 30 * 86_400_000 }] } })
+      Object.assign(fake, over)
+      mock.clock(on)
+      expect(String((await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })).result)).toContain(result)
+    })
+  }
+
+  test('a round booked by another session while the merge is probed is not dropped by the old round\'s verdict', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const NEW = 'beef'.repeat(10)
+    const { runs, fake } = reviewRuns(on, { codexRounds: { [KEY]: [{ ...round(OLD, '[P1] x'), at: Date.now() - 30 * 86_400_000 }] } })
+    fake.merged = [OLD]
+    fake.onProbe = () => {
+      fake.onProbe = undefined // the other session's own probe dropped OLD, then it booked NEW, unmerged
+      runs.store.set('codexRounds', { [KEY]: [{ ...round(NEW, '[P2] y'), jobId: 'j-other' }] })
+    }
+    mock.clock(on)
+    expect(String((await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })).result)).toContain('round 2/3 (vs beefbee, gpt-6-luna)')
+    expect((runs.store.get('codexRounds') as Record<string, { sha: string }[]>)[KEY]!.map(r => r.sha)).toEqual([NEW, BASE])
+    expect(runs.some(r => r.argv.includes('for-each-ref'))).toBe(false) // each ref is checked on its own: no listing to come back cut short
   })
 
   test('a --commit round is not a baseline: the next automatic round is a full review vs main, on luna, with the earlier findings (coverage)', { options: { workerWorktree: 'off' } }, async ($, on) => {
