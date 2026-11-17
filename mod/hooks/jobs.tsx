@@ -21,6 +21,8 @@ import {
 } from './gates'
 import type { CheckRun, GateResult, GitVerdict } from './gates'
 import { endLine, finishedLine, foldInbox, formatInbox, INBOX_FILE, routeLine, routedLine } from './inbox'
+import { publishPlan, runningKey, runningOf } from './running'
+import type { RunningRecord } from './running'
 import {
   CODEX_EXEC_TOOL,
   CODEX_LOGIN_HINT,
@@ -282,6 +284,11 @@ function labelOf(job: Job): string {
 }
 
 export function installJobs(on: On, options: PluginOptions) {
+  // A distinct matcher: manage.tsx holds the other session.end hook.
+  on('session.end', { sessionId: /./ }, async ($, e, next) => {
+    await dropRunning($, e.sessionId).catch(() => undefined) // ending is never held up by this
+    return next(e)
+  })
   // A distinct matcher: the module holds other session.start hooks.
   on('session.start', { cwd: /^\// }, async ($, e, next) => {
     const started = await next(e)
@@ -329,6 +336,7 @@ export function installJobs(on: On, options: PluginOptions) {
     // Keep elapsed times moving while anything runs: only the jobs pane reads TICK.
     $.clock.every(2000, () => {
       if (RUNNING.size > 0) background($, 'the jobs tick', update($, TICK, n => (n + 1) % 1_000_000))
+      background($, 'the running jobs record', publishRunning($))
     })
     // --bg workers live outside this process: poll `claude agents --json`.
     $.clock.every(BG_POLL_MS, () => {
@@ -2537,6 +2545,43 @@ function debugLog($: EngineInterface, text: string): void {
   } catch {
     // best effort
   }
+}
+
+/** What this session last wrote under running:<sessionId>, and when (performance.now()): other sessions' office panes read it. */
+let published: { sessionId: string; sig: string; at: number } | undefined
+let isPublishing = false
+
+/** This session's running jobs, for every office pane: written on a change and as a heartbeat, deleted once none run.
+ *  It only ever deletes its own record; after /clear or a resume (a new id, no session.start) the old one goes first. */
+async function publishRunning($: EngineInterface): Promise<void> {
+  if (isPublishing) return
+  isPublishing = true
+  try {
+    const jobs = runningOf(await read($, JOBS))
+    const sessionId = await $.session.id()
+    if (endedSessions.has(sessionId)) return // its record went with session.end; never written back
+    if (published !== undefined && published.sessionId !== sessionId) {
+      await $.store.delete(runningKey(published.sessionId))
+      published = undefined
+    }
+    const at = performance.now()
+    const plan = publishPlan(published, jobs, at)
+    if (plan === 'none') return
+    if (plan === 'delete') await $.store.delete(runningKey(sessionId))
+    else await $.store.set(runningKey(sessionId), { sessionId, updatedAt: Date.now(), jobs } satisfies RunningRecord)
+    published = { sessionId, sig: JSON.stringify(jobs), at }
+  } finally {
+    isPublishing = false
+  }
+}
+
+/** A session that ends takes its running record with it; the process may go on under a new id (/clear, a resume). */
+const endedSessions = new Set<string>() // ids whose session.end came: their record is never published again
+
+async function dropRunning($: EngineInterface, sessionId: string): Promise<void> {
+  endedSessions.add(sessionId)
+  await $.store.delete(runningKey(sessionId))
+  if (published?.sessionId === sessionId) published = undefined
 }
 
 /**

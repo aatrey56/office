@@ -1300,6 +1300,79 @@ describe('usage alerts', () => {
 
 // A result reaches the model as an appended user row (the full text) plus, when the main loop is idle, a
 // submitted nudge. Both are collected; a refused append would fall back to submitting the full text.
+describe('the office pane shows running jobs', () => {
+  test('after /clear (a new id, no session.start) the record moves to the new id; it goes when the session ends', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    const runs = fakeRepo(on, {
+      async *spawn(e) {
+        if (e.argv[0] === 'codex') await new Promise(() => {})
+      },
+    })
+    on('fs.read', () => ({ value: 'No P1/P2 left.' }))
+    collectDelivery(on)
+    const clock = mock.clock(on)
+    let id = 'self-1'
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    on('session.id', () => ({ value: id }))
+    on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+    await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    const keys = () => [...runs.store.keys()].filter(key => key.startsWith('running:'))
+    await clock.advance(2_000)
+    expect(keys()).toEqual(['running:self-1'])
+    id = 'self-2'
+    await clock.advance(2_000)
+    expect(keys()).toEqual(['running:self-2'])
+    await $.session.end({ reason: 'clear', sessionId: 'self-2', resume: { id: 'self-2' } })
+    expect(keys()).toEqual([])
+    await clock.advance(2_000) // the review still runs: the ended id's record is not written back
+    expect(keys()).toEqual([])
+  })
+
+  test('a running Codex review gets the running row and a crew member, and both go once it finishes', { options: { workerWorktree: 'off' } }, async ($, on) => {
+    let finish = () => {}
+    const finished = new Promise<void>(r => { finish = r })
+    const runs = fakeRepo(on, {
+      async *spawn(e) {
+        if (e.argv[0] === 'codex') await finished
+      },
+    })
+    on('fs.read', () => ({ value: 'No P1/P2 left.' }))
+    collectDelivery(on)
+    const clock = mock.clock(on)
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__office__${e.name}` } }))
+    on('ui.panes', () => ({ value: [] }))
+    on('session.id', () => ({ value: 'self-1' }))
+    await $.session.start({ cwd: '/r', surface: 'terminal', isInteractive: true })
+    await $.tool.call({ tool: 'mcp__office__codex_review', cwd: '/r/src' })
+    await clock.advance(2_000) // the jobs poll publishes it for other sessions' panes
+    const published = () => [...runs.store.entries()].filter(([key]) => key.startsWith('running:')).map(([, v]) => v)
+    expect(published()).toMatchObject([{ jobs: [{ kind: 'codex-review', label: 'codex review r1 sol' }] }])
+
+    const ui = await $.ui.mount({
+      plugin: 'office',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'office',
+      props: { title: 'Office', isFocused: true, bodyColumns: 120, placement: 'dock', scroll: { offset: 0, bodyRows: 60 } },
+    } as Parameters<typeof $.ui.mount>[0])
+    expect(await ui.find({ type: 'Text', text: /^running: codex review r1 sol <1m/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'workers: codex review r1 sol (working)' })).toBeDefined()
+
+    finish()
+    await clock.advance(2_000)
+    expect(published()).toEqual([])
+    expect(await ui.find({ type: 'Text', text: 'running: nothing' })).toBeDefined()
+    await clock.advance(30_000) // it walks out of the door
+    expect(await ui.find({ type: 'Text', text: /^workers:/ })).toBeUndefined()
+    await ui.unmount()
+  })
+})
+
 function collectDelivery(on: On): string[] {
   const delivered: string[] = []
   on('session.append', (_$, e, next) => {

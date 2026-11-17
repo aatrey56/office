@@ -26,7 +26,7 @@ function job(over: Partial<Job> = {}): Job {
 
 const ROOTS = { '/repo/a': '/repo/a', '/repo/a/sub': '/repo/a', '/tmp/x': null }
 const derive = (cards: SessionCard[], jobs: Job[] = [], managers: Record<string, ManagerEntry> = {}) =>
-  deriveCrew(cards, jobs, managers, ROOTS, NOW, LINGER)
+  deriveCrew(cards, jobs, managers, ROOTS, NOW, LINGER, [], [], 'me')
 
 describe('stateOf and roomFor', () => {
   test('lead and manager statuses', () => {
@@ -60,10 +60,28 @@ describe('deriveCrew sessions', () => {
 })
 
 describe('deriveCrew workers', () => {
-  test('only worker jobs become crew, and never selectable', () => {
-    const crew = derive([], [job(), job({ id: 'j2', kind: 'codex-exec' }), job({ id: 'j3', kind: 'codex-review' })])
-    expect(crew.map(c => c.id)).toEqual(['j1'])
+  const other = (id: string, kind: Job['kind'], mode?: Job['mode'], sessionId = 's2') => ({ id, kind, label: id, startedAt: NOW, cwd: '/repo/a/sub', sessionId, ...(mode ? { mode } : {}) })
+  test('jobs become crew, never selectable; Codex reviews at the plain desk and walks out once it ends', () => {
+    const crew = derive([], [job(), job({ id: 'j2', kind: 'codex-exec' }), job({ id: 'j3', kind: 'codex-review', status: 'done', endedAt: NOW })])
+    expect(crew.map(c => c.id)).toEqual(['me:j1', 'me:j2', 'me:j3'])
     expect(crew[0]).toMatchObject({ role: 'worker', isSelectable: false, isSelf: false, state: 'working', room: 'coding' })
+    expect(crew[1]).toMatchObject({ isSelectable: false, state: 'working', room: 'review' })
+    expect(crew[2]).toMatchObject({ state: 'leaving', room: 'lobby' })
+  })
+  test("other sessions' Codex and headless jobs are drawn; their --bg workers are sessions already", () => {
+    const crew = deriveCrew([], [], {}, ROOTS, NOW, LINGER, [], [other('c1', 'codex-review'), other('h1', 'worker', 'headless'), other('b1', 'worker', 'bg')])
+    expect(crew.map(c => [c.id, c.room, c.project])).toEqual([['s2:c1', 'review', '/repo/a'], ['s2:h1', 'coding', '/repo/a']])
+  })
+  test('job ids are per session: the same id in two sessions is two characters, a job and its own record one', () => {
+    const crew = deriveCrew([], [job({ kind: 'codex-review' })], {}, ROOTS, NOW, LINGER, [], [other('j1', 'codex-review'), other('j1', 'codex-review', undefined, 's3'), other('j1', 'codex-review', undefined, 'me')], 'me')
+    expect(crew.map(c => c.id)).toEqual(['me:j1', 's2:j1', 's3:j1'])
+  })
+  test("another session's subagent worker is one character before and after its transcript is found", () => {
+    const record = { ...other('w1', 'worker', 'subagent'), agentId: 'a9' }
+    const before = deriveCrew([], [], {}, ROOTS, NOW, LINGER, [], [record])
+    const after = deriveCrew([card({ sessionId: 's2' })], [], {}, ROOTS, NOW, LINGER, [{ id: 'a9', sessionId: 's2', cwd: '/repo/a', name: 'worker' }], [record])
+    expect(before.map(c => c.id)).toEqual(['a9'])
+    expect(after.map(c => c.id)).toEqual(['s2', 'a9'])
   })
   test('done worker: reporting, then leaving, then gone (boundaries)', () => {
     const at = (since: number, status: Job['status'] = 'done') => derive([], [job({ status, endedAt: NOW - since })])
@@ -89,7 +107,7 @@ describe('deriveCrew agents', () => {
   })
   test('a bg worker that is also a session is drawn once, as the worker, in its project', () => {
     const crew = derive([card({ sessionId: 'bg1', cwd: '/wt/j1' })], [job({ sessionId: 'bg1', cwd: '/wt/j1', project: '/repo/a' })])
-    expect(crew.map(c => [c.id, c.role, c.project])).toEqual([['j1', 'worker', '/repo/a']])
+    expect(crew.map(c => [c.id, c.role, c.project])).toEqual([['me:j1', 'worker', '/repo/a']])
   })
 })
 
